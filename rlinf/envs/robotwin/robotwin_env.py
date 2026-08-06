@@ -14,7 +14,7 @@
 
 import json
 import os
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import gymnasium as gym
 import numpy as np
@@ -28,6 +28,29 @@ from rlinf.envs.utils import center_crop_image, list_of_dict_to_dict_of_list
 
 __all__ = ["RoboTwinEnv"]
 
+ROBOTWIN_HYBRID_CONTRACT_VERSION = "robotwin-agent-v1"
+ROBOTWIN_COMPATIBILITY_ID = "robotwin-rpent-downloads-2026-07-31-v1"
+ROBOTWIN_ASSET_FILE_COUNT = 20854
+ROBOTWIN_ASSET_TREE_SHA256 = (
+    "6ef76bdd0b4b8fefbc5d8dc855563e3b4c4c03674c586079141ab2b66079c12b"
+)
+ROBOTWIN_CUROBO_REPOSITORY = "https://github.com/NVlabs/curobo.git"
+ROBOTWIN_CUROBO_REVISION = "2fbffc35225398cf9d5f382804faa9de2608753b"
+LINGBOT_CHECKPOINT = "RLinf/LingBot-VLA-RoboTwin-EEF-ckpt1500"
+LINGBOT_CHECKPOINT_REVISION = "c55199f25a10397e79dce177ee11c8774fb8edde"
+ROBOTWIN_REQUIRED_CAPABILITIES = {
+    "robot_state",
+    "policy_observation",
+    "agent_observation",
+    "debug_state",
+    "episode_status",
+    "plan_arm_path",
+    "execute_actions",
+    "execute_qpos_updates",
+    "reset_episode",
+    "mutation_result",
+}
+
 
 class RoboTwinEnv(gym.Env):
     def __init__(
@@ -39,6 +62,10 @@ class RoboTwinEnv(gym.Env):
         worker_info,
         record_metrics=True,
     ):
+        self.profile = cfg.get("profile", "standard")
+        self.allow_hybrid_debug = bool(cfg.get("allow_hybrid_debug", False))
+        self._validate_profile_config(self.profile, num_envs, cfg.auto_reset)
+
         env_seed = cfg.seed
         self.seed = env_seed + seed_offset
         self.base_seed = env_seed
@@ -67,6 +94,8 @@ class RoboTwinEnv(gym.Env):
         self._init_reset_state_ids()
 
         self._init_env()
+        if self.profile == "downloads_hybrid":
+            self.get_capabilities()
 
         self.prev_step_reward = torch.zeros(
             self.num_envs, dtype=torch.float32, device=self.device
@@ -83,13 +112,254 @@ class RoboTwinEnv(gym.Env):
 
         from robotwin.envs.vector_env import VectorEnv
 
-        env_seeds = self.reset_state_ids.tolist()
+        if self.profile == "downloads_hybrid":
+            env_seeds = [int(self.cfg.get("hybrid_initial_seed", self.seed))]
+        else:
+            env_seeds = self.reset_state_ids.tolist()
+
+        vector_env_kwargs = {
+            "task_config": OmegaConf.to_container(self.cfg.task_config, resolve=True),
+            "n_envs": self.num_envs,
+            "env_seeds": env_seeds,
+        }
+        if self.profile == "downloads_hybrid":
+            vector_env_kwargs["profile"] = self.profile
 
         self.venv = VectorEnv(
-            task_config=OmegaConf.to_container(self.cfg.task_config, resolve=True),
-            n_envs=self.num_envs,
-            env_seeds=env_seeds,
+            **vector_env_kwargs,
         )
+
+    @staticmethod
+    def _validate_profile_config(profile: str, num_envs: int, auto_reset: bool) -> None:
+        """Validate profile invariants before constructing the native simulator."""
+        if profile not in ("standard", "downloads_hybrid"):
+            raise ValueError(
+                "RoboTwin profile must be 'standard' or 'downloads_hybrid'"
+            )
+        if profile == "downloads_hybrid" and num_envs != 1:
+            raise ValueError("downloads_hybrid requires num_envs == 1")
+        if profile == "downloads_hybrid" and auto_reset:
+            raise ValueError("downloads_hybrid requires auto_reset == False")
+
+    def _require_hybrid_profile(self) -> None:
+        if self.profile != "downloads_hybrid":
+            raise RuntimeError(
+                "RoboTwin native capabilities require profile='downloads_hybrid'"
+            )
+
+    def _call_hybrid_capability(self, method: str, *args, **kwargs):
+        self._require_hybrid_profile()
+        capability = getattr(self.venv, method, None)
+        if capability is None:
+            raise RuntimeError(
+                f"RoboTwin native compatibility branch is missing {method}()"
+            )
+        return capability(*args, **kwargs)
+
+    def get_capabilities(self) -> dict[str, Any]:
+        """Return and validate the RoboTwin hybrid capability contract."""
+        native = self._call_hybrid_capability("get_capabilities")
+        compatibility_id = native.get("compatibility_id")
+        if compatibility_id != ROBOTWIN_COMPATIBILITY_ID:
+            raise RuntimeError(
+                "RoboTwin compatibility mismatch: "
+                f"expected {ROBOTWIN_COMPATIBILITY_ID!r}, "
+                f"got {compatibility_id!r}"
+            )
+        expected_asset_snapshot = {
+            "file_count": ROBOTWIN_ASSET_FILE_COUNT,
+            "tree_sha256": ROBOTWIN_ASSET_TREE_SHA256,
+        }
+        if native.get("asset_snapshot") != expected_asset_snapshot:
+            raise RuntimeError(
+                "RoboTwin asset snapshot contract mismatch: "
+                f"expected {expected_asset_snapshot!r}, "
+                f"got {native.get('asset_snapshot')!r}"
+            )
+        native_capabilities = set(native.get("capabilities", ()))
+        missing = sorted(ROBOTWIN_REQUIRED_CAPABILITIES - native_capabilities)
+        if missing:
+            raise RuntimeError(
+                f"RoboTwin compatibility branch is missing capabilities: {missing}"
+            )
+        planner_snapshot = native.get("planner_snapshot", {})
+        expected_planner = {
+            "repository": ROBOTWIN_CUROBO_REPOSITORY,
+            "revision": ROBOTWIN_CUROBO_REVISION,
+            "clean": True,
+        }
+        for key, expected in expected_planner.items():
+            if planner_snapshot.get(key) != expected:
+                raise RuntimeError(
+                    "RoboTwin planner snapshot contract mismatch: "
+                    f"expected {key}={expected!r}, "
+                    f"got {planner_snapshot.get(key)!r}"
+                )
+        server_instance_id = native.get("server_instance_id")
+        mutation_id_prefix = native.get("mutation_id_prefix")
+        if (
+            not isinstance(server_instance_id, str)
+            or not server_instance_id
+            or mutation_id_prefix != f"{server_instance_id}:"
+        ):
+            raise RuntimeError(
+                "RoboTwin compatibility branch returned an invalid mutation scope"
+            )
+        return {
+            **native,
+            "contract_version": ROBOTWIN_HYBRID_CONTRACT_VERSION,
+            "profile": self.profile,
+            "action_specs": {
+                "qpos": {
+                    "layout": "qpos14",
+                    "shape": [14],
+                    "dtype": "float64",
+                },
+                "ee": {
+                    "layout": "eef16",
+                    "shape": [16],
+                    "dtype": "float64",
+                    "frame": "world",
+                    "position_unit": "metres",
+                    "quaternion_order": "wxyz",
+                    "fields": [
+                        "left_xyz",
+                        "left_qwxyz",
+                        "left_gripper",
+                        "right_xyz",
+                        "right_qwxyz",
+                        "right_gripper",
+                    ],
+                },
+            },
+            "camera_specs": {
+                "policy": {
+                    "views": [
+                        "cam_high",
+                        "cam_left_wrist",
+                        "cam_right_wrist",
+                    ],
+                    "native_resolution": [320, 240],
+                    "model_resolution": [224, 224],
+                },
+                "agent": {
+                    "native_views": ["head", "left_wrist", "right_wrist"],
+                    "high_resolution": [1024, 1024],
+                    "depth_unit": "metres",
+                    "world_frame": "world",
+                },
+            },
+            "episode_budget_counter": "take_action_cnt",
+            "canonical_success": "TASK_ENV.eval_success",
+            "planner_contract": {
+                **expected_planner,
+                "backend": "curobo",
+            },
+            "mutation_protocol": {
+                "scope": "server_instance",
+                "guarantee": "at-most-once",
+                "query_method": "get_mutation_result",
+            },
+            "model_contract": {
+                "checkpoint": LINGBOT_CHECKPOINT,
+                "revision": LINGBOT_CHECKPOINT_REVISION,
+                "policy_name": "robotwin_eef",
+                "norm_stats": "norm_stats/robotwin_eef.json",
+                "qwen_base": "qwen_base",
+                "camera_order": [
+                    "cam_high",
+                    "cam_left_wrist",
+                    "cam_right_wrist",
+                ],
+                "state_layout": "eef16",
+                "action_layout": "eef16",
+                "default_use_length": 50,
+            },
+        }
+
+    def get_robot_state(self, env_id: int = 0) -> dict[str, Any]:
+        """Return dual-arm EEF, gripper, and qpos state."""
+        return self._call_hybrid_capability("get_robot_state", env_id=env_id)
+
+    def capture_policy_observation(self, env_id: int = 0) -> dict[str, Any]:
+        """Capture the native three-camera LingBot observation."""
+        return self._call_hybrid_capability("capture_policy_observation", env_id=env_id)
+
+    def capture_agent_observation(self, env_id: int = 0) -> dict[str, Any]:
+        """Capture synchronized agent-visible RGB and geometry."""
+        return self._call_hybrid_capability("capture_agent_observation", env_id=env_id)
+
+    def capture_debug_state(self, env_id: int = 0) -> dict[str, Any]:
+        """Capture simulator oracle state for tests and evaluators only."""
+        if not self.allow_hybrid_debug:
+            raise PermissionError("capture_debug_state is disabled by configuration")
+        return self._call_hybrid_capability("capture_debug_state", env_id=env_id)
+
+    def get_episode_status(self, env_id: int = 0) -> dict[str, Any]:
+        """Return canonical native success and budget status."""
+        return self._call_hybrid_capability("get_episode_status", env_id=env_id)
+
+    def plan_arm_path(
+        self, env_id: int, arm: str, target_pose: np.ndarray
+    ) -> dict[str, Any]:
+        """Plan one native arm path without mutating the environment."""
+        return self._call_hybrid_capability("plan_arm_path", env_id, arm, target_pose)
+
+    def execute_actions(
+        self,
+        env_id: int,
+        action_type: str,
+        actions: np.ndarray,
+        mutation_id: str,
+        expected_version: Optional[dict[str, int]] = None,
+    ) -> dict[str, Any]:
+        """Execute qpos14 or eef16 actions through the native task owner."""
+        return self._call_hybrid_capability(
+            "execute_actions",
+            env_id,
+            action_type,
+            actions,
+            mutation_id,
+            expected_version,
+        )
+
+    def execute_qpos_updates(
+        self,
+        env_id: int,
+        updates: list[dict[str, Any]],
+        mutation_id: str,
+        expected_plan: Optional[dict[str, int]] = None,
+    ) -> dict[str, Any]:
+        """Execute per-waypoint qpos updates using freshly read native state."""
+        return self._call_hybrid_capability(
+            "execute_qpos_updates",
+            env_id,
+            updates,
+            mutation_id,
+            expected_plan,
+        )
+
+    def reset_episode(
+        self,
+        env_id: int,
+        seed: int,
+        mutation_id: str,
+        reset_options: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Reset through the Downloads-compatible native lifecycle."""
+        return self._call_hybrid_capability(
+            "reset_episode",
+            env_id,
+            seed,
+            mutation_id,
+            reset_options,
+        )
+
+    def get_mutation_result(
+        self, env_id: int, mutation_id: str
+    ) -> Optional[dict[str, Any]]:
+        """Return the cached state of a native mutation."""
+        return self._call_hybrid_capability("get_mutation_result", env_id, mutation_id)
 
     @property
     def device(self):
@@ -399,7 +669,8 @@ class RoboTwinEnv(gym.Env):
             self.update_reset_state_ids(env_idx=env_idx)
 
         extracted_obs, infos = self.reset(env_idx=env_idx.tolist())
-        # gymnasium calls it final observation but it really is just o_{t+1} or the true next observation
+        # Gymnasium calls it final observation, but this is the actual
+        # o_{t+1} / true next observation.
         infos["final_observation"] = final_obs
         infos["final_info"] = final_info
         infos["_final_info"] = dones
