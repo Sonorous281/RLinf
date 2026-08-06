@@ -171,6 +171,35 @@ By default, this script downloads assets under ``/path/to/RoboTwin/assets/``.
 After the download completes, set ``env.train.assets_path`` and
 ``env.eval.assets_path`` to ``/path/to/RoboTwin`` (the parent folder of ``assets/``).
 
+Environment profiles
+--------------------
+
+``RoboTwinEnv`` has two instance-level profiles:
+
+- ``profile: standard`` is the default. It preserves the existing vectorized
+  ``reset`` / ``step`` / ``chunk_step`` interface, batching, partial reset, and
+  auto-reset behavior used by RL training and VLA evaluation.
+- ``profile: downloads_hybrid`` exposes the native planner, qpos14/eef16,
+  calibrated camera, episode-status, and idempotent mutation capabilities used
+  by RPent. It requires ``total_num_envs: 1`` and ``auto_reset: false``.
+
+A profile is fixed when the environment is constructed and cannot be switched
+during an episode. Both profiles use the same ``RoboTwinEnv`` class and native
+task ownership chain. The hybrid profile requires the matching RoboTwin
+compatibility branch and should not be used with an unpatched ``RLinf_support``
+checkout. During development, use RoboTwin branch
+``adapt/robotwin-hybrid``, based on
+``RLinf_support@0008ae6800df9f75fc8de7098bacb01735fd8fd2``, and require
+compatibility ID ``robotwin-rpent-downloads-2026-07-31-v1`` in the startup
+handshake. Replace the development branch reference with its immutable
+published commit before release. See
+``examples/embodiment/config/env/robotwin_place_fan_hybrid.yaml`` for the
+single-environment capability configuration.
+Set ``ROBOTWIN_CUROBO_ROOT`` to a clean
+``NVlabs/curobo@2fbffc35225398cf9d5f382804faa9de2608753b`` checkout before
+creating a hybrid environment; the startup handshake rejects another planner
+revision.
+
 Download the Model
 ------------------
 

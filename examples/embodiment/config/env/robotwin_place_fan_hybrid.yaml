@@ -1,0 +1,76 @@
+env_type: robotwin
+total_num_envs: 1
+
+profile: downloads_hybrid
+allow_hybrid_debug: false
+hybrid_initial_seed: 100002
+
+auto_reset: false
+ignore_terminations: false
+
+reward_coef: 1.0
+use_custom_reward: true
+use_rel_reward: true
+center_crop: false
+
+seed: 100002
+group_size: 1
+use_fixed_reset_state_ids: true
+max_steps_per_rollout_epoch: 450
+max_episode_steps: 450
+
+is_eval: true
+
+assets_path: "/path/to/robotwin"
+# Export ROBOTWIN_CUROBO_ROOT to a clean NVlabs/curobo checkout at
+# 2fbffc35225398cf9d5f382804faa9de2608753b before creating this environment.
+seeds_path: null
+
+video_cfg:
+  save_video: false
+  info_on_video: false
+  video_base_dir: null
+
+enable_offload: false
+
+task_config:
+  task_name: place_fan
+  task_config: demo_randomized
+  ckpt_setting: hybrid_lingbot
+  policy_name: hybrid_lingbot
+  planner_backend: curobo
+  render_freq: 0
+  episode_num: 50
+  use_seed: false
+  save_freq: 15
+  embodiment: [aloha-agilex]
+  language_num: 100
+  domain_randomization:
+    random_background: true
+    cluttered_table: true
+    clean_background_rate: 0.02
+    random_head_camera_dis: 0
+    random_table_height: 0.03
+    random_light: true
+    crazy_random_light_rate: 0.02
+  camera:
+    head_camera_type: D435
+    wrist_camera_type: D435
+    collect_head_camera: true
+    collect_wrist_camera: true
+  data_type:
+    rgb: true
+    third_view: false
+    depth: false
+    pointcloud: false
+    observer: false
+    endpose: true
+    qpos: true
+    mesh_segmentation: false
+    actor_segmentation: false
+  pcd_down_sample_num: 1024
+  pcd_crop: true
+  save_path: ./data
+  clear_cache_freq: 5
+  collect_data: true
+  eval_video_log: false

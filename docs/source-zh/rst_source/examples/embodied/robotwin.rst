@@ -169,6 +169,31 @@ RoboTwin 支持 46 个操作任务。RLinf 提供了以下 ready-to-run 环境�
 下载完成后，请将 ``env.train.assets_path`` 和 ``env.eval.assets_path``
 设置为 ``/path/to/RoboTwin``（即 ``assets/`` 的上一级目录）。
 
+环境 Profile
+------------
+
+``RoboTwinEnv`` 提供两个实例级 profile：
+
+- ``profile: standard`` 为默认值，保持现有 RL 训练和 VLA 评测使用的向量化
+  ``reset`` / ``step`` / ``chunk_step``、batch、partial reset 与 auto-reset
+  语义。
+- ``profile: downloads_hybrid`` 为 RPent 暴露原生 planner、qpos14/eef16、
+  标定相机、episode status 和幂等 mutation 能力。该 profile 要求
+  ``total_num_envs: 1`` 且 ``auto_reset: false``。
+
+profile 在环境实例创建时固定，episode 中不能切换。两个 profile 复用同一个
+``RoboTwinEnv`` 类和 native task 所有权链。hybrid profile 必须搭配匹配的
+RoboTwin compatibility 分支，不能与未打补丁的 ``RLinf_support`` checkout
+混用。开发阶段使用基于
+``RLinf_support@0008ae6800df9f75fc8de7098bacb01735fd8fd2`` 的 RoboTwin
+``adapt/robotwin-hybrid`` 分支，并在启动握手中强制检查 compatibility ID
+``robotwin-rpent-downloads-2026-07-31-v1``。发布前必须将开发分支引用替换为
+不可变的已发布 commit。单环境 capability 配置见
+``examples/embodiment/config/env/robotwin_place_fan_hybrid.yaml``。
+创建 hybrid 环境前设置 ``ROBOTWIN_CUROBO_ROOT``，指向 clean 的
+``NVlabs/curobo@2fbffc35225398cf9d5f382804faa9de2608753b`` checkout；
+启动握手会拒绝其他 planner revision。
+
 下载模型
 ----------------------------------------
 
