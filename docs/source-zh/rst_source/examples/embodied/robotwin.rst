@@ -260,6 +260,24 @@ RoboTwin 支持 46 个操作任务。RLinf 提供了以下 ready-to-run 环境�
 （如 ``robotwin_place_empty_cup_openvlaoft_eval`` 与 ``robotwin_adjust_bottle_openpi_pi05_eval``）
 和结果解读。
 
+面向 Agent 的环境 API
+---------------------
+
+``RoboTwinEnv`` 为 Agent 运行时提供环境操作接口。这些 API 与训练路径分离，
+现有 ``chunk_step(chunk_actions)`` 行为保持不变。
+
+``execute_action_chunk(actions, action_type="qpos" | "ee")`` 将动作转发给
+RoboTwin 原生的 ``task.take_action``，不构造 RL 奖励或结束信号。
+``apply_qpos_updates()`` 会在每个路径点执行前重新读取当前关节目标。机器人
+状态明确区分与动作兼容的 ``qpos_target14`` 和只包含实际机械臂关节的
+``arm_qpos_real12``。
+
+``capture_observation()`` 在持有原生环境锁期间返回相机图像、深度、世界坐标、
+标定信息、机器人状态和任务指令。``get_episode_status()`` 同时返回原生任务状态和
+``agent_valid``。``reset_exact()`` 会在重置前将 Agent episode 标记为无效，
+只有原生重置、seed 校验和 RLinf 状态更新全部成功后才恢复。seed 不匹配时立即
+失败，面向 Agent 的 API 会拒绝继续使用替换后的 episode。
+
 .. note::
 
    提供的配置使用

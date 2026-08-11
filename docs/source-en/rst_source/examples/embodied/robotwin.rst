@@ -264,6 +264,28 @@ It owns ``ROBOTWIN_PATH`` / ``assets_path`` setup, available eval configs such a
 ``robotwin_place_empty_cup_openvlaoft_eval`` and ``robotwin_adjust_bottle_openpi_pi05_eval``,
 and result interpretation.
 
+Agent-facing environment APIs
+-----------------------------
+
+``RoboTwinEnv`` provides environment operations for agent runtimes. These APIs
+are separate from the training path; the existing ``chunk_step(chunk_actions)``
+behavior remains unchanged.
+
+``execute_action_chunk(actions, action_type="qpos" | "ee")`` forwards actions
+to native RoboTwin ``task.take_action`` without constructing RL rewards or done
+signals. ``apply_qpos_updates()`` rereads the current joint target before every
+waypoint. Robot state distinguishes the
+action-compatible ``qpos_target14`` from measured arm-only
+``arm_qpos_real12``.
+
+``capture_observation()`` returns camera images, depth, world coordinates,
+calibration, robot state, and task language while holding the native environment
+lock. ``get_episode_status()`` includes native task state and an ``agent_valid``
+flag. ``reset_exact()`` marks the agent episode invalid before reset and only
+restores it after the native reset, seed verification, and RLinf state updates
+succeed. A seed mismatch fails immediately, and agent-facing APIs reject the
+replacement episode.
+
 .. note::
 
    The provided configs use train/eval seed files under ``rlinf/envs/robotwin/seeds/``.
