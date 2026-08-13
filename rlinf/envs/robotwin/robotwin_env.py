@@ -154,7 +154,7 @@ class RoboTwinEnv(gym.Env):
 
     def _init_env(self):
         mp.set_start_method("spawn", force=True)
-        os.environ["ASSETS_PATH"] = self.cfg.assets_path
+        os.environ["ROBOTWIN_ASSETS_ROOT"] = self.cfg.assets_path
 
         from robotwin.envs.vector_env import VectorEnv
 
