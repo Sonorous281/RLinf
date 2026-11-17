@@ -120,6 +120,8 @@ class MAMegatronActor(MegatronActor):
             label_mask[:, :-1] = label_mask[:, 1:].clone()  # Shift left by 1
             label_mask[:, -1] = False
 
+            logprob_chunk_size = self.cfg.actor.get("logprob_chunk_size", 0)
+
             def logits_processor(logits, label, label_mask):
                 assert logits.shape[:2] == label.shape[:2]
                 assert label.shape == label_mask.shape
@@ -133,7 +135,9 @@ class MAMegatronActor(MegatronActor):
                     log_probs = log_probs.masked_fill(~label_mask, 0.0)
                     ret = {"log_probs": log_probs, "entropy": entropy}
                 else:
-                    log_probs = vocab_parallel_log_probs_from_logits(logits, label)
+                    log_probs = vocab_parallel_log_probs_from_logits(
+                        logits, label, chunk_size=logprob_chunk_size
+                    )
                     log_probs = log_probs.masked_fill(~label_mask, 0.0)
                     ret = {"log_probs": log_probs}
 

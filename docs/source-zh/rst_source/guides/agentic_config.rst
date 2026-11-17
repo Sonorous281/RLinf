@@ -647,3 +647,20 @@ reward
      - 训练使用的奖励类型（例如 ``math``）。
    * - ``reward.reward_scale``
      - 答案正确时获得 ``reward_scale``；错误时获得 ``-reward_scale``。
+
+降低 Logprob 计算的显存开销
+----------------------------------------
+
+Megatron 智能体训练使用动态批次时，将 ``actor.logprob_chunk_size`` 设为正数，可按 token 分块计算词表 softmax。反向传播时重新计算各块，无需保留完整的 FP32 softmax 结果。默认值 ``0`` 表示不启用分块。启用分块时需要关闭熵计算。
+
+在智能体训练配置中添加：
+
+.. code-block:: yaml
+
+   actor:
+     logprob_chunk_size: 256
+   algorithm:
+     calculate_entropy: false
+     entropy_bonus: 0.0
+
+块大小为 256 时，每次 softmax 处理最多 256 个序列位置。模型仍会生成完整词表 logits，这个设置不会对词表投影分块。减小块大小可以降低临时张量的显存占用，但会增加计算开销。在实际任务上测量峰值显存和单步耗时，再选择块大小。
