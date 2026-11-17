@@ -664,3 +664,28 @@ reward
    * - ``reward.reward_scale``
      - A correct answer receives ``reward_scale``; an incorrect one receives
        ``-reward_scale``.
+
+Reduce Logprob Memory
+---------------------
+
+For Megatron agent training with dynamic batches, set ``actor.logprob_chunk_size``
+to a positive value to compute vocabulary softmax in token chunks. The backward
+pass recomputes each chunk instead of retaining the full FP32 softmax output.
+The default value, ``0``, disables chunking. Disable entropy calculation when
+using chunks.
+
+Add these settings to your agent training config:
+
+.. code-block:: yaml
+
+   actor:
+     logprob_chunk_size: 256
+   algorithm:
+     calculate_entropy: false
+     entropy_bonus: 0.0
+
+A chunk size of 256 limits each softmax chunk to 256 sequence positions.
+The model still produces the full vocabulary logits; this setting does not
+chunk the vocabulary projection. Smaller chunks trade more computation for
+smaller temporary tensors. Measure peak GPU memory and step time on your workload
+before choosing a chunk size.

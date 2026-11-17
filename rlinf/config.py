@@ -2020,6 +2020,21 @@ def _validate_steam_ensemble_cfg(actor_cfg: DictConfig) -> None:
 
 
 def validate_reasoning_cfg(cfg: DictConfig) -> DictConfig:
+    logprob_chunk_size = cfg.actor.get("logprob_chunk_size", 0)
+    if type(logprob_chunk_size) is not int or logprob_chunk_size < 0:
+        raise ValueError("actor.logprob_chunk_size must be a nonnegative integer")
+    if logprob_chunk_size and (
+        cfg.actor.training_backend != "megatron"
+        or not OmegaConf.select(
+            cfg, "agentloop.is_dynamic_rollout_batch", default=False
+        )
+        or cfg.algorithm.get("calculate_entropy", False)
+        or cfg.algorithm.get("entropy_bonus", 0) != 0
+    ):
+        raise ValueError(
+            "actor.logprob_chunk_size requires a dynamic Megatron agent batch "
+            "with entropy calculation disabled"
+        )
     assert cfg.algorithm.recompute_logprobs or cfg.rollout.return_logprobs, (
         "One of `algorithm.recompute_logprobs` or `rollout.return_logprobs` must be True to compute `prev_logprobs`."
     )
