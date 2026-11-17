@@ -19,7 +19,7 @@ import itertools
 import os
 from contextlib import contextmanager, nullcontext
 from functools import partial
-from typing import TYPE_CHECKING, Iterator, Optional
+from typing import TYPE_CHECKING, Callable, Iterator, Optional
 
 import megatron
 import torch
@@ -319,6 +319,7 @@ class MegatronModelManager:
                 "virtual_pipeline_model_parallel_size",
                 "expert_model_parallel_size",
                 "context_parallel_size",
+                "attention_backend",
                 "gradient_accumulation_fusion",
                 "moe_aux_loss_coeff",
                 "moe_router_bias_update_rate",
@@ -351,6 +352,9 @@ class MegatronModelManager:
                 provider.mtp_num_layers = 0
                 # Bridge exports the HF config alongside the loaded parameters.
                 text_config.mtp_num_hidden_layers = 0
+
+        if self.is_dedicated_critic_model:
+            provider.register_pre_wrap_hook(self._attach_value_head)
 
         # the Mbridge run the qwen3-vl-moe model will freeze the language model and vision model by default.
         provider.freeze_language_model = getattr(
@@ -470,16 +474,39 @@ class MegatronModelManager:
             )
 
         if self.is_dedicated_critic_model and post_process:
-            # replace lm head with value head if this is a critic model
-            model.output_layer = LinearForLastLayer(
-                input_size=self._cfg.model.hidden_size,
-                output_size=1,
-                sequence_parallel=self._cfg.model.sequence_parallel,
-                weight_init=self._cfg.get("value_head_init", "normal"),
-                init_std=self._cfg.model.get("init_method_std", 0.02),
+            model.output_layer = self._value_head(
+                self._cfg.model.hidden_size, self._cfg.model.sequence_parallel
             )
 
         return model
+
+    def _value_head(self, hidden_size: int, sequence_parallel: bool) -> torch.nn.Module:
+        """Return the scalar projection that replaces a critic's language-model head."""
+        return LinearForLastLayer(
+            input_size=hidden_size,
+            output_size=1,
+            sequence_parallel=sequence_parallel,
+            weight_init=self._cfg.get("value_head_init", "normal"),
+            init_std=self._cfg.model.get("init_method_std", 0.02),
+        )
+
+    def _attach_value_head(self, model_chunks: list) -> list:
+        """Replace the language-model head of bridge-built critic chunks."""
+        for chunk in model_chunks:
+            if not chunk.post_process:
+                continue
+            head = self._value_head(
+                chunk.config.hidden_size, chunk.config.sequence_parallel
+            ).to(next(chunk.parameters()).device)
+            if hasattr(chunk, "output_layer"):
+                # A value head never shares the input embedding weights.
+                chunk.share_embeddings_and_output_weights = False
+                chunk.output_layer = head
+            else:
+                # A vision-language chunk keeps its head on the language model.
+                chunk.language_model.share_embeddings_and_output_weights = False
+                chunk.language_model.output_layer = head
+        return model_chunks
 
     def optimizer_step(self, increment):
         success, grad_norm, num_zeros_in_grad = self.optimizer.step()
@@ -607,7 +634,8 @@ class MegatronModelManager:
             return
 
         with self.ensure_onloaded_and_then_offload():
-            if self.mbridge:
+            # A value head has no Hugging Face counterpart to export.
+            if self.mbridge and not self.is_dedicated_critic_model:
                 # save mbridge checkpoint to hf checkpoint
                 hf_save_path = os.path.join(save_path, "hf_checkpoint")
                 self.bridge.save_hf_pretrained(
@@ -690,28 +718,65 @@ class MegatronModelManager:
         max_batch_seqlen: int = 4096,
         padding_seqlen: Optional[int] = None,
         keep_left_padding: bool = False,
+        trim_right_padding: bool = False,
+        scoring_forward: Optional[Callable] = None,
+        multimodal_position_ids: Optional[torch.Tensor] = None,
         **model_forward_kwargs,
     ):
-        """Default forward pass for GPT models with optional sequence packing."""
+        """Pack model inputs and restore outputs to the caller's padded layout.
+
+        ``scoring_forward`` can replace the packed model/LM-head forward. It
+        receives the wrapper, unwrapped model and packed scoring arguments,
+        and returns per-token scores instead of vocabulary logits.
+        """
         pre_process = unwrap_model(model).pre_process
         post_process = unwrap_model(model).post_process
+        if scoring_forward is not None and (
+            value_model or logits_processor is None or not pack_seqs
+        ):
+            raise ValueError(
+                "A scoring forward requires packed Actor inputs and logits processor arguments"
+            )
+        if multimodal_position_ids is not None and not pack_seqs:
+            raise ValueError(
+                "Token-space verification requires the packed Bridge forward"
+            )
         if pack_seqs:
+            # Bridge Qwen-VL embeds images before its own THD/CP packing.
+            packs_in_model = any(
+                cls.__module__.startswith("megatron.bridge.models.qwen_vl.")
+                for cls in type(unwrap_model(model)).__mro__
+            )
             batch_size, seq_len = attention_mask.shape[:2]
             input_ids_rmpad, packed_seq_params = preprocess_packed_seqs(
                 input_ids,
                 attention_mask,
-                pre_process=pre_process,
+                pre_process=pre_process and not packs_in_model,
                 padding_seqlen=padding_seqlen,
             )
             input_ids_rmpad = input_ids_rmpad.contiguous()
-            output_orig = model(
+            model_attention_mask = attention_mask if packs_in_model else None
+            model_position_ids = position_ids
+            if packs_in_model and trim_right_padding:
+                # Qwen-VL embeds its dense inputs before packing. Do not run its
+                # vision/language path over context-cap padding. Keep the original
+                # mask below so logprobs/values return with the caller's full width.
+                columns = attention_mask.any(dim=0).nonzero(as_tuple=True)[0]
+                used = int(columns[-1]) + 1 if columns.numel() else 1
+                tp = parallel_state.get_tensor_model_parallel_world_size()
+                cp = parallel_state.get_context_parallel_world_size()
+                alignment = tp * (2 * cp if cp > 1 else 1)
+                used = min(seq_len, (used + alignment - 1) // alignment * alignment)
+                input_ids_rmpad = input_ids_rmpad[:, :used].contiguous()
+                model_attention_mask = attention_mask[:, :used].contiguous()
+                model_position_ids = position_ids[..., :used].contiguous()
+            model_inputs = dict(
                 input_ids=input_ids_rmpad,
-                attention_mask=None,
-                position_ids=position_ids,
+                attention_mask=model_attention_mask,
+                position_ids=model_position_ids,
                 packed_seq_params=packed_seq_params,
                 **model_forward_kwargs,
             )
-            output_orig /= temperature
             if post_process and logits_processor is not None:
                 args = {
                     k: preprocess_packed_seqs(
@@ -722,7 +787,34 @@ class MegatronModelManager:
                     )[0]
                     for k, v in logits_processor_args.items()
                 }
-                output_dict = logits_processor(output_orig, **args)
+            verification = nullcontext()
+            if multimodal_position_ids is not None:
+                from rlinf.hybrid_engines.megatron.qwen_vl_inputs import (
+                    verify_qwen_vl_positions,
+                )
+
+                verification = verify_qwen_vl_positions(
+                    unwrap_model(model),
+                    multimodal_position_ids[..., : input_ids_rmpad.shape[1]],
+                    model_attention_mask,
+                )
+            with verification:
+                if post_process and scoring_forward is not None:
+                    output_orig = scoring_forward(
+                        model,
+                        unwrap_model(model),
+                        **args,
+                        temperature=temperature,
+                        **model_inputs,
+                    )
+                else:
+                    output_orig = model(**model_inputs)
+                    output_orig /= temperature
+            if post_process and logits_processor is not None:
+                if scoring_forward is not None:
+                    output_dict = output_orig
+                else:
+                    output_dict = logits_processor(output_orig, **args)
                 output = {
                     k: postprocess_packed_seqs(
                         v,

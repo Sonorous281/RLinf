@@ -196,3 +196,93 @@ def test_vocab_log_probs_match_dense_gradient(
         )
     finally:
         dist.destroy_process_group()
+
+
+def test_response_only_logits_match_full_logits_at_scored_positions():
+    pytest.importorskip("megatron.training")
+    from rlinf.hybrid_engines.megatron.utils import output_layer_positions
+    from rlinf.workers.actor.ma_megatron_actor_worker import _at_positions
+
+    torch.manual_seed(0)
+    module = torch.nn.Module()
+    module.output_layer = torch.nn.Linear(4, 7)
+    hidden = torch.randn(6, 1, 4)  # [tokens, batch, hidden]
+    positions = torch.tensor([1, 2, 5])
+    full = module.output_layer(hidden)
+    with output_layer_positions(module, positions):
+        partial = module.output_layer(hidden)
+    torch.testing.assert_close(partial, full.index_select(0, positions))
+    torch.testing.assert_close(module.output_layer(hidden), full)
+
+    def logprobs(logits, label, label_mask):
+        values = logits.log_softmax(-1).gather(-1, label.unsqueeze(-1)).squeeze(-1)
+        return {"log_probs": values.masked_fill(~label_mask, 0.0)}
+
+    label = torch.randint(0, 7, (1, 6))
+    label_mask = torch.ones(1, 6, dtype=torch.bool)
+    expected = logprobs(full.transpose(0, 1), label, label_mask)["log_probs"]
+    scored = _at_positions(logprobs, positions)(
+        partial.transpose(0, 1), label, label_mask
+    )["log_probs"]
+    torch.testing.assert_close(scored[:, positions], expected[:, positions])
+    assert scored[:, [0, 3, 4]].count_nonzero() == 0
+
+
+@pytest.mark.parametrize("instance_override", [False, True])
+def test_chunked_forward_restores_postprocess_after_failure(instance_override):
+    from types import SimpleNamespace
+
+    from rlinf.hybrid_engines.megatron.qwen_vl import (
+        forward_qwen_vl_with_chunked_log_probs,
+    )
+
+    class LanguageModel(torch.nn.Module):
+        def _postprocess(self, **kwargs):
+            return kwargs
+
+    language = LanguageModel()
+    language.post_process = True
+    language.mtp_process = False
+    language.config = SimpleNamespace(
+        mtp_num_layers=0, use_mup=False, defer_embedding_wgrad_compute=False, fp8=False
+    )
+    language.pg_collection = SimpleNamespace(tp=None)
+    if instance_override:
+        language._postprocess = lambda **kwargs: kwargs
+    original = language._postprocess
+    model = SimpleNamespace(language_model=language, post_process=True)
+
+    def fail(**kwargs):
+        assert language._postprocess is not original
+        raise RuntimeError("decoder failed")
+
+    with pytest.raises(RuntimeError, match="decoder failed"):
+        forward_qwen_vl_with_chunked_log_probs(
+            fail,
+            model,
+            label=torch.zeros(1, 2, dtype=torch.long),
+            label_mask=torch.ones(1, 2, dtype=torch.bool),
+            chunk_size=1,
+            temperature=1.0,
+        )
+    assert ("_postprocess" in language.__dict__) is instance_override
+    assert language._postprocess == original
+
+
+def test_mrope_verification_removes_hook_after_failure():
+    pytest.importorskip("megatron.bridge")
+    from rlinf.hybrid_engines.megatron.qwen_vl_inputs import verify_qwen_vl_positions
+
+    class BridgeModel(torch.nn.Module):
+        __module__ = "megatron.bridge.models.qwen_vl.test"
+
+        def __init__(self):
+            super().__init__()
+            self.language_model = torch.nn.Identity()
+
+    model = BridgeModel()
+    positions = torch.zeros(3, 1, 2, dtype=torch.long)
+    with pytest.raises(ValueError, match="M-RoPE positions different"):
+        with verify_qwen_vl_positions(model, positions, torch.ones(1, 2)):
+            model.language_model(position_ids=positions + 1)
+    assert not model.language_model._forward_pre_hooks

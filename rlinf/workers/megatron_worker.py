@@ -13,8 +13,9 @@
 # limitations under the License.
 
 import time
+from contextlib import nullcontext
 from functools import partial
-from typing import Callable, Optional
+from typing import Callable, ContextManager, Iterator, Optional
 
 import torch
 import torch.distributed
@@ -439,6 +440,12 @@ class MegatronWorker(MegatronModelManager, Worker):
         else:
             return get_num_microbatches()
 
+    def data_iterator_context(
+        self, iterator: Iterator[dict]
+    ) -> ContextManager[Iterator[dict]]:
+        """Scope optional iterator resources to one forward/backward schedule."""
+        return nullcontext(self.make_data_iterator_list(iterator))
+
     def run_forward_backward(self, batch: dict[str, torch.Tensor], forward_only=True):
         """Run the forward and backward pass on the model.
 
@@ -477,16 +484,17 @@ class MegatronWorker(MegatronModelManager, Worker):
                 else self.megatron_forward_backward_record
             )
             forward_backward_record.start()
-        forward_outputs = fwd_bwd_function(
-            forward_step_func=self.get_forward_step_func(),
-            data_iterator=self.make_data_iterator_list(batch_iter),
-            model=self.model,
-            num_microbatches=num_microbatches,
-            forward_only=forward_only,
-            seq_length=total_seqlen,
-            micro_batch_size=1,
-            collect_non_loss_data=forward_only,
-        )
+        with self.data_iterator_context(batch_iter) as data_iterator:
+            forward_outputs = fwd_bwd_function(
+                forward_step_func=self.get_forward_step_func(),
+                data_iterator=data_iterator,
+                model=self.model,
+                num_microbatches=num_microbatches,
+                forward_only=forward_only,
+                seq_length=total_seqlen,
+                micro_batch_size=1,
+                collect_non_loss_data=forward_only,
+            )
         if self.use_profiler:
             forward_backward_record.stop()
             self.profiler.stop(forward_only=forward_only)

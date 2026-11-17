@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import ContextManager, Iterator
+
 import torch
 from megatron.core import parallel_state
 from megatron.training.training import unwrap_model
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from rlinf.algorithms.registry import calculate_adv_and_returns
+from rlinf.config import shared_multi_modal_processor_enabled
 from rlinf.data.schema.reasoning_results import DynamicRolloutResult
 from rlinf.scheduler import Channel
 from rlinf.utils.data_iter_utils import (
@@ -30,6 +33,7 @@ from rlinf.utils.distributed import (
     masked_stats,
     normalize_from_stats,
 )
+from rlinf.utils.multimodal import MultimodalBatchPreparer
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.utils.utils import clear_memory, configure_batch_sizes, cpu_dict
 from rlinf.workers.critic.megatron_critic_worker import MegatronCritic
@@ -48,10 +52,32 @@ class MAMegatronCritic(MegatronCritic):
         assert cfg.agentloop.is_dynamic_rollout_batch and not self.is_pipeline, (
             "Multi-agent critic requires dynamic rollout batches and synchronous execution."
         )
-        assert self.enable_dp_load_balance, (
-            "Multi-agent critic requires enable_dp_load_balance=True."
-        )
+        assert self.enable_dp_load_balance or cfg.critic.get(
+            "expect_multi_modal_inputs", False
+        ), "Multi-agent critic requires enable_dp_load_balance=True."
         self.pack_traj = cfg.actor.get("pack_traj", True)
+        self.multimodal_preparer = MultimodalBatchPreparer(
+            cfg.rollout.model.model_path,
+            token_space=shared_multi_modal_processor_enabled(
+                OmegaConf.select(cfg, "rollout.sglang")
+            ),
+            cache_bytes=OmegaConf.select(
+                cfg, "critic.multimodal.cache_bytes", default=0
+            ),
+            prefetch_batches=OmegaConf.select(
+                cfg, "critic.multimodal.prefetch_batches", default=0
+            ),
+            prefetch_bytes=OmegaConf.select(
+                cfg, "critic.multimodal.prefetch_bytes", default=0
+            ),
+        )
+
+    def data_iterator_context(
+        self, iterator: Iterator[dict]
+    ) -> ContextManager[Iterator[dict]]:
+        return self.multimodal_preparer.iterator_context(
+            self.make_data_iterator_list(iterator)
+        )
 
     def get_forward_step_func(self):
         """Align full-sequence state values with generated action tokens."""
@@ -61,12 +87,19 @@ class MAMegatronCritic(MegatronCritic):
                 key: val.to(self.torch_device_type) if torch.is_tensor(val) else val
                 for key, val in next(dataloader_iter).items()
             }
+            multimodal_inputs = self.multimodal_preparer.for_forward(
+                batch, self.torch_device_type
+            )
             output = self.custom_forward(
                 model,
                 batch["input_ids"],
                 batch["attention_mask"],
                 batch["position_ids"],
                 sequence_parallel=self.transformer_config.sequence_parallel,
+                trim_right_padding=self.cfg.get("critic", {}).get(
+                    "trim_right_padding", False
+                ),
+                **multimodal_inputs,
             )
 
             def action_values(output):

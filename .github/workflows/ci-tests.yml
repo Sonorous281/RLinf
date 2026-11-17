@@ -31,7 +31,7 @@ jobs:
       all_changes_filter: ${{ steps.filter.outputs.all_changes_filter }}
       checked_files_filter_files: ${{ steps.filter.outputs.checked_files_filter_files }}
       all_changes_no_delete_filter_files: ${{ steps.filter.outputs.all_changes_no_delete_filter_files }}
- 
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -191,6 +191,11 @@ jobs:
               - '.github/workflows/offline_rl-e2e-tests.yml'
             unit_test_filter: &unit
               - *shared
+              - 'rlinf/hybrid_engines/sglang/multimodal/**'
+              - 'rlinf/hybrid_engines/megatron/qwen_vl_inputs.py'
+              - 'rlinf/workers/actor/ma_megatron_actor_worker.py'
+              - 'tests/unit_tests/test_sglang.py'
+              - 'tests/unit_tests/test_multimodal.py'
               - 'rlinf/robotics/**'
               - 'rlinf/models/embodiment/openpi/**'
               # Unit tests import env modules directly (robot task envs, the

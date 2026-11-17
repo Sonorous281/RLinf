@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import copy
+from contextlib import nullcontext
 from dataclasses import replace
-from typing import Optional
+from functools import partial
+from typing import ContextManager, Iterator, Optional
 
 import torch
 import torch.distributed
@@ -23,7 +25,7 @@ from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.training.training import unwrap_model
 from megatron.training.utils import average_losses_across_data_parallel_group
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 import rlinf.algorithms  # noqa: F401
 from rlinf.algorithms.registry import (
@@ -32,8 +34,13 @@ from rlinf.algorithms.registry import (
     policy_loss,
 )
 from rlinf.algorithms.utils import kl_penalty
+from rlinf.config import shared_multi_modal_processor_enabled
 from rlinf.data.schema.reasoning_requests import get_seq_length
 from rlinf.data.schema.reasoning_results import DynamicRolloutResult
+from rlinf.hybrid_engines.megatron.utils import (
+    output_layer_positions,
+    preprocess_packed_seqs,
+)
 from rlinf.scheduler import Channel
 from rlinf.utils.data_iter_utils import (
     get_iterator_k_split,
@@ -52,6 +59,7 @@ from rlinf.utils.metric_utils import (
     VersionedTrajectoryRecord,
     compute_staleness_metrics,
 )
+from rlinf.utils.multimodal import MultimodalBatchPreparer
 from rlinf.utils.placement import (
     ModelParallelComponentPlacement,
     PlacementMode,
@@ -67,19 +75,52 @@ from rlinf.workers.actor.megatron_actor_worker import (
 )
 
 
+def _at_positions(logits_processor, positions: torch.Tensor):
+    """Run ``logits_processor`` on logits computed only at packed ``positions``.
+
+    Labels are selected at the same positions, and each output is scattered
+    back to the packed layout with zeros elsewhere.
+    """
+
+    def processor(logits, label, label_mask):
+        outputs = logits_processor(
+            logits, label[:, positions], label_mask[:, positions]
+        )
+        return {
+            key: value.new_zeros(label.shape).index_copy(1, positions, value)
+            for key, value in outputs.items()
+        }
+
+    return processor
+
+
 class MAMegatronActor(MegatronActor):
     """The class for running the actor training using Megatron."""
 
     def __init__(
         self, cfg: DictConfig, placement: ModelParallelComponentPlacement, role="actor"
     ):
+        self.lm_head_chunk_size = cfg.actor.model.get("lm_head_chunk_size", 0)
         super().__init__(cfg, placement)
+        self.scoring_forward = None
+        if self.lm_head_chunk_size:
+            from rlinf.hybrid_engines.megatron.qwen_vl import (
+                forward_qwen_vl_with_chunked_log_probs,
+            )
+
+            self.scoring_forward = partial(
+                forward_qwen_vl_with_chunked_log_probs,
+                chunk_size=self.lm_head_chunk_size,
+                calculate_entropy=self.calculate_entropy,
+            )
         self._init_auto_scheduler(role)
         self.is_dynamic_rollout_batch = self.cfg.agentloop.is_dynamic_rollout_batch
         assert self.is_dynamic_rollout_batch
-        assert self.enable_dp_load_balance, (
-            "enable_dp_load_balance must be True when is_dynamic_rollout_batch is True"
-        )
+        # Episodes contribute different row counts, so the ranks must regroup
+        # their rows before training to run the same number of micro-batches.
+        assert self.enable_dp_load_balance or self.cfg.actor.get(
+            "expect_multi_modal_inputs", False
+        ), "enable_dp_load_balance must be True when is_dynamic_rollout_batch is True"
         self.placement = placement
 
         assert self.placement_mode in [
@@ -92,6 +133,65 @@ class MAMegatronActor(MegatronActor):
         loss_scales = self.cfg.algorithm.get("loss_scales", [])
         self.loss_scale_fns = get_loss_scales(loss_scales)
         self.pack_traj = self.cfg.actor.get("pack_traj", True)
+        self.multimodal_preparer = MultimodalBatchPreparer(
+            cfg.rollout.model.model_path,
+            token_space=shared_multi_modal_processor_enabled(
+                OmegaConf.select(cfg, "rollout.sglang")
+            ),
+            cache_bytes=OmegaConf.select(
+                cfg, "actor.multimodal.cache_bytes", default=0
+            ),
+            prefetch_batches=OmegaConf.select(
+                cfg, "actor.multimodal.prefetch_batches", default=0
+            ),
+            prefetch_bytes=OmegaConf.select(
+                cfg, "actor.multimodal.prefetch_bytes", default=0
+            ),
+        )
+        # Long agent rows would otherwise materialize vocabulary logits for every
+        # history token; this scores only the positions of response tokens.
+        self.response_only_logits = self.cfg.actor.get("response_only_logits", False)
+        if self.response_only_logits and (
+            parallel_state.get_context_parallel_world_size() > 1
+        ):
+            raise ValueError(
+                "actor.response_only_logits requires context_parallel_size=1"
+            )
+
+    def _forward_multimodal_inputs(self, batch: dict) -> dict[str, torch.Tensor]:
+        """Materialize only the rows scored by this forward, in token-marker order."""
+        return self.multimodal_preparer.for_forward(batch, self.torch_device_type)
+
+    def data_iterator_context(
+        self, iterator: Iterator[dict]
+    ) -> ContextManager[Iterator[dict]]:
+        return self.multimodal_preparer.iterator_context(
+            self.make_data_iterator_list(iterator)
+        )
+
+    def _scored_positions(
+        self, batch: dict[str, torch.Tensor], attention_mask: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Packed positions predicting a response token, or None to score all.
+
+        Positions index the THD layout that ``custom_forward`` builds.
+        """
+        if not self.response_only_logits:
+            return None
+        scored = torch.zeros_like(attention_mask)
+        scored[:, :-1] = batch["response_mask"][:, 1:]
+        packed = preprocess_packed_seqs(scored, attention_mask)[0][0]
+        positions = packed.nonzero(as_tuple=True)[0]
+        # Loss-free balancing rows still evaluate one output row.
+        return positions if len(positions) else positions.new_zeros(1)
+
+    @staticmethod
+    def _output_positions(model, positions: torch.Tensor | None):
+        """Restrict the output layer to ``positions`` on the last pipeline stage."""
+        module = unwrap_model(model)
+        if positions is None or not module.post_process:
+            return nullcontext()
+        return output_layer_positions(module, positions)
 
     def get_forward_step_func(self):
         """Acquire the forward step function for the model."""
@@ -116,11 +216,17 @@ class MAMegatronActor(MegatronActor):
             # response_mask needs to be shifted left by 1 to align with the shifted labels
             # because response_mask[i] indicates whether position i is a response token in input_ids
             # but label[i] = input_ids[i+1], so we need to shift response_mask left to align
-            label_mask = copy.deepcopy(batch["attention_mask"])
+            mask_source = (
+                batch["response_mask"]
+                if self.lm_head_chunk_size
+                else batch["attention_mask"]
+            )
+            label_mask = copy.deepcopy(mask_source)
             label_mask[:, :-1] = label_mask[:, 1:].clone()  # Shift left by 1
             label_mask[:, -1] = False
 
             logprob_chunk_size = self.cfg.actor.get("logprob_chunk_size", 0)
+            chunked_logprobs = self.response_only_logits and not self.calculate_entropy
 
             def logits_processor(logits, label, label_mask):
                 assert logits.shape[:2] == label.shape[:2]
@@ -136,7 +242,13 @@ class MAMegatronActor(MegatronActor):
                     ret = {"log_probs": log_probs, "entropy": entropy}
                 else:
                     log_probs = vocab_parallel_log_probs_from_logits(
-                        logits, label, chunk_size=logprob_chunk_size
+                        logits,
+                        label,
+                        chunk_size=logprob_chunk_size
+                        or (256 if chunked_logprobs else 0),
+                        temperature=self.cfg.algorithm.sampling_params.temperature
+                        if chunked_logprobs
+                        else 1.0,
                     )
                     log_probs = log_probs.masked_fill(~label_mask, 0.0)
                     ret = {"log_probs": log_probs}
@@ -145,16 +257,39 @@ class MAMegatronActor(MegatronActor):
 
             logits_processor_args = {"label": label, "label_mask": label_mask}
 
-            output = self.custom_forward(
-                model,
-                input_ids,
-                attention_mask,
-                position_ids,
-                sequence_parallel=self.transformer_config.sequence_parallel,
-                logits_processor=logits_processor,
-                logits_processor_args=logits_processor_args,
-                temperature=self.cfg.algorithm.sampling_params.temperature,
+            forward_options = {}
+            if chunked_logprobs:
+                # Keep the vocabulary tensor in BF16; scale only FP32 chunks.
+                forward_options["fp32_output"] = False
+
+            positions = (
+                None
+                if self.lm_head_chunk_size
+                else self._scored_positions(batch, attention_mask)
             )
+            if positions is not None:
+                logits_processor = _at_positions(logits_processor, positions)
+            with self._output_positions(model, positions):
+                output = self.custom_forward(
+                    model,
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    sequence_parallel=self.transformer_config.sequence_parallel,
+                    logits_processor=logits_processor,
+                    logits_processor_args=logits_processor_args,
+                    # Float16Module otherwise upcasts the entire vocabulary
+                    # output. Scale only each FP32 chunk, including at T != 1.
+                    temperature=self.cfg.algorithm.sampling_params.temperature
+                    if self.lm_head_chunk_size or not chunked_logprobs
+                    else 1.0,
+                    trim_right_padding=self.cfg.get("actor", {}).get(
+                        "trim_right_padding", False
+                    ),
+                    **self._forward_multimodal_inputs(batch),
+                    scoring_forward=self.scoring_forward,
+                    **forward_options,
+                )
 
             if not self.return_loss:
 
@@ -329,16 +464,17 @@ class MAMegatronActor(MegatronActor):
                 else self.megatron_forward_backward_record
             )
             forward_backward_record.start()
-        forward_outputs = fwd_bwd_function(
-            forward_step_func=self.get_forward_step_func(),
-            data_iterator=self.make_data_iterator_list(batch_iter),
-            model=self.model,
-            num_microbatches=num_microbatches,
-            forward_only=forward_only,
-            seq_length=total_seqlen,
-            micro_batch_size=1,
-            collect_non_loss_data=forward_only,
-        )
+        with self.data_iterator_context(batch_iter) as data_iterator:
+            forward_outputs = fwd_bwd_function(
+                forward_step_func=self.get_forward_step_func(),
+                data_iterator=data_iterator,
+                model=self.model,
+                num_microbatches=num_microbatches,
+                forward_only=forward_only,
+                seq_length=total_seqlen,
+                micro_batch_size=1,
+                collect_non_loss_data=forward_only,
+            )
         if self.use_profiler:
             forward_backward_record.stop()
             self.profiler.stop(forward_only=forward_only)
@@ -394,13 +530,34 @@ class MAMegatronActor(MegatronActor):
             self.cfg.data.rollout_batch_size
             // parallel_state.get_data_parallel_world_size()
         )
+        multimodal_inputs = []
         for _ in range(total_result_size_per_dp):
             batch, rollout_result = self.get_batch(input_channel)
             batches.append(batch)
             rollout_results.append(rollout_result)
+            # A result whose rows all lack images has no payload list, and its
+            # rows still need an entry so every row keeps its image or its None.
+            entries = rollout_result.multi_modal_inputs
+            if entries is None:
+                entries = [None] * rollout_result.num_sequence
+            elif len(entries) != rollout_result.num_sequence:
+                raise ValueError(
+                    f"a rollout result carries {len(entries)} image payloads for "
+                    f"{rollout_result.num_sequence} rows"
+                )
+            multimodal_inputs.extend(entries)
         batch = DynamicRolloutResult.merge_batches(
             batches, self.cfg.algorithm.group_size
         )
+        del batches
+        if any(entry is not None for entry in multimodal_inputs):
+            if len(multimodal_inputs) != batch["input_ids"].shape[0]:
+                raise ValueError(
+                    "each actor row needs one image payload, got "
+                    f"{len(multimodal_inputs)} for "
+                    f"{batch['input_ids'].shape[0]} rows"
+                )
+            batch["multi_modal_inputs"] = multimodal_inputs
         fixed_ppo_targets = self.cfg.critic.get("use_critic_model", False)
         assert "recomputed_logprobs" in batch or "rollout_logprobs" in batch
         batch = self.compute_advantages_and_returns(batch)

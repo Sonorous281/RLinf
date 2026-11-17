@@ -276,6 +276,58 @@ def activation_to_func(
     return activation_func
 
 
+def shared_multi_modal_processor_enabled(cfg: DictConfig | dict | None) -> bool:
+    """Read the SGLang config switch, accepting legacy saved configurations."""
+    if cfg is None:
+        return False
+    current = "enable_shared_multi_modal_processor"
+    legacy = "enable_token_space_processor"
+    if current in cfg and legacy in cfg:
+        raise ValueError(
+            f"rollout.sglang contains both {current} and {legacy}; keep only {current}."
+        )
+    key = legacy if legacy in cfg else current
+    enabled = cfg.get(key, False)
+    if type(enabled) is not bool:
+        raise ValueError(f"rollout.sglang.{key} must be a boolean, got {enabled!r}.")
+    return enabled
+
+
+def validate_sglang_multimodal_cfg(cfg: DictConfig) -> None:
+    """Check multimodal options supported by the default serving worker."""
+    shared_processor = shared_multi_modal_processor_enabled(cfg)
+    serving_mode = cfg.get("serving_mode")
+    cache_enabled = cfg.get("enable_token_space_preprocess_cache", False)
+    cache_directory = cfg.get("token_space_preprocess_cache_dir")
+    check_rate = cfg.get("token_space_preprocess_cache_check_rate", 0.0)
+    if cache_enabled:
+        if (
+            serving_mode is not None
+            or not shared_processor
+            or not cfg.get("token_space_preprocess_cache_trust_url", False)
+            or not cache_directory
+            or not os.path.isabs(cache_directory)
+        ):
+            raise ValueError(
+                "Shared preprocessing cache requires the default SGLang worker, "
+                "enable_shared_multi_modal_processor=True, "
+                "token_space_preprocess_cache_trust_url=True and an absolute "
+                "token_space_preprocess_cache_dir visible to rollout and learners."
+            )
+    elif cache_directory is not None or check_rate:
+        raise ValueError(
+            "Set enable_token_space_preprocess_cache=True to use "
+            "token_space_preprocess_cache_dir or token_space_preprocess_cache_check_rate."
+        )
+    if check_rate is not None and (
+        type(check_rate) not in (int, float) or not 0 <= check_rate <= 1
+    ):
+        raise ValueError(
+            "token_space_preprocess_cache_check_rate must be between 0 and 1, "
+            f"got {check_rate!r}."
+        )
+
+
 def validate_rollout_cfg(cfg, algorithm_cfg, actor_cfg=None):
     SupportedModel(cfg.model.model_type)  # To validate model_type is supported
 
@@ -301,6 +353,7 @@ def validate_rollout_cfg(cfg, algorithm_cfg, actor_cfg=None):
             f"backend_type=server; the server backend is only implemented for "
             f"the default serving worker (leave serving_mode unset)."
         )
+        validate_sglang_multimodal_cfg(cfg)
         return cfg
 
     def validate_vllm_cfg(cfg):
@@ -2480,6 +2533,73 @@ def adv_requires_group_baseline(
     return False
 
 
+def validate_qwen_vl_chunked_cfg(cfg) -> int:
+    """Validate the experimental Qwen3.5 Actor mode before model initialization."""
+    size = cfg.actor.model.get("lm_head_chunk_size", 0)
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        raise ValueError(
+            f"actor.model.lm_head_chunk_size must be a nonnegative integer, got {size!r}"
+        )
+    if size == 0:
+        return 0
+    if (
+        not cfg.actor.megatron.get("mbridge", False)
+        or cfg.actor.model.model_type != "qwen3_5"
+    ):
+        raise ValueError("Qwen-VL chunked scoring requires MBridge Qwen3.5")
+    if (
+        cfg.actor.model.pipeline_model_parallel_size != 1
+        or cfg.actor.model.get("context_parallel_size", 1) != 1
+    ):
+        raise ValueError("Qwen-VL chunked scoring currently requires PP1 and CP1")
+    if cfg.algorithm.calculate_entropy and cfg.algorithm.entropy_bonus != 0:
+        raise ValueError(
+            "Qwen-VL chunked scoring supports entropy metrics only; entropy_bonus must be zero"
+        )
+    if cfg.actor.model.get("load_mtp", True):
+        raise ValueError("Qwen-VL chunked scoring requires actor.model.load_mtp=False")
+    for option in (
+        "fp8",
+        "mtp_num_layers",
+        "defer_embedding_wgrad_compute",
+        "use_mup",
+        "enable_autocast",
+    ):
+        if cfg.actor.model.get(option, None):
+            raise ValueError(
+                f"Qwen-VL chunked scoring does not support actor.model.{option}"
+            )
+    temperature = cfg.algorithm.sampling_params.temperature
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError(
+            "Qwen-VL chunked scoring requires a finite positive temperature"
+        )
+    return size
+
+
+def validate_multimodal_learner_cfg(cfg: DictConfig) -> None:
+    """Validate per-rank image cache and prefetch budgets for agent learners."""
+    for role in ("actor", "critic"):
+        multimodal = (cfg.get(role) or {}).get("multimodal") or {}
+        for field in ("cache_bytes", "prefetch_batches", "prefetch_bytes"):
+            value = multimodal.get(field, 0)
+            if type(value) is not int or value < 0:
+                raise ValueError(
+                    f"{role}.multimodal.{field} must be a nonnegative integer, "
+                    f"got {value!r}."
+                )
+        if multimodal.get("prefetch_batches", 0) and (
+            not multimodal.get("prefetch_bytes", 0)
+            or not shared_multi_modal_processor_enabled(
+                OmegaConf.select(cfg, "rollout.sglang")
+            )
+        ):
+            raise ValueError(
+                f"{role}.multimodal prefetch requires enable_shared_multi_modal_processor=True "
+                "and positive prefetch_bytes per learner rank."
+            )
+
+
 def validate_cfg(cfg: DictConfig) -> DictConfig:
     OmegaConf.set_struct(cfg, True)
 
@@ -2599,6 +2719,8 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
             cfg.critic = validate_fsdp_cfg(cfg.critic)
 
     if cfg.runner.task_type == "reasoning":
+        validate_qwen_vl_chunked_cfg(cfg)
+        validate_multimodal_learner_cfg(cfg)
         cfg = validate_searchr1_cfg(cfg)
 
     return cfg
@@ -2802,6 +2924,16 @@ def build_transformer_config(cfg) -> "TransformerConfig":
                 model_parallel_config, field.name
             )
 
+    if isinstance(transformer_config_dict.get("attention_backend"), str):
+        from megatron.core.transformer.enums import AttnBackend
+
+        backend = transformer_config_dict["attention_backend"]
+        try:
+            transformer_config_dict["attention_backend"] = AttnBackend[backend]
+        except KeyError as error:
+            raise ValueError(
+                f"Unknown Megatron attention backend: {backend}"
+            ) from error
     transformer_config = TransformerConfig(**transformer_config_dict)
 
     # pass mcore customization configs directly to mcore
