@@ -80,9 +80,9 @@ class AsyncAgentRunner(AgentPPORunner):
             "step by the synchronous runner and are not supported here; "
             "group filtering runs in the RolloutBufferWorker instead."
         )
-        assert not cfg.algorithm.recompute_logprobs, (
+        assert not cfg.algorithm.recompute_logprobs or critic is not None, (
             "AsyncAgentRunner: recompute_logprobs requires the actor to "
-            "double as the inference engine, which is not supported here."
+            "double as the inference engine; only the actor/critic path supports this."
         )
         super().__init__(
             cfg,

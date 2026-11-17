@@ -35,6 +35,7 @@ from omegaconf import OmegaConf
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.algorithms.utils import (
     apply_importance_sampling_correction,
+    behavior_logprob_metrics,
     compute_entropy_loss,
 )
 from rlinf.data.schema.reasoning_results import DynamicRolloutResult
@@ -1546,3 +1547,37 @@ def test_unknown_critic_loss_is_rejected():
 
     with pytest.raises(ValueError, match="not registered"):
         get_critic_loss("unknown_critic_loss")
+
+
+def _tis_metric_rank(rank, rendezvous):
+    torch.distributed.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=2
+    )
+    try:
+        weights = [1.0] if rank == 0 else [2.0, 0.5, 4.0]
+        recomputed = torch.tensor([math.log(w) for w in weights] + [float("nan")])
+        behavior = torch.zeros_like(recomputed)
+        mask = torch.tensor([True] * len(weights) + [False])
+        metrics = behavior_logprob_metrics(recomputed, behavior, mask, 2.0)
+        assert metrics == pytest.approx(
+            {
+                "tis/max_abs_logprob_diff": math.log(4),
+                "tis/mean_abs_logprob_diff": math.log(2),
+                "tis/mean_weight": 5.5 / 4,
+                "tis/ess_fraction": 5.5**2 / (9.25 * 4),
+                "tis/clipped_fraction": 0.5,
+            }
+        )
+        assert behavior_logprob_metrics(recomputed, behavior, mask & False, 2.0) == {}
+        if rank == 1:
+            mask[-1] = True
+        with pytest.raises(ValueError, match="finite response-token"):
+            behavior_logprob_metrics(recomputed, behavior, mask, 2.0)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_behavior_metrics_reduce_uneven_masked_tokens_and_reject_bad_rank(tmp_path):
+    torch.multiprocessing.spawn(
+        _tis_metric_rank, args=((tmp_path / "tis-group").as_uri(),), nprocs=2, join=True
+    )

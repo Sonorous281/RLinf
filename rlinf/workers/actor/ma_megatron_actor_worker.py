@@ -33,7 +33,11 @@ from rlinf.algorithms.registry import (
     get_loss_scales,
     policy_loss,
 )
-from rlinf.algorithms.utils import kl_penalty
+from rlinf.algorithms.utils import (
+    apply_importance_sampling_correction,
+    behavior_logprob_metrics,
+    kl_penalty,
+)
 from rlinf.config import shared_multi_modal_processor_enabled
 from rlinf.data.schema.reasoning_requests import get_seq_length
 from rlinf.data.schema.reasoning_results import DynamicRolloutResult
@@ -322,14 +326,19 @@ class MAMegatronActor(MegatronActor):
                     ref_logprobs = batch["ref_logprobs"]
 
                 if self.cfg.algorithm.get("importance_sampling_fix", False):
-                    assert False, (
-                        "importance_sampling_fix is not supported for dynamic rollout batch"
-                    )
-                    rollout_logprobs = batch["rollout_logprobs"]
-                    recomputed_logprobs = batch.get("recomputed_logprobs")
-                    advantages = advantages * torch.clamp(
-                        (recomputed_logprobs - rollout_logprobs).exp(),
-                        max=self.cfg.algorithm.importance_sampling_clip,
+                    mask = batch["response_mask"].bool()
+                    recomputed = torch.where(mask, batch["recomputed_logprobs"], 0.0)
+                    behavior = torch.where(mask, batch["rollout_logprobs"], 0.0)
+                    if not (
+                        torch.isfinite(recomputed).all()
+                        and torch.isfinite(behavior).all()
+                    ):
+                        raise ValueError("TIS requires finite response-token logprobs")
+                    advantages, _, _ = apply_importance_sampling_correction(
+                        advantages,
+                        recomputed,
+                        behavior,
+                        self.cfg.algorithm.importance_sampling_clip,
                     )
 
                 mask = batch["response_mask"]
@@ -585,6 +594,18 @@ class MAMegatronActor(MegatronActor):
                 rollout_metrics = {}
             rollout_metrics.update(staleness_metrics)
 
+        if self.cfg.algorithm.get("importance_sampling_fix", False):
+            # A collective over the data parallel group: every rank computes it.
+            behavior_metrics = behavior_logprob_metrics(
+                batch["recomputed_logprobs"],
+                batch["rollout_logprobs"],
+                batch["response_mask"],
+                self.cfg.algorithm.importance_sampling_clip,
+                group=parallel_state.get_data_parallel_group(),
+            )
+            if rollout_metrics is not None:
+                rollout_metrics.update(behavior_metrics)
+
         # pack traj
         scale_context = {
             "folding_scale": [],
@@ -730,6 +751,18 @@ class MAMegatronActor(MegatronActor):
                 turn_tokens = rollout_result.response_lengths[turn_index]
                 version_start = rollout_result.version_start[turn_index]
                 version_end = rollout_result.version_end[turn_index]
+                token_version_sum = version_start * turn_tokens
+                if rollout_result.rollout_weight_versions is not None:
+                    active = [
+                        v
+                        for i, v in enumerate(
+                            rollout_result.rollout_weight_versions[turn_index]
+                        )
+                        if rollout_result.response_mask is None
+                        or rollout_result.response_mask[turn_index][i]
+                    ]
+                    turn_tokens = len(active)
+                    token_version_sum = sum(active)
                 earliest_versions[traj_index] = (
                     version_start
                     if earliest_versions[traj_index] is None
@@ -745,9 +778,7 @@ class MAMegatronActor(MegatronActor):
                 cross_version_calls[traj_index] += int(version_start != version_end)
                 turn_rewards[traj_index] += rollout_result.rewards[turn_index]
                 turn_counts[traj_index] += 1
-                token_weighted_version_start_sums[traj_index] += (
-                    version_start * turn_tokens
-                )
+                token_weighted_version_start_sums[traj_index] += token_version_sum
             for traj_index in range(num_trajectories):
                 records.append(
                     VersionedTrajectoryRecord(

@@ -48,8 +48,9 @@ class SyncHFWeightInput:
     # paused (i.e. the existing synchronous training path). Same values as the
     # `rollout.pause_mode` config: "in_place" / "retract" / "drain".
     pause_mode: Optional[str] = None
+    weight_version: Optional[int] = None
 
 
 @dataclass
 class SyncHFWeightOutput:
-    pass
+    weight_version: Optional[int] = None

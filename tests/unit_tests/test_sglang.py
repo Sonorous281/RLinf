@@ -478,3 +478,136 @@ def test_qwen_image_processor_keeps_text_request_behavior(qwen_image_processor):
     output = asyncio.run(processor.process_mm_data_async(images, text, request))
     assert output.input_ids == expected.input_ids[0].tolist()
     assert torch.equal(output.mm_items[0].feature, expected.pixel_values)
+
+
+def test_sglang_packet_metadata_stays_aligned_with_cumulative_tokens():
+    from rlinf.hybrid_engines.sglang.common.token_metadata import (
+        accumulate_token_metadata,
+        decode_generation_result,
+    )
+
+    states = {"episode": SimpleNamespace()}
+    for version, count, forced in [(1, 3, False), (2, 2, False), (2, 1, True)]:
+        packet = SimpleNamespace(
+            rids=["episode", "cancelled"],
+            customized_info={
+                "rollout_weight_versions": [[version] * count, [0]],
+                "forced_token_mask": [[forced] * count, [False]],
+            },
+        )
+        accumulate_token_metadata(packet, states)
+    assert packet.customized_info["rollout_weight_versions"][0] == [1, 1, 1, 2, 2, 2]
+    assert packet.customized_info["forced_token_mask"][0] == [False] * 5 + [True]
+
+    result = decode_generation_result(
+        {
+            "output_ids": [10, 11, 12, 13, 14, 15],
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": 8,
+                "forced_token_mask": packet.customized_info["forced_token_mask"][0],
+                "rollout_weight_versions": packet.customized_info[
+                    "rollout_weight_versions"
+                ][0],
+                "output_token_logprobs": [
+                    (-0.5, token, None) for token in range(10, 16)
+                ],
+            },
+        },
+        return_logprobs=True,
+    )
+    assert result["forced_token_positions"] == [5]
+    assert (
+        len(result["logprobs"])
+        == len(result["weight_versions"])
+        == len(result["output_ids"])
+    )
+
+
+def test_token_space_http_and_generation_metadata_preserve_prompt_ids(monkeypatch):
+    from rlinf.hybrid_engines.sglang.common.token_metadata import (
+        decode_generation_result,
+    )
+    from rlinf.utils.http_client import InferenceHTTPClient
+
+    client = InferenceHTTPClient("http://127.0.0.1:1")
+
+    async def capture_request(path, body):
+        assert path == "/generate"
+        return body
+
+    monkeypatch.setattr(client, "_apost", capture_request)
+    body = asyncio.run(
+        client.async_generate(
+            input_ids=[1, 9, 9, 2],
+            sampling_params={"max_new_tokens": 2},
+            return_logprob=True,
+            image_data=[b"image"],
+            return_prompt_token_ids=True,
+            mm_token_expansion_start_len=4,
+        )
+    )
+    assert body["return_prompt_token_ids"] is True
+    assert body["mm_token_expansion_start_len"] == 4
+    assert body["image_data"] == ["aW1hZ2U="]
+    result = decode_generation_result(
+        {
+            "output_ids": [3],
+            "prompt_token_ids": body["input_ids"],
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": 4,
+                "output_token_logprobs": [(-0.5, 3, None)],
+            },
+        },
+        return_logprobs=True,
+    )
+    assert result["prompt_token_ids"] == [1, 9, 9, 2]
+    assert result["logprobs"] == [-0.5]
+    legacy = InferenceHTTPClient._generate_body(None, [1, 2], {}, False)
+    assert "return_prompt_token_ids" not in legacy
+    assert "mm_token_expansion_start_len" not in legacy
+
+
+def test_token_versions_survive_retraction_and_multiple_weight_updates():
+    pytest.importorskip("sglang")
+    from rlinf.hybrid_engines.sglang.common.sgl_scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    request = SimpleNamespace(output_ids=[10, 11], customized_info=None)
+    scheduler._rlinf_weight_version = 3
+    scheduler._stamp_generated_weight_versions(request)
+    scheduler._rlinf_weight_version = 4
+    scheduler._stamp_generated_weight_versions(
+        request
+    )  # Prefix replay produces no new tokens.
+    request.output_ids.append(12)
+    scheduler._stamp_generated_weight_versions(request)
+    assert request.customized_info["rollout_weight_versions"] == [3, 3, 4]
+    request.output_ids.pop()
+    with pytest.raises(RuntimeError, match="prefixes must survive"):
+        scheduler._stamp_generated_weight_versions(request)
+
+
+def test_sync_requires_all_scheduler_version_acknowledgments():
+    pytest.importorskip("sglang")
+    import asyncio
+
+    from rlinf.hybrid_engines.sglang.common.io_struct import (
+        SyncHFWeightInput,
+        SyncHFWeightOutput,
+    )
+    from rlinf.hybrid_engines.sglang.common.tokenizer_manager import TokenizerManager
+
+    manager = TokenizerManager.__new__(TokenizerManager)
+    manager.auto_create_handle_loop = lambda: None
+
+    async def replies(_):
+        return [
+            SyncHFWeightOutput(weight_version=3),
+            SyncHFWeightOutput(weight_version=2),
+        ]
+
+    manager.sync_hf_weight_communicator = replies
+    with pytest.raises(RuntimeError, match="acknowledged"):
+        asyncio.run(manager.sync_hf_weight(SyncHFWeightInput(weight_version=3)))

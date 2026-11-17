@@ -31,6 +31,7 @@ from omegaconf import OmegaConf
 
 from rlinf.data.schema import DiscardedGroup
 from rlinf.workers.agent.agent_loop import (
+    AgentLoopOutput,
     AgentLoopWorker,
     GroupDiscarded,
     MultiAgentLoopWorker,
@@ -695,8 +696,8 @@ def _single_turn_output(
     version_start: int | None,
     version_end: int | None,
     not_training: bool = False,
-) -> SimpleNamespace:
-    return SimpleNamespace(
+) -> AgentLoopOutput:
+    return AgentLoopOutput(
         prompt_ids=[1, 2],
         response_ids=[3],
         response_logprobs=[0.5],

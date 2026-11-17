@@ -183,8 +183,10 @@ def patch_load_checkpoint_to_be_non_strict(enable: bool):
         load_checkpoint_orig = megatron.training.training.load_checkpoint
         load_checkpoint_patched = partial(load_checkpoint_orig, strict=False)
         megatron.training.training.load_checkpoint = load_checkpoint_patched
-        yield
-        megatron.training.training.load_checkpoint = load_checkpoint_orig
+        try:
+            yield
+        finally:
+            megatron.training.training.load_checkpoint = load_checkpoint_orig
 
     if enable:
         return context()
@@ -609,8 +611,9 @@ class MegatronModelManager:
 
     @contextmanager
     def ensure_onloaded_and_then_offload(self):
+        """Onload checkpoint state, then apply the configured residency policy."""
         # if weights and opt states are offloaded, recover them first
-        if self.is_weight_offloaded:
+        if self.is_weight_offloaded or self.is_grad_offloaded:
             self.onload_model_weights_and_grad()
         if self.is_optimizer_offloaded:
             self.onload_megatron_optimizer()
@@ -621,8 +624,14 @@ class MegatronModelManager:
         if hasattr(self, "megatron_type") and self.megatron_type == "sft":
             return
 
-        self.offload_model_weights_and_grad()
-        self.offload_megatron_optimizer()
+        offload_weight = self._cfg.get("offload_weight", True)
+        offload_grad = self._cfg.get("offload_grad", True)
+        if offload_weight or offload_grad:
+            self.offload_model_weights_and_grad(
+                offload_weight=offload_weight, offload_grad=offload_grad
+            )
+        if self._cfg.get("offload_optimizer", True):
+            self.offload_megatron_optimizer()
 
     def save_checkpoint(
         self,

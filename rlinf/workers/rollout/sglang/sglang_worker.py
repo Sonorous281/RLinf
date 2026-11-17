@@ -31,7 +31,9 @@ from rlinf.config import (
 )
 from rlinf.data.schema.reasoning_requests import RolloutRequest, SeqGroupInfo
 from rlinf.data.schema.reasoning_results import RolloutResult
+from rlinf.hybrid_engines.sglang.common.token_metadata import decode_generation_result
 from rlinf.scheduler import Channel, Worker
+from rlinf.scheduler.channel.channel import DEFAULT_KEY
 from rlinf.scheduler.dynamic_scheduler.manager import RolloutScalingScheduler
 from rlinf.scheduler.dynamic_scheduler.utils import (
     get_scheduler_channel,
@@ -663,7 +665,9 @@ class SGLangWorker(Worker):
         """
         if not self._is_model_instance_entry:
             return
-        await self._backend.sync_weights(pause_mode=self._pause_mode)
+        await self._backend.sync_weights(
+            pause_mode=self._pause_mode, weight_version=version
+        )
         if version is not None:
             self._weight_version = version
 
@@ -925,24 +929,17 @@ class SGLangWorker(Worker):
                 return_logprob=self._return_logprobs,
                 **extra,
             )
-            # sglang will trim matched stop in result text, so we should only return output_ids
-            result_dict = {
-                "output_ids": result["output_ids"],
-                "finish_reason": result["meta_info"]["finish_reason"]["type"],
-                # Weight versions this call spanned: a call queued inside
-                # sglang across a sync starts on the old version and its
-                # tokens come from the new one (start != end).
-                "version_start": version_start,
-                "version_end": self._weight_version,
-            }
+            result_dict = decode_generation_result(
+                result, return_logprobs=self._return_logprobs
+            )
+            result_dict.update(
+                version_start=version_start, version_end=self._weight_version
+            )
             if return_prompt_token_ids:
                 result_dict["prompt_token_ids"] = result["meta_info"][
                     "prompt_token_ids"
                 ]
-            if self._return_logprobs:
-                result_dict["logprobs"] = [
-                    item[0] for item in result["meta_info"]["output_token_logprobs"]
-                ]
+
         except Exception as e:
             self.log_error(
                 f"Rollout generate request failed (channel_key={channel_key}):\n"
@@ -969,7 +966,14 @@ class SGLangWorker(Worker):
         if not self._is_model_instance_entry:
             return
         while True:
-            rollout_request = await input_channel.get(async_op=True).async_wait()
+            rollout_request = await input_channel.get(
+                key=(
+                    self._placement.rollout_model_instance_id(self._rank)
+                    if self._cfg_rollout.get("replica_affinity", False)
+                    else DEFAULT_KEY
+                ),
+                async_op=True,
+            ).async_wait()
             # Drain gate: while paused in "drain" mode, hold the request here
             # instead of dispatching it; the sync happens without the engine
             # having in-flight requests.

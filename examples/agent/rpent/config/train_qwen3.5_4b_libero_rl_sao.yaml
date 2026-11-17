@@ -1,0 +1,35 @@
+# SAO changes the update rules and completion-based scheduling, not the task.
+defaults:
+  - train_qwen3.5_4b_libero_rl_ppo
+  - _self_
+
+runner:
+  synchronous: false
+  async_mode: true
+  experiment_name: rpent-libero-rl-qwen3.5-4b-sao
+
+algorithm:
+  critic_loss_type: mse
+  loss_type: dis
+  clip_ratio_low: 0.3
+  clip_ratio_high: 5.0
+  adv_type: sao_gae
+  gae_lambda_alpha: 1.5
+  recompute_logprobs: false
+  importance_sampling_fix: false
+  n_minibatches: 1
+
+agentloop:
+  max_actor_accept_staleness: null
+  truncate_response: false
+
+critic:
+  compute_advantages_after_update: true
+  update_epochs: 2
+
+rollout:
+  pause_mode: retract
+
+rollout_buffer:
+  max_inflight_groups: null
+  max_buffered_groups: null

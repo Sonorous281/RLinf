@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from dataclasses import fields
 from functools import wraps
 from importlib.metadata import version
 from typing import Any, Callable, Literal, Optional
@@ -20,6 +21,8 @@ from typing import Any, Callable, Literal, Optional
 import torch
 from omegaconf import DictConfig
 from packaging.version import parse
+
+from rlinf.hybrid_engines.sglang.multimodal.token_space import is_token_space_build
 
 try:
     from sglang.srt.constants import GPU_MEMORY_ALL_TYPES
@@ -157,9 +160,14 @@ class Scheduler(_Scheduler):
     """
 
     def __init__(self, *args, **kwargs):
+        self._rlinf_weight_version = None
         # Must run before super().__init__, which builds the model.
         patch_glm4_moe_lite_shared_expert_tp1()
         super().__init__(*args, **kwargs)
+        if not hasattr(self, "tp_rank"):
+            from sglang.srt.runtime_context import get_parallel
+
+            self.tp_rank = get_parallel().tp_rank
         self._parked_requests: dict | None = None
         # `TpModelWorkerClient` is used when ServerArgs.enable_overlap=True, and it has 'worker' attribute.
         # But in early SGLang version, `TpModelWorker` doesn't have 'worker' attribute.
@@ -192,7 +200,9 @@ class Scheduler(_Scheduler):
             sglang_version = parse(version("sglang"))
         except Exception as e:
             raise ValueError(f"sglang version not supported: {e}")
-        self.patch_return_output_ids = sglang_version < parse("0.5.0")
+        self.patch_return_output_ids = (
+            sglang_version < parse("0.5.0") and not is_token_space_build()
+        )
 
     def cuda_info(self, text: str = ""):
         free_gpu_memory, total_gpu_memory = Worker.torch_platform.mem_get_info()
@@ -489,7 +499,41 @@ class Scheduler(_Scheduler):
             if mm_utils.embedding_cache is not None:
                 mm_utils.embedding_cache.clear()
         self._handle_cache_after_sync(recv_req.pause_mode)
-        return SyncHFWeightOutput()
+        if recv_req.weight_version is not None:
+            self._rlinf_weight_version = recv_req.weight_version
+        return SyncHFWeightOutput(weight_version=self._rlinf_weight_version)
+
+    def maybe_collect_customized_info(self, i, req, logits_output):
+        super().maybe_collect_customized_info(i, req, logits_output)
+        self._stamp_generated_weight_versions(req)
+
+    def init_batch_result_processor(self) -> None:
+        """Install the token-version hook on component-based SGLang schedulers."""
+        super().init_batch_result_processor()
+        processor = self.batch_result_processor
+        stamp_versions = self._stamp_generated_weight_versions
+
+        class VersionedBatchResultProcessor(type(processor)):
+            def _maybe_collect_customized_info(self, i, req, logits_output):
+                super()._maybe_collect_customized_info(i, req, logits_output)
+                stamp_versions(req)
+
+        self.batch_result_processor = VersionedBatchResultProcessor(
+            **{
+                field.name: getattr(processor, field.name)
+                for field in fields(processor)
+            }
+        )
+
+    def _stamp_generated_weight_versions(self, req) -> None:
+        if self._rlinf_weight_version is not None:
+            if req.customized_info is None:
+                req.customized_info = {}
+            versions = req.customized_info.setdefault("rollout_weight_versions", [])
+            count = len(req.output_ids) - len(versions)
+            if count < 0:
+                raise RuntimeError("Generated token prefixes must survive retraction.")
+            versions.extend([self._rlinf_weight_version] * count)
 
     def _handle_cache_after_sync(self, pause_mode: Optional[str]):
         """Handle prefix tree / KV caches at the end of `sync_hf_weight`.
@@ -673,17 +717,32 @@ class Scheduler(_Scheduler):
             )
 
     def get_scheduler_running_state(self):
-        num_used = self.max_total_num_tokens - (
-            self.token_to_kv_pool_allocator.available_size()
-            + self.tree_cache.evictable_size()
-        )
+        capacity = self.max_total_num_tokens
+        get_pool_stats = getattr(self, "get_pool_stats", None)
+        observer = getattr(self, "pool_stats_observer", None)
+        if observer is not None:
+            stats = observer.get_pool_stats()
+            num_used = stats.full_num_used
+            if stats.full_capacity is not None:
+                capacity = stats.full_capacity
+            token_usage = stats.full_token_usage
+        elif get_pool_stats is not None:
+            # Hybrid caches account for full KV tokens and recurrent slots separately.
+            num_used = get_pool_stats().full_num_used
+            token_usage = num_used / capacity
+        else:
+            num_used = capacity - (
+                self.token_to_kv_pool_allocator.available_size()
+                + self.tree_cache.evictable_size()
+            )
+            token_usage = num_used / capacity
         num_running_reqs = len(self.running_batch.reqs)
         return {
             "num_running_reqs": num_running_reqs,
             "max_running_reqs": self.max_running_requests,
             "num_used_tokens": num_used,
-            "max_total_num_tokens": self.max_total_num_tokens,
-            "token_usage": num_used / self.max_total_num_tokens,
+            "max_total_num_tokens": capacity,
+            "token_usage": token_usage,
             "num_queue_reqs": len(self.waiting_queue),
         }
 

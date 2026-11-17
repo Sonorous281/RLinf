@@ -570,3 +570,48 @@ def compute_entropy_loss(
             torch.broadcast_shapes(loss_mask.shape, entropy.shape)
         )
     return masked_mean(entropy, mask=loss_mask)
+
+
+def behavior_logprob_metrics(
+    recomputed_logprobs: torch.Tensor,
+    rollout_logprobs: torch.Tensor,
+    loss_mask: torch.Tensor,
+    clip: float,
+    group=None,
+) -> dict[str, float]:
+    """Compare training and sampling logprobs on response tokens across ``group``.
+
+    Returns the mean and largest absolute logprob difference and the truncated
+    importance weights' mean, effective-sample-size fraction and clipped
+    fraction. Every rank raises ``ValueError`` when any rank has a non-finite
+    response logprob.
+    """
+    delta = (recomputed_logprobs - rollout_logprobs)[loss_mask.bool()].float()
+    error = torch.where(delta.isfinite(), delta.abs(), float("inf"))
+    max_error = error.max() if error.numel() else error.new_zeros(())
+    torch.distributed.all_reduce(
+        max_error, op=torch.distributed.ReduceOp.MAX, group=group
+    )
+    if not torch.isfinite(max_error):
+        raise ValueError("TIS requires finite response-token logprobs")
+    weights = delta.exp().clamp(max=clip)
+    sums = torch.stack(
+        [
+            error.sum(),
+            weights.sum(),
+            weights.square().sum(),
+            (weights >= clip).float().sum(),
+            weights.new_tensor(weights.numel()),
+        ]
+    )
+    torch.distributed.all_reduce(sums, group=group)
+    error_sum, weight_sum, square_sum, clipped, count = sums.tolist()
+    if count == 0:
+        return {}
+    return {
+        "tis/max_abs_logprob_diff": max_error.item(),
+        "tis/mean_abs_logprob_diff": error_sum / count,
+        "tis/mean_weight": weight_sum / count,
+        "tis/ess_fraction": weight_sum**2 / (square_sum * count) if square_sum else 0.0,
+        "tis/clipped_fraction": clipped / count,
+    }

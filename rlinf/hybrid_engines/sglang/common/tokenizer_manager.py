@@ -42,6 +42,7 @@ from .io_struct import (
     TaskMethodInput,
     TaskMethodOutput,
 )
+from .token_metadata import accumulate_token_metadata
 
 
 # Add two methods and their communicators, input/output structs.
@@ -107,7 +108,13 @@ class TokenizerManager(_TokenizerManager):
         if obj is None:
             obj = SyncHFWeightInput()
         self.auto_create_handle_loop()
-        await self.sync_hf_weight_communicator(obj)
+        responses = await self.sync_hf_weight_communicator(obj)
+        if obj.weight_version is not None and any(
+            response.weight_version != obj.weight_version for response in responses
+        ):
+            raise RuntimeError(
+                "Not all rollout schedulers acknowledged the published weight version."
+            )
 
     async def abort_generation(
         self,
@@ -125,6 +132,9 @@ class TokenizerManager(_TokenizerManager):
     ):
         import json
         import time
+
+        if not hasattr(_TokenizerManager, "update_request_meta_info"):
+            accumulate_token_metadata(recv_obj, self.rid_to_state)
 
         # for sglang 0.5.0 and later, we use the original _handle_batch_output
         if not self.patch_return_output_ids:

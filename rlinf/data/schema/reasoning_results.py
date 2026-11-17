@@ -895,6 +895,9 @@ class DynamicRolloutResult:
     # size of belows are num_sequence
     input_ids: list[list[int]]
     rollout_logprobs: Optional[list[list[float]]] = None
+    # Version of each generated token, aligned with response_mask.
+    rollout_weight_versions: Optional[list[list[int]]] = None
+    response_mask: Optional[list[list[int]]] = None
     # One processor payload per row; text-only rows carry None.
     multi_modal_inputs: Optional[list[Optional[dict]]] = None
     recomputed_logprobs: Optional[torch.Tensor] = None
@@ -932,6 +935,24 @@ class DynamicRolloutResult:
     extra_fields_traj: Optional[dict] = None  # [group_size]
     extra_fields_group: Optional[dict] = None  # [1]
 
+    def _merged_response_mask(self, seq_length: int) -> torch.Tensor:
+        """Expand per-response masks to the padded [rows, seq_length] layout."""
+        if len(self.response_mask) != self.num_sequence or any(
+            len(mask) != length
+            for mask, length in zip(self.response_mask, self.response_lengths)
+        ):
+            raise ValueError(
+                "response_mask must have one entry per response token of every row"
+            )
+        return batch_pad_to_fixed_len(
+            [
+                torch.as_tensor([0] * prompt + mask, dtype=torch.bool)
+                for prompt, mask in zip(self.prompt_lengths, self.response_mask)
+            ],
+            max_batch_len=seq_length,
+            pad_token=0,
+        )
+
     def group_metadata(self) -> GroupMetadata:
         """Summarize this group for routing and filtering decisions.
 
@@ -949,6 +970,13 @@ class DynamicRolloutResult:
             if self.version_start is not None and self.version_end is not None
             else None
         )
+        if self.rollout_weight_versions is not None:
+            versions = [
+                version
+                for row, row_versions in enumerate(self.rollout_weight_versions)
+                for column, version in enumerate(row_versions)
+                if self.response_mask is None or self.response_mask[row][column]
+            ]
         return GroupMetadata(
             group_id=self.group_id,
             task_name=self.task_name,
@@ -1054,6 +1082,9 @@ class DynamicRolloutResult:
             pad_token=pad_token,
         )
 
+        if self.response_mask is not None:
+            response_mask = self._merged_response_mask(seq_length)
+
         device = Worker.torch_device_type
         batch = {
             "idx_to_traj": self.idx_to_traj,
@@ -1095,6 +1126,27 @@ class DynamicRolloutResult:
                 pad_token=0,
             )
             batch["rollout_logprobs"] = logprobs.to(device)
+
+        if self.rollout_weight_versions is not None:
+            if len(self.rollout_weight_versions) != self.num_sequence or any(
+                len(versions) != length
+                for versions, length in zip(
+                    self.rollout_weight_versions, self.response_lengths
+                )
+            ):
+                raise ValueError(
+                    "rollout_weight_versions must match each row's response length"
+                )
+            batch["rollout_weight_versions"] = batch_pad_to_fixed_len(
+                [
+                    torch.as_tensor([-1] * prompt + versions, dtype=torch.long)
+                    for prompt, versions in zip(
+                        self.prompt_lengths, self.rollout_weight_versions
+                    )
+                ],
+                max_batch_len=seq_length,
+                pad_token=-1,
+            ).to(device)
 
         if self.recomputed_logprobs is not None:
             batch["recomputed_logprobs"] = self.recomputed_logprobs.to(device)
@@ -1170,6 +1222,9 @@ class DynamicRolloutResult:
             # A padded row carries no images; the value is per row, not per token.
             "multi_modal_inputs": [None],
         }
+        batch_pad["rollout_weight_versions"] = torch.full_like(
+            batch_pad["input_ids"], -1
+        )
         batch_pad = {k: v for k, v in batch_pad.items() if k in available_keys}
         return batch_pad
 
@@ -1316,6 +1371,7 @@ class DynamicRolloutResult:
             "response_lengths",
             "recomputed_logprobs",
             "rollout_logprobs",
+            "rollout_weight_versions",
             "ref_logprobs",
             "rewards",
             "advantages",
@@ -1473,7 +1529,30 @@ class DynamicRolloutResult:
         carry_payloads = any(
             res.multi_modal_inputs is not None for res in rollout_results
         )
+        carry_mask = any(res.response_mask is not None for res in rollout_results)
+        carry_versions = any(
+            res.rollout_weight_versions is not None for res in rollout_results
+        )
+        if carry_versions and any(
+            res.rollout_weight_versions is None
+            or len(res.rollout_weight_versions) != res.num_sequence
+            for res in rollout_results
+        ):
+            raise ValueError(
+                "rollout_weight_versions must cover every row of every result"
+            )
+
         for res in rollout_results:
+            if carry_mask:
+                merged_result.response_mask = (merged_result.response_mask or []) + (
+                    res.response_mask
+                    if res.response_mask is not None
+                    else [[1] * n for n in res.response_lengths]
+                )
+            if carry_versions:
+                merged_result.rollout_weight_versions = (
+                    merged_result.rollout_weight_versions or []
+                ) + res.rollout_weight_versions
             # Merge required list fields (size: num_sequence)
             merged_result.idx_to_traj.extend(res.idx_to_traj)
             merged_result.input_ids.extend(res.input_ids)
@@ -1614,6 +1693,14 @@ class DynamicRolloutResult:
                 idx_to_traj=split_idx_to_traj,
                 input_ids=split_input_ids,
                 rollout_logprobs=split_rollout_logprobs,
+                response_mask=rollout_result.response_mask[start_idx:end_idx]
+                if rollout_result.response_mask is not None
+                else None,
+                rollout_weight_versions=rollout_result.rollout_weight_versions[
+                    start_idx:end_idx
+                ]
+                if rollout_result.rollout_weight_versions is not None
+                else None,
                 multi_modal_inputs=rollout_result.multi_modal_inputs[start_idx:end_idx]
                 if rollout_result.multi_modal_inputs is not None
                 else None,

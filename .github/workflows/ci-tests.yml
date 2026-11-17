@@ -196,6 +196,8 @@ jobs:
               - 'rlinf/workers/actor/ma_megatron_actor_worker.py'
               - 'tests/unit_tests/test_sglang.py'
               - 'tests/unit_tests/test_multimodal.py'
+              - 'examples/agent/rpent/**'
+              - 'rlinf/hybrid_engines/sglang/common/**'
               - 'rlinf/robotics/**'
               - 'rlinf/models/embodiment/openpi/**'
               # Unit tests import env modules directly (robot task envs, the

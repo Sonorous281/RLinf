@@ -1470,3 +1470,136 @@ class TestIssuedRequestTaskName:
         with mock.patch.object(Worker, "__init__", return_value=None):
             worker = RolloutBufferWorker(cfg, _ToyDataset(num_samples=8))
         assert worker.max_actor_accept_staleness == 3
+
+
+def _rpent_buffer():
+    from collections import deque
+
+    from rlinf.agents.rpent.rollout_buffer import RPentRolloutBufferWorker
+
+    worker = RPentRolloutBufferWorker.__new__(RPentRolloutBufferWorker)
+    worker.__dict__.update(
+        _make_worker(
+            max_inflight_groups=3, max_buffered_groups=3, task_name="rpent"
+        ).__dict__
+    )
+    worker._fetch_lock = asyncio.Lock()
+    worker._queued_requests = deque()
+    worker._issued_requests = {}
+    worker._replay_requests = deque()
+    return worker
+
+
+def _rpent_result(group_id):
+    from rlinf.data.schema.reasoning_results import DynamicRolloutResult
+
+    return DynamicRolloutResult(
+        group_id=group_id,
+        task_name="rpent",
+        num_sequence=1,
+        group_size=1,
+        idx_to_traj=[0],
+        input_ids=[[1, 2, 3]],
+        prompt_lengths=[1],
+        response_lengths=[2],
+        rewards=[1.0],
+        is_end=[True],
+        rollout_logprobs=[[-0.2, 0.0]],
+        response_mask=[[1, 0]],
+        rollout_weight_versions=[[2, 1]],
+        multi_modal_inputs=[{"images": ["/immutable/episode/image.png"]}],
+    )
+
+
+def _check_rpent_resume(path):
+    async def run():
+        worker = _rpent_buffer()
+        await worker.load_checkpoint(path, start_step=2)
+        assert worker.buffer.next_group_id == 5
+        ready = worker.buffer.tasks["rpent"]["buffer"][2][1]
+        assert ready.rollout_weight_versions == [[2, 1]]
+        assert ready.group_metadata().earliest_version == 2
+        assert ready.multi_modal_inputs[0]["images"] == ["/immutable/episode/image.png"]
+        output = _QueueChannel()
+        task = asyncio.create_task(worker._run_admission(output))
+        try:
+            first = await asyncio.wait_for(output.get(async_op=True).async_wait(), 2)
+            second = await asyncio.wait_for(output.get(async_op=True).async_wait(), 2)
+            assert [first.group_ids, second.group_ids] == [[3], [4]]
+            assert [first.input_ids[0][0], second.input_ids[0][0]] == [3, 4]
+            result = _rpent_result(3)
+            worker.buffer.record_result(result, result.group_metadata())
+            assert [r.group_id for r in worker.buffer.release_groups()] == [2, 3]
+            queued = await asyncio.wait_for(output.get(async_op=True).async_wait(), 2)
+            assert queued.group_ids == [5] and queued.input_ids[0][0] == 5
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_rpent_checkpoint_replays_only_unconsumed_groups_in_new_process(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    async def save():
+        worker = _rpent_buffer()
+        output = _QueueChannel()
+        task = asyncio.create_task(worker._run_admission(output))
+        try:
+            for _ in range(3):
+                await asyncio.wait_for(output.get(async_op=True).async_wait(), 2)
+            for gid in (0, 1):
+                result = _rpent_result(gid)
+                worker.buffer.record_result(result, result.group_metadata())
+            assert [r.group_id for r in worker.buffer.release_groups()] == [0, 1]
+            for _ in range(2):
+                await asyncio.wait_for(output.get(async_op=True).async_wait(), 2)
+            result = _rpent_result(2)
+            worker.buffer.record_result(result, result.group_metadata())
+            await worker.save_checkpoint(str(tmp_path))
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(save())
+    env = dict(os.environ)
+    env["PYTHONPATH"] = (
+        str(Path(__file__).parent) + os.pathsep + env.get("PYTHONPATH", "")
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from test_rollout_buffer import _check_rpent_resume; import sys; _check_rpent_resume(sys.argv[1])",
+            str(tmp_path),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_rpent_checkpoint_preserves_shuffle_across_epochs(tmp_path):
+    from rlinf.agents.rpent.rollout_buffer import RPentRolloutBufferWorker
+
+    async def run():
+        cfg = _cfg(rollout_batch_size=4, shuffle=True)
+        with mock.patch.object(Worker, "__init__", return_value=None):
+            source = RPentRolloutBufferWorker(cfg, _ToyDataset(num_samples=12))
+            restored = RPentRolloutBufferWorker(cfg, _ToyDataset(num_samples=12))
+        for _ in range(4):
+            batch = await source._next_batch()
+            source.buffer.num_samples_fetched += len(batch["idx"])
+        await source.save_checkpoint(str(tmp_path))
+        await restored.load_checkpoint(str(tmp_path), start_step=4)
+        for _ in range(5):
+            expected = await source._next_batch()
+            actual = await restored._next_batch()
+            assert actual["idx"].tolist() == expected["idx"].tolist()
+
+    asyncio.run(run())

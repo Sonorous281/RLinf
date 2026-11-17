@@ -2277,8 +2277,8 @@ class TestSearchr1AsyncAdmissionCfg:
         ):
             return cfg_mod.validate_searchr1_cfg(cfg)
 
-    def test_collocated_placement_is_rejected(self):
-        """Async training requires the actor and rollout on separate GPUs."""
+    def test_collocated_placement_requires_offload(self):
+        """Shared async GPUs require model, gradient and optimizer offload."""
         import rlinf.config as cfg_mod
 
         placement = MagicMock()
@@ -2288,7 +2288,9 @@ class TestSearchr1AsyncAdmissionCfg:
         with mock.patch.object(
             cfg_mod, "ModelParallelComponentPlacement", return_value=placement
         ):
-            with pytest.raises(ValueError, match="disaggregated placement.*COLLOCATED"):
+            with pytest.raises(
+                ValueError, match="actor weight, gradient and optimizer offload"
+            ):
                 cfg_mod.validate_searchr1_cfg(self._make_cfg())
 
     @pytest.mark.parametrize(

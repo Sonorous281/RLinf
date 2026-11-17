@@ -37,6 +37,7 @@ from rlinf.data.schema.reasoning_results import (
 )
 from rlinf.models.tokenization.hf import hf_tokenizer
 from rlinf.scheduler import Channel, Worker
+from rlinf.scheduler.channel.channel import DEFAULT_KEY
 from rlinf.utils.metric_utils import aggregate_agent_metrics
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.workers.agent.tool_worker import ToolChannelInfo
@@ -59,6 +60,10 @@ class AgentLoopOutput:
     response_mask: Optional[list[int]] = None
     """Log probabilities for the response tokens."""
     response_logprobs: Optional[list[float]] = None
+    """Published rollout version that generated each response token."""
+    response_weight_versions: Optional[list[int]] = None
+    """Images the prompt expanded, as the processor's token grid and PNG bytes."""
+    response_images: Optional[dict[str, Any]] = None
     """Number of chat turns, including user, assistant, tool."""
     num_turns: int = 0
     """Whether the sequence ends."""
@@ -112,6 +117,10 @@ class AgentLoopWorker(Worker):
     Subclasses must implement the run_one_query method.
     """
 
+    # Requests go to any SGLang replica unless rollout.replica_affinity pins
+    # this worker's requests to one, so a multi-turn episode reuses its prefix cache.
+    rollout_request_key = DEFAULT_KEY
+
     def __init__(
         self,
         cfg: DictConfig,
@@ -119,6 +128,10 @@ class AgentLoopWorker(Worker):
     ):
         super().__init__()
         self.cfg = cfg
+        if cfg.rollout.get("replica_affinity", False):
+            self.rollout_request_key = (
+                self._rank % placement.rollout_num_model_instances
+            )
         self.print_outputs = cfg.agentloop.print_outputs
         if cfg.runner.task_type == "reasoning_eval":
             self.return_logprobs = False
@@ -176,27 +189,66 @@ class AgentLoopWorker(Worker):
         prompt_ids: list[int],
         sampling_params: Optional[dict] = None,
         rollout_name: Optional[str] = None,
+        image_data: Optional[list[bytes]] = None,
+        return_prompt_token_ids: bool = False,
+        mm_token_expansion_start_len: Optional[int] = None,
     ):
+        """Sample one turn; images the prompt stands for ride with the request.
+
+        The rollout engine expands the image markers in ``prompt_ids`` from
+        ``image_data`` itself, so the tokens stay the ones this turn trains on.
+        """
+        request = {
+            "prompt_ids": prompt_ids,
+            "sampling_params": sampling_params,
+        }
+        if image_data:
+            request["image_data"] = image_data
+        if return_prompt_token_ids:
+            request["return_prompt_token_ids"] = True
+        if mm_token_expansion_start_len is not None:
+            request["mm_token_expansion_start_len"] = mm_token_expansion_start_len
+        return await self._request_rollout(request, rollout_name)
+
+    async def prepare_multimodal(
+        self,
+        prompt_ids: list[int],
+        image_data: list,
+        *,
+        prefix_length: int,
+        image_spans: list,
+    ) -> dict:
+        """Resolve image expansion before calculating this turn's output budget."""
+        return await self._request_rollout(
+            {
+                "prompt_ids": prompt_ids,
+                "image_data": image_data,
+                "prepare_multimodal": {
+                    "prefix_length": prefix_length,
+                    "image_spans": image_spans,
+                },
+            }
+        )
+
+    async def _request_rollout(self, request: dict, rollout_name=None) -> dict:
         channel_key = uuid4().hex
+        request["channel_key"] = channel_key
         if rollout_name is None:
             input_channel = self.generate_input_channel
+            request_key = self.rollout_request_key
         else:
             input_channel = self.solid_generate_input_channels[rollout_name]
+            request_key = DEFAULT_KEY
         await input_channel.put(
-            {
-                "channel_key": channel_key,
-                "prompt_ids": prompt_ids,
-                "sampling_params": sampling_params,
-            },
+            request,
+            key=request_key,
             async_op=True,
         ).async_wait()
         result = await self.generate_output_channel.get(
             channel_key, async_op=True
         ).async_wait()
-        if isinstance(result, dict) and "error" in result:
-            # The rollout side failed to generate and reported back via the
-            # channel; fail loudly instead of continuing.
-            raise RuntimeError(f"Rollout generate request failed: {result['error']}")
+        if "error" in result:
+            raise RuntimeError(f"rollout generation failed: {result['error']}")
         return result
 
     async def state_less_tool_call_with_channel(
@@ -636,12 +688,23 @@ class MultiAgentLoopWorker(AgentLoopWorker):
         self.extra_keys_traj = None
         self.is_eval = self.cfg.runner.task_type == "reasoning_eval"
 
+    @staticmethod
+    async def _gather_rollout_tasks(tasks: list[asyncio.Task]) -> list:
+        """Wait for sibling cleanup before propagating a rollout failure or cancellation."""
+        try:
+            return await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
     async def run_agentloop_rollout_group(
         self,
         input_dict: dict,
         answer: str,
         group_size: int,
-        output_channel: Channel,
+        output_channel: Channel | list[Channel],
         group_id: Optional[int] = None,
         task_name: Optional[str] = None,
     ):
@@ -667,7 +730,7 @@ class MultiAgentLoopWorker(AgentLoopWorker):
             rollout_tasks.append(task)
 
         try:
-            task_results = await asyncio.gather(*rollout_tasks)
+            task_results = await self._gather_rollout_tasks(rollout_tasks)
 
             # For eval mode, allow multiple samples (group_size=k) to compute pass@k and avg@k
             extra_fields = self.gen_extra_fields(task_results, answer)
@@ -677,7 +740,11 @@ class MultiAgentLoopWorker(AgentLoopWorker):
                 rollout_result.task_name = task_name
             agent_metrics = self.get_rollout_metrics(rollout_result)
 
-            await output_channel.put(rollout_result, async_op=True).async_wait()
+            channels = (
+                output_channel if isinstance(output_channel, list) else [output_channel]
+            )
+            for channel in channels:
+                await channel.put(rollout_result, async_op=True).async_wait()
         except GroupDiscarded as e:
             # Only this failure mode is per-group: record the discard and
             # let the group end normally. The remaining trajectories of
@@ -698,14 +765,14 @@ class MultiAgentLoopWorker(AgentLoopWorker):
     async def run_agentloop_rollout(
         self,
         input_channel: Channel,
-        output_channel: Channel,
+        output_channel: Channel | list[Channel],
     ):
         """
         Run the agent loop for multiple queries.
 
         Args:
             input_channel: Channel to receive rollout requests
-            output_channel: Channel receiving each result
+            output_channel: Channels receiving a copy of each result
         """
         with self.worker_timer():
             rollout_request: RolloutRequest = input_channel.get()
@@ -724,7 +791,7 @@ class MultiAgentLoopWorker(AgentLoopWorker):
                 )
                 send_output_tasks.append(task)
 
-            agent_metrics_list = await asyncio.gather(*send_output_tasks)
+            agent_metrics_list = await self._gather_rollout_tasks(send_output_tasks)
             agent_metrics = self.post_process_metric(agent_metrics_list)
             return agent_metrics
 
@@ -762,16 +829,22 @@ class MultiAgentLoopWorker(AgentLoopWorker):
                     extra_fields_traj[k].append(v)
         return extra_fields_turn, extra_fields_traj, None, {}
 
-    def post_process_metric(self, agent_metrics_list: list[dict]):
+    def post_process_metric(
+        self, agent_metrics_list: list[dict], *, gather_workers: bool = True
+    ):
         """Merge per-query metrics, including weighted stats across workers.
 
         Args:
             agent_metrics_list: Metrics returned by each query rollout.
+            gather_workers: Gather worker-local lists. Set false when the runner
+                supplies a complete learner batch to every worker.
 
         Returns:
             Aggregated metric dictionary on rank 0, or empty dict on no data.
         """
-        if self._world_size > 1:
+        if not gather_workers and self._rank != 0:
+            return None
+        if gather_workers and self._world_size > 1:
             if self._rank == 0:
                 for i in range(1, self._world_size):
                     recv_list = self.recv(self._group_name, i)
@@ -820,8 +893,12 @@ class MultiAgentLoopWorker(AgentLoopWorker):
         rollout_logprobs = None
         if self.return_logprobs:
             rollout_logprobs = []
+        weight_versions = []
+        images = []
         is_end = []
         rewards = []
+        response_masks = []
+
         version_start = []
         version_end = []
 
@@ -842,10 +919,29 @@ class MultiAgentLoopWorker(AgentLoopWorker):
                         single_turn_output.response_ids
                     ), "response_logprobs should have the same length as response_ids"
                     rollout_logprobs.append(single_turn_output.response_logprobs)
+                weight_versions.append(single_turn_output.response_weight_versions)
+                images.append(single_turn_output.response_images)
                 is_end.append(single_turn_output.is_end)
                 rewards.append(single_turn_output.reward_score)
-                version_start.append(single_turn_output.version_start)
-                version_end.append(single_turn_output.version_end)
+                response_masks.append(single_turn_output.response_mask)
+
+                token_versions = single_turn_output.response_weight_versions
+                if token_versions is not None:
+                    active = [
+                        v
+                        for i, v in enumerate(token_versions)
+                        if single_turn_output.response_mask is None
+                        or single_turn_output.response_mask[i]
+                    ]
+                    version_start.append(
+                        min(active) if active else single_turn_output.version_start
+                    )
+                    version_end.append(
+                        max(active) if active else single_turn_output.version_end
+                    )
+                else:
+                    version_start.append(single_turn_output.version_start)
+                    version_end.append(single_turn_output.version_end)
 
         # Weight versions are either stamped on every turn or on none: mixing
         # would silently drop the version-less turns from staleness statistics.
@@ -868,8 +964,19 @@ class MultiAgentLoopWorker(AgentLoopWorker):
             response_lengths=response_lengths,
             input_ids=input_ids,
             rollout_logprobs=rollout_logprobs,
+            rollout_weight_versions=weight_versions
+            if any(v is not None for v in weight_versions)
+            else None,
+            multi_modal_inputs=images if any(v is not None for v in images) else None,
             is_end=is_end,
             rewards=rewards,
+            # Rows without a mask train every response token.
+            response_mask=[
+                [1] * length if mask is None else mask
+                for mask, length in zip(response_masks, response_lengths)
+            ]
+            if any(mask is not None for mask in response_masks)
+            else None,
             version_start=version_start,
             version_end=version_end,
             extra_fields_turn=extra_fields_turn,
