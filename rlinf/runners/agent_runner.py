@@ -26,14 +26,14 @@ from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.utils.runner_utils import check_progress
-from rlinf.workers.actor.megatron_actor_worker import MegatronActor
 from rlinf.workers.agent.agent_loop import AgentLoopWorker
 from rlinf.workers.agent.tool_worker import ToolChannelInfo, ToolWorker, ToolWorkerInfo
-from rlinf.workers.critic.ma_megatron_critic_worker import MAMegatronCritic
-from rlinf.workers.inference.megatron_inference_worker import MegatronInference
 from rlinf.workers.reward.reward_worker import RewardWorker
 
 if typing.TYPE_CHECKING:
+    from rlinf.workers.actor.megatron_actor_worker import MegatronActor
+    from rlinf.workers.critic.ma_megatron_critic_worker import MAMegatronCritic
+    from rlinf.workers.inference.megatron_inference_worker import MegatronInference
     from rlinf.workers.rollout.sglang.sglang_worker import SGLangWorker
     from rlinf.workers.rollout.vllm.vllm_worker import VLLMWorker
 
@@ -50,13 +50,13 @@ class AgentRunner(ReasoningRunner):
         train_dataset: Dataset,
         val_dataset: Optional[Dataset],
         rollout: Union["SGLangWorker", "VLLMWorker"],
-        inference: Optional[MegatronInference],
-        actor: MegatronActor,
+        inference: Optional["MegatronInference"],
+        actor: "MegatronActor",
         reward: Optional[RewardWorker],
         agent_loop: AgentLoopWorker,
         tool_workers: dict[ToolWorker, ToolWorkerInfo] = {},
         solid_rollouts: dict[str, Union["SGLangWorker", "VLLMWorker"]] = {},
-        critic: MAMegatronCritic | None = None,
+        critic: Optional["MAMegatronCritic"] = None,
     ):
         super().__init__(
             cfg,
@@ -87,6 +87,8 @@ class AgentRunner(ReasoningRunner):
         )
         self.agent_loop = agent_loop
         self.batch_split_num = len(agent_loop._workers)
+        self.rollout_output_channels = self.rollout_channel
+        self.release_rollout = not self.is_pipeline
         self.tool_workers = tool_workers
         self.solid_rollouts = solid_rollouts
         self.generate_input_channel = Channel.create("GenerateInput")
@@ -165,9 +167,11 @@ class AgentRunner(ReasoningRunner):
             self.solid_generate_input_channels,
         ).wait()
 
-    def _sync_weights(self):
-        super()._sync_weights()
-        if not self.is_pipeline:
+    def _sync_weights(
+        self, do_offload: bool = True, weight_version: int | None = None
+    ) -> None:
+        super()._sync_weights(do_offload=do_offload, weight_version=weight_version)
+        if do_offload and not self.is_pipeline:
             onload_handles = []
             for solid_rollout in self.solid_rollouts.values():
                 onload_handles.append(solid_rollout.onload_engine())
@@ -242,16 +246,19 @@ class AgentRunner(ReasoningRunner):
                         # Rollout
                         rollout_handle: Handle = self.agent_loop.run_agentloop_rollout(
                             input_channel=self.dataloader_channel,
-                            output_channel=self.rollout_channel,
+                            output_channel=self.rollout_output_channels,
                         )
 
                         if not self.is_pipeline:
                             agent_metrics = rollout_handle.wait()[0]
-                            offload_handles = [self.rollout.offload_engine()]
-                            for solid_rollout in self.solid_rollouts.values():
-                                offload_handles.append(solid_rollout.offload_engine())
-                            for handle in offload_handles:
-                                handle.wait()
+                            if self.release_rollout:
+                                offload_handles = [self.rollout.offload_engine()]
+                                for solid_rollout in self.solid_rollouts.values():
+                                    offload_handles.append(
+                                        solid_rollout.offload_engine()
+                                    )
+                                for handle in offload_handles:
+                                    handle.wait()
 
                         (
                             actor_rollout_metrics,

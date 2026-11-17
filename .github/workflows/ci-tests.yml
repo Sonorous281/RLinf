@@ -134,7 +134,6 @@ jobs:
               - *shared
               - 'rlinf/agents/**'
               - 'rlinf/workers/actor/ma_megatron_actor_worker.py'
-              - 'tests/unit_tests/test_megatron_lm_head.py'
               - 'rlinf/workers/actor/megatron_actor_worker.py'
               - 'rlinf/workers/actor/fsdp_actor_worker.py'
               - 'rlinf/workers/actor/ma_fsdp_actor_worker.py'
@@ -148,6 +147,12 @@ jobs:
               - 'rlinf/workers/rollout_buffer/**'
               - 'rlinf/runners/agent_runner.py'
               - 'rlinf/runners/agent_ppo_runner.py'
+              - 'rlinf/runners/async_agent_ppo_runner.py'
+              - 'tests/unit_tests/test_agent_ppo.py'
+              - 'tests/unit_tests/test_openai_session_server.py'
+              - 'tests/unit_tests/test_sglang.py'
+              - 'tests/unit_tests/test_megatron_lm_head.py'
+
               - 'rlinf/runners/async_agent_runner.py'
               - 'rlinf/runners/agentlightning_runner.py'
               - 'rlinf/runners/reasoning_runner.py'
@@ -191,6 +196,21 @@ jobs:
               - '.github/workflows/offline_rl-e2e-tests.yml'
             unit_test_filter: &unit
               - *shared
+              # Unit tests import these agentic, Megatron actor and runner
+              # modules, and load the RPent checkpoint tool and configs.
+              - 'rlinf/hybrid_engines/sglang/multimodal/**'
+              - 'rlinf/hybrid_engines/megatron/qwen_vl_inputs.py'
+              - 'rlinf/agents/rpent/**'
+              - 'rlinf/agents/tokenization/**'
+              - 'rlinf/agents/tool_call/parsers.py'
+              - 'rlinf/workers/agent/agent_loop.py'
+              - 'rlinf/workers/agent/openai_session_server.py'
+              - 'rlinf/workers/actor/ma_megatron_actor_worker.py'
+              - 'rlinf/runners/reasoning_runner.py'
+              - 'rlinf/runners/async_agent_ppo_runner.py'
+              - 'examples/agent/rpent/checkpoint.py'
+              - 'examples/agent/rpent/eval.py'
+              - 'examples/agent/rpent/config/**'
               - 'rlinf/robotics/**'
               - 'rlinf/models/embodiment/openpi/**'
               # Unit tests import env modules directly (robot task envs, the

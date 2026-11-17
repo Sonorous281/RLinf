@@ -1,0 +1,44 @@
+# One bounded episode on one node: policy GPU 0, simulator/SAM3 GPU 1.
+# This checks collection and cleanup, not learning or numerical parity.
+defaults:
+  - eval_qwen3.5_4b_libero_rl
+  - _self_
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    rollout,reward: 0
+    agentloop:
+      node_group: node
+      placement: "0:1"
+
+runner:
+  experiment_name: rpent-libero-rl-smoke
+  seq_length: 16384
+
+algorithm:
+  sampling_params:
+    max_new_tokens: 1024
+
+data:
+  val_rollout_batch_size: 1
+
+agentloop:
+  max_turns: 3
+  minimum_output_tokens: 64
+  model_request_timeout_s: 120
+  episode_timeout_s: 300
+  max_infra_retries: 0
+
+tools:
+  rpent:
+    env_gpus: [1]
+    episodes_per_worker: 1
+    max_env_initializations_per_worker: 1
+    max_episode_steps: 40
+    keep_episodes: all
+    process_timeout_s: 360
+
+rollout:
+  enforce_eager: true
+  max_running_requests: 1

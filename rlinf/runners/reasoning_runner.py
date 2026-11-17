@@ -283,11 +283,33 @@ class ReasoningRunner:
             dataloader_state_dict = torch.load(
                 dataloader_local_path, weights_only=False
             )
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
+            self._load_data_state(dataloader_state_dict)
         else:
             logging.warning(
                 f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch"
             )
+
+    def _restore_dataloader_state(
+        self, state: dict, completed_epochs: Optional[int] = None
+    ) -> None:
+        """Restore the sampler's epoch and the saved within-epoch position."""
+        if self.cfg.data.shuffle:
+            # The loader tracks RandomSampler's cursor, not its generator.
+            # Checkpoints precede exhaustion of the current epoch's iterator.
+            if completed_epochs is None:
+                completed_epochs = (self.global_steps - 1) // len(self.train_dataloader)
+            for _ in range(completed_epochs):
+                for _ in self.train_dataloader.sampler:
+                    pass
+        self.train_dataloader.load_state_dict(state)
+
+    def _load_data_state(self, state):
+        """Restore dataloader progress; async runners add their buffered rollouts."""
+        self._restore_dataloader_state(state)
+
+    def _save_data_state(self):
+        """Snapshot dataloader progress; async runners add their buffered rollouts."""
+        return self.train_dataloader.state_dict()
 
     def init_workers(self):
         if self.cfg.runner.resume_dir == "auto":
@@ -398,7 +420,7 @@ class ReasoningRunner:
         local_mkdir_safe(data_save_path)
         dataloader_local_path = os.path.join(data_save_path, "data.pt")
         dataloader_tmp_path = f"{dataloader_local_path}.tmp"
-        dataloader_state_dict = self.train_dataloader.state_dict()
+        dataloader_state_dict = self._save_data_state()
         # Publish atomically so an interrupted save cannot leave a truncated
         # data.pt behind, which auto resume reads as a complete checkpoint.
         try:
@@ -433,7 +455,10 @@ class ReasoningRunner:
         for request in requests:
             self.dataloader_channel.put(request, async_op=True)
 
-    def _sync_weights(self):
+    def _sync_weights(
+        self, do_offload: bool = True, weight_version: int | None = None
+    ) -> None:
+        """Sync weights; do_offload=False leaves residency under caller control."""
         if self.has_dedicated_actor_inference:
             self.actor.sync_model_to_inference()
             self.actor_inference.sync_model_from_actor().wait()
@@ -444,12 +469,22 @@ class ReasoningRunner:
 
         # self.rollout here is always 'sync' mode (cpu/None weight_reload is only
         # used by separate judge/eval rollouts), so this is unconditional.
-        self.actor.sync_model_to_rollout()
-        self.rollout.sync_model_from_actor().wait()
+        if do_offload:
+            self.actor.sync_model_to_rollout()
+        else:
+            self.actor.sync_model_to_rollout(do_offload=False)
+        # Only the SGLang backend tracks published weight versions; other
+        # backends keep their argument-less signature.
+        if weight_version is None:
+            self.rollout.sync_model_from_actor().wait()
+        else:
+            self.rollout.sync_model_from_actor(version=weight_version).wait()
         self.actor.del_reshard_state_dict().wait()
         # KV cache + cudagraph were deferred (only weights resumed) to avoid OOM;
         # mirrors the offload condition — pure disaggregated never offloads them.
-        if self.component_placement.is_collocated or self.component_placement.is_auto:
+        if do_offload and (
+            self.component_placement.is_collocated or self.component_placement.is_auto
+        ):
             self.rollout.onload_kv_cudagraph().wait()
 
     def _stop_rollouts(self):

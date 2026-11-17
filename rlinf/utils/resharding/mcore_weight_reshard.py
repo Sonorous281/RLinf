@@ -241,9 +241,14 @@ class MegatronCoreWeightReshard:
         tl_params = {}
         expert_params = {}
 
+        def is_synced(key):
+            # A frozen vision tower keeps the weights the rollout already
+            # serves, and its layers do not follow the language TP layout.
+            return not key.startswith("vision_model.")
+
         if vp_size > 1:  # consolidate params across model chunks
             for key, (val, idx) in bucket_weight.items():
-                if "_extra_state" in key:
+                if "_extra_state" in key or not is_synced(key):
                     continue
                 if torch.is_tensor(val):
                     if key.startswith("decoder.layers."):
@@ -265,7 +270,7 @@ class MegatronCoreWeightReshard:
                         model_level_params[key] = val
         else:
             for key, val in bucket_weight.items():
-                if "_extra_state" in key:
+                if "_extra_state" in key or not is_synced(key):
                     continue
                 if torch.is_tensor(val):
                     if (

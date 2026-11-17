@@ -44,6 +44,8 @@ class TaskMethodOutput:
 
 @dataclass
 class SyncHFWeightInput:
+    weight_version: Optional[int] = None
+
     # The rollout's current pause mode during async training, None when not
     # paused (i.e. the existing synchronous training path). Same values as the
     # `rollout.pause_mode` config: "in_place" / "retract" / "drain".
@@ -52,4 +54,4 @@ class SyncHFWeightInput:
 
 @dataclass
 class SyncHFWeightOutput:
-    pass
+    weight_version: Optional[int] = None

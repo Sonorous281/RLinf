@@ -12,11 +12,205 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-"""Compare chunked vocabulary projection against dense values and gradients."""
+"""Dense and chunked response scoring: values, gradients, and saved tensors."""
 
 import pytest
 import torch
+
+
+def test_response_only_logits_match_full_logits_at_scored_positions():
+    pytest.importorskip("megatron.training")
+    from rlinf.hybrid_engines.megatron.utils import output_layer_positions
+    from rlinf.workers.actor.ma_megatron_actor_worker import _at_positions
+
+    torch.manual_seed(0)
+    module = torch.nn.Module()
+    module.output_layer = torch.nn.Linear(4, 7)
+    hidden = torch.randn(6, 1, 4)  # [tokens, batch, hidden]
+    positions = torch.tensor([1, 2, 5])
+    full = module.output_layer(hidden)
+    with output_layer_positions(module, positions):
+        partial = module.output_layer(hidden)
+    torch.testing.assert_close(partial, full.index_select(0, positions))
+    torch.testing.assert_close(module.output_layer(hidden), full)
+
+    def logprobs(logits, label, label_mask):
+        values = logits.log_softmax(-1).gather(-1, label.unsqueeze(-1)).squeeze(-1)
+        return {"log_probs": values.masked_fill(~label_mask, 0.0)}
+
+    label = torch.randint(0, 7, (1, 6))
+    label_mask = torch.ones(1, 6, dtype=torch.bool)
+    expected = logprobs(full.transpose(0, 1), label, label_mask)["log_probs"]
+    scored = _at_positions(logprobs, positions)(
+        partial.transpose(0, 1), label, label_mask
+    )["log_probs"]
+    torch.testing.assert_close(scored[:, positions], expected[:, positions])
+    assert scored[:, [0, 3, 4]].count_nonzero() == 0
+
+
+def _assert_chunked_sao_gradients(rank, dtype, temperature):
+    from rlinf.algorithms.losses import compute_dis_actor_loss
+    from rlinf.utils.distributed import vocab_parallel_log_probs_from_logits
+
+    torch.manual_seed(3)
+    full = torch.randn(1, 9, 22, dtype=dtype, requires_grad=True)
+    labels = torch.tensor([[0, 21, 4, 15, 11, 8, 1, 20, 12]])
+    advantages = torch.linspace(-1, 1, 9).unsqueeze(0)
+    mask = torch.tensor([[True, False, True, True, False, True, True, False, True]])
+    expected = (
+        (full.float() / temperature)
+        .log_softmax(-1)
+        .gather(-1, labels.unsqueeze(-1))
+        .squeeze(-1)
+    )
+    old = expected.detach() + torch.linspace(-0.4, 0.4, 9).unsqueeze(0)
+    delta = (expected - old).detach()
+    keep = mask & (delta > torch.tensor(0.8).log()) & (delta < torch.tensor(1.2).log())
+    ratio = delta.exp().masked_fill(~keep, 0.0)
+    reference_loss = -(ratio * advantages * expected).sum() / mask.sum()
+    reference_loss.backward()
+    local = full.detach().chunk(2, dim=-1)[rank].clone().requires_grad_()
+    original = local.detach().clone()
+    saved = []
+
+    def pack(tensor):
+        saved.append((tensor.dtype, tensor.numel(), tensor.data_ptr()))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        actual = vocab_parallel_log_probs_from_logits(
+            local, labels, chunk_size=4, temperature=temperature
+        )
+    torch.testing.assert_close(actual, expected, rtol=2e-6, atol=2e-6)
+    loss, metrics = compute_dis_actor_loss(
+        logprobs=actual,
+        old_logprobs=old,
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        advantages=advantages,
+        loss_mask=mask,
+    )
+    torch.testing.assert_close(loss, reference_loss, rtol=2e-6, atol=2e-6)
+    torch.testing.assert_close(metrics["actor/ratio"], ratio[mask].mean().detach())
+    loss.backward()
+    torch.testing.assert_close(
+        local.grad, full.grad.chunk(2, dim=-1)[rank], rtol=2e-3, atol=2e-6
+    )
+    assert torch.equal(local, original)
+    assert not any(
+        kind == torch.float32 and count == local.numel() and pointer != local.data_ptr()
+        for kind, count, pointer in saved
+    ), "Chunked logprobs retained a separate full-vocabulary FP32 tensor"
+
+
+def _chunked_log_probs_rank(rank: int, store: str) -> None:
+    from megatron.core import parallel_state
+    from megatron.core.transformer.module import Float16Module
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    torch.set_num_threads(1)
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{store}", rank=rank, world_size=2
+    )
+    try:
+        parallel_state.initialize_model_parallel(tensor_model_parallel_size=2)
+        wrapper = Float16Module(
+            TransformerConfig(
+                num_layers=1, hidden_size=4, num_attention_heads=2, bf16=True
+            ),
+            torch.nn.Identity(),
+        )
+        sample = torch.ones(1, 9, 11, dtype=torch.bfloat16)
+        assert wrapper(sample).dtype == torch.float32
+        assert wrapper(sample, fp32_output=False).dtype == torch.bfloat16
+        for dtype, temperature in (
+            (torch.float32, 1.0),
+            (torch.bfloat16, 1.0),
+            (torch.bfloat16, 0.7),
+        ):
+            _assert_chunked_sao_gradients(rank, dtype, temperature)
+    finally:
+        parallel_state.destroy_model_parallel()
+        torch.distributed.destroy_process_group()
+
+
+def test_chunked_vocab_log_probs_match_dense_tp_values_and_gradients(tmp_path):
+    pytest.importorskip("megatron.core")
+    torch.multiprocessing.spawn(
+        _chunked_log_probs_rank, args=(str(tmp_path / "store"),), nprocs=2
+    )
+
+
+def _sequence_parallel_positions_rank(rank: int, store: str) -> None:
+    from megatron.core import parallel_state, tensor_parallel
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    from rlinf.hybrid_engines.megatron.utils import output_layer_positions
+
+    torch.cuda.set_device(rank)
+    torch.distributed.init_process_group(
+        "nccl", init_method=f"file://{store}", rank=rank, world_size=2
+    )
+    try:
+        parallel_state.initialize_model_parallel(tensor_model_parallel_size=2)
+        tensor_parallel.model_parallel_cuda_manual_seed(0)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=2,
+            tensor_model_parallel_size=2,
+            sequence_parallel=True,
+        )
+        module = torch.nn.Module()
+        module.output_layer = tensor_parallel.ColumnParallelLinear(
+            8,
+            12,
+            config=config,
+            init_method=torch.nn.init.normal_,
+            bias=False,
+            gather_output=False,
+        )
+        torch.manual_seed(0)
+        weight = torch.randn(12, 8, device="cuda") * 0.1
+        with torch.no_grad():
+            module.output_layer.weight.copy_(weight.chunk(2)[rank])
+        # Odd counts need padding before the scatter; one row leaves a rank
+        # holding padding only.
+        for positions in ([0, 3, 7], [6]):
+            selected = torch.tensor(positions, device="cuda")
+            full = torch.randn(8, 1, 8, device="cuda", requires_grad=True)
+            full_weight = weight.clone().requires_grad_()
+            expected = torch.nn.functional.linear(full, full_weight)[selected]
+            expected.square().sum().backward()
+
+            hidden = full.detach().chunk(2)[rank].clone().requires_grad_()
+            module.zero_grad()
+            with output_layer_positions(module, selected):
+                logits, _ = module.output_layer(hidden)
+            logits.square().sum().backward()
+
+            close = {"rtol": 2e-5, "atol": 2e-6}
+            torch.testing.assert_close(logits, expected.chunk(2, -1)[rank], **close)
+            torch.testing.assert_close(hidden.grad, full.grad.chunk(2)[rank], **close)
+            torch.testing.assert_close(
+                module.output_layer.weight.grad,
+                full_weight.grad.chunk(2)[rank],
+                **close,
+            )
+    finally:
+        parallel_state.destroy_model_parallel()
+        torch.distributed.destroy_process_group()
+
+
+def test_sequence_parallel_response_logits_match_full_output_and_gradients(
+    tmp_path,
+):
+    pytest.importorskip("megatron.training")
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Tensor parallelism with sequence parallelism needs two GPUs.")
+    torch.multiprocessing.spawn(
+        _sequence_parallel_positions_rank, args=(str(tmp_path / "store"),), nprocs=2
+    )
 
 
 @pytest.mark.parametrize(
@@ -157,3 +351,63 @@ def test_chunked_lm_head_two_rank_vocab_shards(tmp_path):
     mp.spawn(
         _chunked_lm_head_tp_reference, args=((tmp_path / "tp-init").as_uri(),), nprocs=2
     )
+
+
+@pytest.mark.parametrize("instance_override", [False, True])
+def test_chunked_forward_restores_postprocess_after_failure(instance_override):
+    from types import SimpleNamespace
+
+    from rlinf.hybrid_engines.megatron.qwen_vl import (
+        forward_qwen_vl_with_chunked_log_probs,
+    )
+
+    class LanguageModel(torch.nn.Module):
+        def _postprocess(self, **kwargs):
+            return kwargs
+
+    language = LanguageModel()
+    language.post_process = True
+    language.mtp_process = False
+    language.config = SimpleNamespace(
+        mtp_num_layers=0, use_mup=False, defer_embedding_wgrad_compute=False, fp8=False
+    )
+    language.pg_collection = SimpleNamespace(tp=None)
+    if instance_override:
+        language._postprocess = lambda **kwargs: kwargs
+    original = language._postprocess
+    model = SimpleNamespace(language_model=language, post_process=True)
+
+    def fail(**kwargs):
+        assert language._postprocess is not original
+        raise RuntimeError("decoder failed")
+
+    with pytest.raises(RuntimeError, match="decoder failed"):
+        forward_qwen_vl_with_chunked_log_probs(
+            fail,
+            model,
+            label=torch.zeros(1, 2, dtype=torch.long),
+            label_mask=torch.ones(1, 2, dtype=torch.bool),
+            chunk_size=1,
+            temperature=1.0,
+        )
+    assert ("_postprocess" in language.__dict__) is instance_override
+    assert language._postprocess == original
+
+
+def test_mrope_verification_removes_hook_after_failure():
+    pytest.importorskip("megatron.bridge")
+    from rlinf.hybrid_engines.megatron.qwen_vl_inputs import verify_qwen_vl_positions
+
+    class BridgeModel(torch.nn.Module):
+        __module__ = "megatron.bridge.models.qwen_vl.test"
+
+        def __init__(self):
+            super().__init__()
+            self.language_model = torch.nn.Identity()
+
+    model = BridgeModel()
+    positions = torch.zeros(3, 1, 2, dtype=torch.long)
+    with pytest.raises(ValueError, match="M-RoPE positions different"):
+        with verify_qwen_vl_positions(model, positions, torch.ones(1, 2)):
+            model.language_model(position_ids=positions + 1)
+    assert not model.language_model._forward_pre_hooks

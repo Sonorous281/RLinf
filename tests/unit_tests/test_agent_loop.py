@@ -606,6 +606,9 @@ def _single_turn_output(
         prompt_ids=[1, 2],
         response_ids=[3],
         response_logprobs=[0.5],
+        response_weight_versions=None,
+        response_images=None,
+        response_mask=None,
         is_end=True,
         reward_score=0.0,
         extra_fields={"not_training": not_training},
@@ -616,6 +619,8 @@ def _single_turn_output(
 
 def _make_multi_worker():
     worker = MultiAgentLoopWorker.__new__(MultiAgentLoopWorker)
+    worker._next_rollout_id = 0
+    worker._world_size = 1
     worker.print_outputs = False
     worker.return_logprobs = True
     return worker
@@ -849,6 +854,8 @@ class TestTaskNamePassthrough:
 
         async def run():
             worker = _make_group_worker(MultiAgentLoopWorker)
+            worker._next_rollout_id = 0
+            worker._world_size = 1
             worker.return_logprobs = True
             worker.extra_keys_turn = None
             worker.extra_keys_traj = None

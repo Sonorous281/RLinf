@@ -1,0 +1,18 @@
+# Nodes 0-1 share all model GPUs; node 2 runs SAM3 and simulator workers.
+defaults:
+  - train_qwen3.5_4b_libero_rl_sao
+  - _self_
+
+cluster:
+  num_nodes: 3
+  component_placement:
+    actor: 0-15
+    critic: 0-15
+    rollout: 0-15
+    reward: 0-15
+    agentloop:
+      node_group: node
+      placement: "2:0-7"
+
+runner:
+  experiment_name: rpent-libero-rl-qwen3.5-4b-sao-3node

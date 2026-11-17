@@ -14,6 +14,7 @@
 
 from collections import UserDict
 from contextlib import contextmanager
+from itertools import accumulate
 from typing import Any, Callable, Optional, Sequence, Union
 
 import numpy as np
@@ -65,6 +66,9 @@ def compute_rollout_metrics_dynamic(
     - Uses idx_to_traj to map turns to trajectories
     - Aggregates turn rewards to trajectory level before averaging
     - Supports tool call metrics, eval metrics, and MAS turn metrics
+    - ``response_length`` counts the generated tokens of a row (``response_mask``);
+      ``total_length`` counts every token, including tool results that a row
+      merging several turns carries in its response
 
     Args:
         rollout_batch: Batch containing turn-level data with idx_to_traj mapping
@@ -85,6 +89,7 @@ def compute_rollout_metrics_dynamic(
     response_lengths = rollout_batch["response_lengths"].clone().to(device=device)
     reward_scores = rollout_batch["rewards"].clone().to(device=device)
     is_end = rollout_batch["is_end"].clone().float().to(device=device)
+    generated_lengths = mask.sum(dim=-1)
     idx_to_traj = rollout_batch["idx_to_traj"]
     num_trajectories = max(idx_to_traj) + 1 if idx_to_traj else 0
     num_seq = prompt_lengths.numel()
@@ -178,7 +183,7 @@ def compute_rollout_metrics_dynamic(
     # must use the local tensor size instead.
     if prompt_lengths.numel() > 0:
         local_max_prompt = prompt_lengths.max().item()
-        local_max_response = response_lengths.max().item()
+        local_max_response = generated_lengths.max().item()
         local_max_total = (prompt_lengths + response_lengths).max().item()
     else:
         local_max_prompt = local_max_response = local_max_total = 0
@@ -198,7 +203,7 @@ def compute_rollout_metrics_dynamic(
     rollout_metrics = {
         "total_num_sequence": num_seq,
         "prompt_length": sum_plen / num_seq,
-        "response_length": sum_rlen / num_seq,
+        "response_length": n_valid_token / num_seq,
         "total_length": (sum_plen + sum_rlen) / num_seq,
         "max_prompt_length": int(global_max_prompt),
         "max_response_length": int(global_max_response),
@@ -228,11 +233,14 @@ def compute_rollout_metrics(
     response_lengths = rollout_batch["response_lengths"].clone().to(device=device)
     reward_scores = rollout_batch["rewards"].clone().to(device=device)
     is_end = rollout_batch["is_end"].clone().float().to(device=device)
+    # Tool results inside a response are masked out; count generated tokens.
+    generated_lengths = mask.sum(dim=-1)
 
     dp_world_size = torch.distributed.get_world_size(data_parallel_group)
 
     prompt_lengths_list: list[list[int]] = [None for _ in range(dp_world_size)]
     decode_lengths_list: list[list[int]] = [None for _ in range(dp_world_size)]
+    generated_lengths_list: list[list[int]] = [None for _ in range(dp_world_size)]
     torch.distributed.all_gather_object(
         prompt_lengths_list,
         prompt_lengths.tolist(),
@@ -243,18 +251,26 @@ def compute_rollout_metrics(
         response_lengths.tolist(),
         group=data_parallel_group,
     )
+    torch.distributed.all_gather_object(
+        generated_lengths_list,
+        generated_lengths.tolist(),
+        group=data_parallel_group,
+    )
 
     total_prompt_lengths = torch.tensor(sum(prompt_lengths_list, []), device="cpu")
     total_decode_lengths = torch.tensor(sum(decode_lengths_list, []), device="cpu")
+    total_generated_lengths = torch.tensor(
+        sum(generated_lengths_list, []), device="cpu"
+    )
 
     sum_plen = prompt_lengths.sum().detach().item()
     sum_rlen = response_lengths.sum().detach().item()
     sum_rewards = reward_scores.sum().detach().item()
     sum_end = is_end.sum().detach().item()
 
-    mean_rlen = total_decode_lengths.float().mean().detach().item()
-    var_rlen = total_decode_lengths.float().var().detach().item()
-    min_rlen, max_rlen = total_decode_lengths.float().aminmax()
+    mean_rlen = total_generated_lengths.float().mean().detach().item()
+    var_rlen = total_generated_lengths.float().var().detach().item()
+    min_rlen, max_rlen = total_generated_lengths.float().aminmax()
     min_rlen, max_rlen = min_rlen.detach().item(), max_rlen.detach().item()
 
     valid_adv = torch.masked_select(advantages, mask)
@@ -319,7 +335,7 @@ def compute_rollout_metrics(
     rollout_metrics = {
         "total_num_sequence": num_seq,
         "prompt_length": sum_plen / num_seq,
-        "response_length": sum_rlen / num_seq,
+        "response_length": n_valid_token / num_seq,
         "average_response_length": mean_rlen,
         "variance_of_response_length": var_rlen,
         "max_of_response_length": max_rlen,
@@ -335,6 +351,155 @@ def compute_rollout_metrics(
         rollout_metrics.update(values_metrics)
 
     return rollout_metrics, total_prompt_lengths, total_decode_lengths
+
+
+def _host_collective_group(group):
+    """Use a Gloo group only when it has the caller's data-parallel members."""
+    if group is None:
+        group = torch.distributed.group.WORLD
+    if torch.distributed.get_backend(group) == "gloo":
+        return group
+    try:
+        from megatron.core import parallel_state
+
+        gloo_group = parallel_state.get_data_parallel_group_gloo()
+        if gloo_group is not None and torch.distributed.get_process_group_ranks(
+            gloo_group
+        ) == torch.distributed.get_process_group_ranks(group):
+            return gloo_group
+    except (AssertionError, ImportError, RuntimeError):
+        pass
+    return group
+
+
+def _to_cpu(value):
+    """Copy tensors in a per-row payload to host memory, leaving the rest alone."""
+    if torch.is_tensor(value):
+        return value.cpu()
+    if isinstance(value, dict):
+        return {k: _to_cpu(item) for k, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_cpu(item) for item in value]
+    return value
+
+
+def _exchange_tensor_rows(values, row_counts, partitions, rank, group, pad):
+    """Exchange only assigned rows, retaining at most one peer's transfer buffer."""
+    starts = list(accumulate((0, *row_counts)))
+    assigned = partitions[rank]
+    output = pad.expand(len(assigned), *pad.shape[1:]).clone()
+    local_slots = [
+        slot
+        for slot, index in enumerate(assigned)
+        if starts[rank] <= index < starts[rank + 1]
+    ]
+    local_indices = [assigned[slot] - starts[rank] for slot in local_slots]
+    output[local_slots] = values[local_indices]
+    device = (
+        "cpu"
+        if torch.distributed.get_backend(group) == "gloo"
+        else Worker.torch_platform.current_device()
+    )
+    for peer in range(len(row_counts)):
+        if peer == rank:
+            continue
+        send_indices = [
+            index - starts[rank]
+            for index in partitions[peer]
+            if starts[rank] <= index < starts[rank + 1]
+        ]
+        receive_slots = [
+            slot
+            for slot, index in enumerate(assigned)
+            if starts[peer] <= index < starts[peer + 1]
+        ]
+        outgoing = values[send_indices].to(device).contiguous()
+        incoming = torch.empty(
+            (len(receive_slots), *values.shape[1:]),
+            dtype=values.dtype,
+            device=device,
+        )
+        peer_global = torch.distributed.get_global_rank(group, peer)
+        # Matching peer order also covers ranks that send or receive zero rows.
+        if rank < peer:
+            if outgoing.numel():
+                torch.distributed.send(outgoing, peer_global, group)
+            if incoming.numel():
+                torch.distributed.recv(incoming, peer_global, group)
+        else:
+            if incoming.numel():
+                torch.distributed.recv(incoming, peer_global, group)
+            if outgoing.numel():
+                torch.distributed.send(outgoing, peer_global, group)
+        output[receive_slots] = incoming.cpu()
+        del outgoing, incoming
+    return output
+
+
+def _auxiliary_plan(values, row_counts, partitions, rank, pad_value):
+    """Split a rank's payloads into what it keeps and what each peer receives.
+
+    ``values`` holds this rank's rows in global order and ``partitions`` is the
+    shared row assignment, so the plan is decided without any communication.
+    """
+    world_size = len(row_counts)
+    starts = list(accumulate((0, *row_counts)))[:-1]
+
+    def owner(index):
+        for owner_rank in range(world_size):
+            if (
+                starts[owner_rank]
+                <= index
+                < starts[owner_rank] + row_counts[owner_rank]
+            ):
+                return owner_rank
+        # Rows appended to make the batch divisible belong to no rank.
+        return None
+
+    assigned = partitions[rank]
+    arranged = [pad_value] * len(assigned)
+    slots = {index: slot for slot, index in enumerate(assigned)}
+    for slot, index in enumerate(assigned):
+        if owner(index) == rank:
+            arranged[slot] = values[index - starts[rank]]
+
+    outgoing = {
+        peer: {
+            index: values[index - starts[rank]]
+            for index in partitions[peer]
+            if owner(index) == rank
+        }
+        for peer in range(world_size)
+        if peer != rank
+    }
+    return arranged, slots, outgoing
+
+
+def _exchange_auxiliary(values, row_counts, partitions, rank, group, pad_value):
+    """Deliver each non-tensor payload row to the ranks that train it.
+
+    A rank keeps its own rows in place and fetches the rows it was assigned from
+    their owners, so no rank ever holds more than its own share of the payloads.
+    An all-gather would instead copy the whole global payload list into every
+    rank's memory.
+    """
+    arranged, slots, outgoing = _auxiliary_plan(
+        values, row_counts, partitions, rank, pad_value
+    )
+    for peer, payload in outgoing.items():
+        peer_global_rank = torch.distributed.get_global_rank(group, peer)
+        # The lower rank sends first, so no pair of ranks waits on itself.
+        if rank < peer:
+            torch.distributed.send_object_list([payload], peer_global_rank, group)
+            incoming = [None]
+            torch.distributed.recv_object_list(incoming, peer_global_rank, group)
+        else:
+            incoming = [None]
+            torch.distributed.recv_object_list(incoming, peer_global_rank, group)
+            torch.distributed.send_object_list([payload], peer_global_rank, group)
+        for index, item in incoming[0].items():
+            arranged[slots[index]] = item
+    return arranged
 
 
 class RolloutDataBalance(UserDict):
@@ -612,77 +777,127 @@ class RolloutDataBalance(UserDict):
         partitioning_tool: Callable,
     ) -> Self:
         # 0. Check data
-        assert rollout_batches.keys() == rollout_batch_pad.keys(), (
-            f"rollout_batches and rollout_batch_pad must have the same keys, but these are [{sorted(rollout_batches.keys())}] and [{sorted(rollout_batch_pad.keys())}]"
-        )
         assert (
             "input_ids" in rollout_batches
             and "prompt_lengths" in rollout_batches
             and "response_lengths" in rollout_batches
         )
+        # Per-row payloads that are not tensors, such as a row's image grids,
+        # travel as Python objects next to the tensor batch. Only a rank whose
+        # own rows carried images has that entry, so the ranks agree on the key
+        # set before any payload collective: a rank that skipped a collective
+        # would hang the whole group.
+        local_auxiliary = {
+            k: v for k, v in rollout_batches.items() if not torch.is_tensor(v)
+        }
+        local_tensors = sorted(
+            k for k, v in rollout_batches.items() if torch.is_tensor(v)
+        )
+        local_rows = rollout_batches["input_ids"].size(0)
+        object_group = _host_collective_group(dp_group)
+        manifests = [None] * dp_world_size
+        torch.distributed.all_gather_object(
+            manifests,
+            (local_tensors, sorted(local_auxiliary), local_rows),
+            group=object_group,
+        )
+        tensor_key_sets = {tuple(manifest[0]) for manifest in manifests}
+        assert len(tensor_key_sets) == 1, (
+            f"every data-parallel rank must hold the same tensor entries, got "
+            f"{sorted(tensor_key_sets)}"
+        )
+        auxiliary_keys = sorted({k for manifest in manifests for k in manifest[1]})
+        # get_batch_pad only lists entries the caller passed, so a rank whose
+        # rows carried no images pads that entry with an empty row instead.
+        auxiliary_pad = {
+            k: (rollout_batch_pad[k] if k in rollout_batch_pad else [None])
+            for k in auxiliary_keys
+        }
+        assert all(len(pad) == 1 for pad in auxiliary_pad.values()), (
+            "A non-tensor batch entry needs a one-row pad template."
+        )
+        tensor_batches = {
+            k: v for k, v in rollout_batches.items() if k not in local_auxiliary
+        }
+        tensor_pad = {
+            k: v for k, v in rollout_batch_pad.items() if k not in auxiliary_keys
+        }
+        rollout_batches = tensor_batches
         batch_size = rollout_batches["input_ids"].size(0)
-        assert all(v.size(0) == batch_size for v in rollout_batches.values())
-        assert all(v.size(0) == 1 for v in rollout_batch_pad.values())
-        for k in rollout_batches.keys():
-            assert rollout_batches[k].dtype == rollout_batch_pad[k].dtype, (
-                f"batch dtype mismatch: key: {k}, dtype: {rollout_batches[k].dtype}, {rollout_batch_pad[k].dtype}"
+        # A rank without local image rows contributes empty payloads, so every
+        # rank iterates the same keys in the same order.
+        auxiliary = {
+            k: local_auxiliary.get(k, [None] * batch_size) for k in auxiliary_keys
+        }
+        for k in auxiliary_keys:
+            assert len(auxiliary[k]) == batch_size, (
+                f"Entry {k} holds {len(auxiliary[k])} values for {batch_size} rows."
             )
-            assert rollout_batches[k].shape[1:] == rollout_batch_pad[k].shape[1:], (
-                f"batch shape mismatch: key: {k}, shape: {rollout_batches[k].shape}, {rollout_batch_pad[k].shape}"
+        assert all(v.size(0) == batch_size for v in rollout_batches.values())
+        assert all(v.size(0) == 1 for v in tensor_pad.values())
+        for k in rollout_batches.keys():
+            assert rollout_batches[k].dtype == tensor_pad[k].dtype, (
+                f"batch dtype mismatch: key: {k}, dtype: {rollout_batches[k].dtype}, {tensor_pad[k].dtype}"
+            )
+            assert rollout_batches[k].shape[1:] == tensor_pad[k].shape[1:], (
+                f"batch shape mismatch: key: {k}, shape: {rollout_batches[k].shape}, {tensor_pad[k].shape}"
             )
         rollout_batches = {k: v.cpu() for k, v in rollout_batches.items()}
-        rollout_batch_pad = {k: v.cpu() for k, v in rollout_batch_pad.items()}
+        tensor_pad = {k: v.cpu() for k, v in tensor_pad.items()}
 
-        # 1. Allgather data
-        gathered_rollout_batches = [{} for _ in range(dp_world_size)]
-        for k in sorted(rollout_batches.keys()):
-            rollout_batch_values = [None for _ in range(dp_world_size)]
-            torch.distributed.all_gather_object(
-                rollout_batch_values, rollout_batches[k], group=dp_group
-            )
-            for gathered_batch, value in zip(
-                gathered_rollout_batches, rollout_batch_values
-            ):
-                gathered_batch[k] = value
-
-        global_batch_size = batch_size = sum(
-            b["input_ids"].size(0) for b in gathered_rollout_batches
+        # Only lengths are global; full token tensors stay with their owners.
+        gathered_lengths = [None] * dp_world_size
+        torch.distributed.all_gather_object(
+            gathered_lengths,
+            (
+                rollout_batches["prompt_lengths"] + rollout_batches["response_lengths"]
+            ).tolist(),
+            group=object_group,
         )
-
-        # 2. Merge data and pad data to fixed length
-        if global_batch_size % (dp_world_size * split_fix_chunk) == 0:
-            pad_size = 0
-        else:
-            pad_size = (dp_world_size * split_fix_chunk) - (
-                global_batch_size % (dp_world_size * split_fix_chunk)
-            )
-        # make sure dp_world_size * split_fix_chunk (dp size * self.num_train_steps * self.cfg.actor.micro_batch_size) can be divided by global_batch_size
-        merged_rollout_batches = {}
-        for key in rollout_batches.keys():
-            merged_rollout_batches[key] = torch.cat(
-                [rollout_batches[key] for rollout_batches in gathered_rollout_batches]
-                + [rollout_batch_pad[key]] * pad_size,
-                dim=0,
-            )
-
-        # 3. get length of each sample
-        sample_lengths = (
-            merged_rollout_batches["prompt_lengths"]
-            + merged_rollout_batches["response_lengths"]
-        ).tolist()
+        sample_lengths = [length for lengths in gathered_lengths for length in lengths]
+        global_batch_size = sum(manifest[2] for manifest in manifests)
+        pad_size = -global_batch_size % (dp_world_size * split_fix_chunk)
+        pad_length = int(
+            tensor_pad["prompt_lengths"][0] + tensor_pad["response_lengths"][0]
+        )
+        sample_lengths.extend([pad_length] * pad_size)
 
         # 4. Calc partitions
+        # Every rank derives the same assignment from the gathered lengths, so
+        # it can happen before any payload moves.
         partitions = partitioning_tool(
             seqlen_list=sample_lengths,
             k_partitions=dp_world_size,
             equal_size=True,
         )
-        self_partition = partitions[dp_rank]
+        # 5. Move each payload row to the ranks that train it
+        merged_auxiliary = {}
+        for key, local in auxiliary.items():
+            # The collective marshals its payload through the backend buffer, so
+            # device tensors in an entry (a row's pixel values) would allocate on
+            # the GPU. The forward moves them back when it needs them.
+            merged_auxiliary[key] = _exchange_auxiliary(
+                [_to_cpu(item) for item in local],
+                [manifest[2] for manifest in manifests],
+                partitions,
+                dp_rank,
+                object_group,
+                auxiliary_pad[key][0],
+            )
 
-        # 5. Get indices of samples for current rank
+        # 6. Get indices of samples for current rank
         selected_rollout_batches = {
-            k: v[self_partition] for k, v in merged_rollout_batches.items()
+            key: _exchange_tensor_rows(
+                rollout_batches[key],
+                [manifest[2] for manifest in manifests],
+                partitions,
+                dp_rank,
+                object_group,
+                tensor_pad[key],
+            )
+            for key in local_tensors
         }
+        selected_rollout_batches.update(merged_auxiliary)
 
         return selected_rollout_batches
 
@@ -1292,11 +1507,71 @@ def vocab_parallel_entropy_and_log_probs(
     return entropy, log_probs
 
 
-def vocab_parallel_log_probs_from_logits(logits, labels):
+class _ChunkedVocabParallelLogProbs(torch.autograd.Function):
+    """Recompute vocabulary softmax in bounded token chunks during backward."""
+
+    @staticmethod
+    def forward(ctx, logits, labels, chunk_size, temperature):
+        from megatron.core import tensor_parallel
+
+        ctx.save_for_backward(logits, labels)
+        ctx.chunk_size = chunk_size
+        ctx.temperature = temperature
+        output = torch.empty_like(labels, dtype=torch.float32)
+        for start in range(0, logits.shape[-2], chunk_size):
+            stop = start + chunk_size
+            # Megatron cross-entropy mutates its FP32 input into probabilities.
+            chunk = logits[..., start:stop, :].to(torch.float32, copy=True)
+            chunk.div_(temperature)
+            output[..., start:stop] = -tensor_parallel.vocab_parallel_cross_entropy(
+                chunk, labels[..., start:stop]
+            )
+        return output
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_output):
+        from megatron.core import tensor_parallel
+
+        logits, labels = ctx.saved_tensors
+        grad_input = torch.empty_like(logits)
+        for start in range(0, logits.shape[-2], ctx.chunk_size):
+            stop = start + ctx.chunk_size
+            with torch.enable_grad():
+                chunk = (
+                    logits[..., start:stop, :]
+                    .detach()
+                    .to(torch.float32, copy=True)
+                    .requires_grad_(True)
+                )
+                log_probs = -tensor_parallel.vocab_parallel_cross_entropy(
+                    chunk / ctx.temperature, labels[..., start:stop]
+                )
+                (gradient,) = torch.autograd.grad(
+                    log_probs, chunk, grad_outputs=grad_output[..., start:stop]
+                )
+            grad_input[..., start:stop, :].copy_(gradient)
+        return grad_input, None, None, None
+
+
+def vocab_parallel_log_probs_from_logits(
+    logits, labels, *, chunk_size=0, temperature=1.0
+):
+    """Compute log probabilities, optionally recomputing FP32 softmax by chunk.
+
+    Tensor-parallel peers must use the same token count and chunk size.
+    Chunking preserves the input logits and stores no full FP32 softmax.
+    """
+    if chunk_size > 0:
+        return _ChunkedVocabParallelLogProbs.apply(
+            logits, labels, chunk_size, temperature
+        )
+
     from megatron.core import tensor_parallel
 
     return -tensor_parallel.vocab_parallel_cross_entropy(
-        vocab_parallel_logits=logits, target=labels
+        vocab_parallel_logits=logits / temperature if temperature != 1.0 else logits,
+        target=labels,
     )
 
 

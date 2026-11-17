@@ -582,6 +582,7 @@ class _StubRunner:
         self.critic = critic
 
     _is_complete_checkpoint = ReasoningRunner._is_complete_checkpoint
+    _save_data_state = ReasoningRunner._save_data_state
 
 
 class _ImmediateHandle:

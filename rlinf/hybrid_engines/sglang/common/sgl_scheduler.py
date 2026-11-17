@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from dataclasses import fields
 from importlib.metadata import version
 from typing import Any, Callable, Literal, Optional
 
@@ -32,9 +33,10 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.scheduler import Scheduler as _Scheduler
 from sglang.srt.managers.scheduler import logger
 from sglang.srt.managers.scheduler import (
-    run_scheduler_process as _run_scheduler_process,
+    run_scheduler_process as ORIG__run_scheduler_process,
 )
 
+from rlinf.hybrid_engines.sglang.multimodal.token_space import is_token_space_build
 from rlinf.scheduler import Worker, WorkerAddress
 from rlinf.utils.placement import (
     ModelParallelComponentPlacement,
@@ -78,9 +80,19 @@ class Scheduler(_Scheduler):
     """
 
     def __init__(self, *args, **kwargs):
+        # An empty dict is paused; None permits requests to enter the scheduler.
+        self._rlinf_parked = None
+        self._rlinf_update_incomplete = False
+        self._rlinf_weight_version = None
+        self._rlinf_generated_tokens = 0
+        self._rlinf_retractions = 0
         # Must run before super().__init__, which builds the model.
         patch_glm4_moe_lite_shared_expert_tp1()
         super().__init__(*args, **kwargs)
+        if not hasattr(self, "tp_rank"):
+            from sglang.srt.runtime_context import get_parallel
+
+            self.tp_rank = get_parallel().tp_rank
         # `TpModelWorkerClient` is used when ServerArgs.enable_overlap=True, and it has 'worker' attribute.
         # But in early SGLang version, `TpModelWorker` doesn't have 'worker' attribute.
         if not hasattr(self.tp_worker, "worker"):
@@ -110,7 +122,9 @@ class Scheduler(_Scheduler):
             sglang_version = parse(version("sglang"))
         except Exception as e:
             raise ValueError(f"sglang version not supported: {e}")
-        self.patch_return_output_ids = sglang_version < parse("0.5.0")
+        self.patch_return_output_ids = (
+            sglang_version < parse("0.5.0") and not is_token_space_build()
+        )
 
     def cuda_info(self, text: str = ""):
         free_gpu_memory, total_gpu_memory = Worker.torch_platform.mem_get_info()
@@ -239,12 +253,11 @@ class Scheduler(_Scheduler):
         batch_weight.clear()
 
     def sync_hf_weight(self, recv_req: SyncHFWeightInput):
+        self._check_weight_update_state()
+        self._rlinf_update_incomplete = True
         assert self.weight_reload == "sync", (
             "only sglang with 'sync' can run 'sync_hf_weight'"
         )
-        use_cudagraph = not self.cfg.rollout.enforce_eager
-        assert use_cudagraph, "use_cudagraph must be True now."
-
         # Under overlap scheduling an already-launched batch may still be on
         # the GPU when a pause leaves it unprocessed; wait before load_weights.
         Worker.torch_platform.synchronize()
@@ -314,7 +327,174 @@ class Scheduler(_Scheduler):
             self.weight_norm_dict = None
 
         self._handle_cache_after_sync(recv_req.pause_mode)
-        return SyncHFWeightOutput()
+        if recv_req.weight_version is not None:
+            self._rlinf_weight_version = recv_req.weight_version
+        self._rlinf_update_incomplete = False
+        return SyncHFWeightOutput(weight_version=self._rlinf_weight_version)
+
+    def _add_request_to_queue(self, req, is_retracted=False):
+        if self._rlinf_parked is not None:
+            self._rlinf_parked[req.rid] = req
+        elif is_retracted:
+            super()._add_request_to_queue(req, is_retracted=True)
+        else:
+            super()._add_request_to_queue(req)
+
+    def maybe_collect_customized_info(self, i, req, logits_output):
+        super().maybe_collect_customized_info(i, req, logits_output)
+        self._stamp_generated_weight_versions(req)
+
+    def init_batch_result_processor(self) -> None:
+        """Install the token-version hook on component-based SGLang schedulers."""
+        super().init_batch_result_processor()
+        processor = self.batch_result_processor
+        stamp_versions = self._stamp_generated_weight_versions
+
+        class VersionedBatchResultProcessor(type(processor)):
+            def _maybe_collect_customized_info(self, i, req, logits_output):
+                super()._maybe_collect_customized_info(i, req, logits_output)
+                stamp_versions(req)
+
+        self.batch_result_processor = VersionedBatchResultProcessor(
+            **{
+                field.name: getattr(processor, field.name)
+                for field in fields(processor)
+            }
+        )
+
+    def _stamp_generated_weight_versions(self, req) -> None:
+        if self._rlinf_weight_version is not None:
+            if req.customized_info is None:
+                req.customized_info = {}
+            versions = req.customized_info.setdefault("rollout_weight_versions", [])
+            count = len(req.output_ids) - len(versions)
+            if count < 0:
+                raise RuntimeError("Generated token prefixes must survive retraction.")
+            versions.extend([self._rlinf_weight_version] * count)
+            self._rlinf_generated_tokens += count
+
+    def _active_rollout_requests(self):
+        requests = {req.rid: req for req in self.waiting_queue}
+        # Component schedulers expose running and last batches at request dispatch.
+        for batch in (
+            self.running_batch,
+            self.last_batch,
+            getattr(self, "cur_batch", None),
+        ):
+            if batch is not None:
+                requests.update((req.rid, req) for req in batch.reqs)
+        if self.chunked_req is not None:
+            requests[self.chunked_req.rid] = self.chunked_req
+        return requests
+
+    def _check_weight_update_state(self) -> None:
+        if self._rlinf_update_incomplete:
+            raise RuntimeError(
+                "A previous pause or weight sync did not complete; restart the "
+                "rollout engine before resuming generation or publishing weights."
+            )
+
+    def pause_for_weight_update(self) -> dict[str, Any]:
+        """Acknowledge drained GPU work and park requests outside cache ownership."""
+        from sglang.srt.managers.io_struct import PauseGenerationReqInput
+
+        self._check_weight_update_state()
+        if self._rlinf_parked is not None:
+            return self.get_async_rollout_state()
+        self._rlinf_update_incomplete = True
+        requests = self._active_rollout_requests()
+        self._rlinf_parked = {}
+        super().pause_generation(PauseGenerationReqInput(mode="retract"))
+        if self.enable_overlap:
+            while self.result_queue:
+                batch, result = self.result_queue.popleft()
+                self.process_batch_result(batch, result)
+        for req in requests.values():
+            if not req.finished():
+                self._rlinf_parked[req.rid] = req
+        for req in self._rlinf_parked.values():
+            if hasattr(req, "kv"):
+                # SGLang owns request pool rows and releases them during retraction.
+                if req.kv.holds_kv or req.kv.holds_mamba:
+                    raise RuntimeError(
+                        f"Retracted request {req.rid} still owns a GPU cache row."
+                    )
+            else:
+                if not req.is_retracted or req.kv_allocated_len:
+                    req.reset_for_retract()
+                req.req_pool_idx = None
+            if req.logprob_start_len >= len(req.origin_input_ids):
+                # Output-only logprobs already cover the retained generated prefix.
+                req.logprob_start_len = -1
+        self._rlinf_retractions += len(self._rlinf_parked)
+        self.waiting_queue.clear()
+        self.running_batch.filter_batch(keep_indices=[])
+        self.last_batch = self.chunked_req = None
+        if hasattr(self, "cur_batch"):
+            self.cur_batch = None
+            self._chunked_req_scheduled_last_iter = False
+        self._rlinf_worker.torch_platform.synchronize()
+        if not self.flush_cache():
+            raise RuntimeError(
+                "Retraction left active GPU state; refusing weight publication."
+            )
+        self._rlinf_update_incomplete = False
+        return self.get_async_rollout_state()
+
+    def resume_after_weight_update(self) -> dict[str, Any]:
+        """Restore parked requests for prefill under the fully installed weights."""
+        from sglang.srt.managers.io_struct import ContinueGenerationReqInput
+
+        self._check_weight_update_state()
+        if self._rlinf_parked is not None:
+            requests = list(self._rlinf_parked.values())
+            self._rlinf_parked = None
+            for req in requests:
+                self._add_request_to_queue(req, is_retracted=True)
+        super().continue_generation(ContinueGenerationReqInput())
+        return self.get_async_rollout_state()
+
+    def get_async_rollout_state(
+        self, include_requests: bool = False, include_live_requests: bool = False
+    ) -> dict[str, Any]:
+        """Return publication and generation counters, with optional paused prefixes."""
+        parked = self._rlinf_parked or {}
+        state = {
+            "weight_version": self._rlinf_weight_version,
+            "paused": self._rlinf_parked is not None
+            and not self._rlinf_update_incomplete,
+            "update_incomplete": self._rlinf_update_incomplete,
+            "parked_requests": len(parked),
+            "generated_tokens": self._rlinf_generated_tokens,
+            "retracted_requests": self._rlinf_retractions,
+        }
+        if include_requests:
+            state["requests"] = {
+                rid: {
+                    "output_ids": list(req.output_ids),
+                    "logprobs": list(
+                        getattr(req, "logprob", req).output_token_logprobs_val or []
+                    ),
+                    "weight_versions": (req.customized_info or {}).get(
+                        "rollout_weight_versions", []
+                    ),
+                }
+                for rid, req in parked.items()
+            }
+        if include_live_requests:
+            requests = self._active_rollout_requests()
+            queued = {req.rid for req in self.waiting_queue}
+            state["live_requests"] = {
+                rid: {
+                    "output_tokens": len(req.output_ids),
+                    "prompt_tokens": len(req.origin_input_ids),
+                    "cached_tokens": req.cached_tokens,
+                    "queued": rid in queued,
+                }
+                for rid, req in requests.items()
+                if not req.finished()
+            }
+        return state
 
     def _handle_cache_after_sync(self, pause_mode: Optional[str]):
         """Handle prefix tree / KV caches at the end of `sync_hf_weight`.
@@ -483,17 +663,32 @@ class Scheduler(_Scheduler):
             )
 
     def get_scheduler_running_state(self):
-        num_used = self.max_total_num_tokens - (
-            self.token_to_kv_pool_allocator.available_size()
-            + self.tree_cache.evictable_size()
-        )
+        capacity = self.max_total_num_tokens
+        get_pool_stats = getattr(self, "get_pool_stats", None)
+        observer = getattr(self, "pool_stats_observer", None)
+        if observer is not None:
+            stats = observer.get_pool_stats()
+            num_used = stats.full_num_used
+            if stats.full_capacity is not None:
+                capacity = stats.full_capacity
+            token_usage = stats.full_token_usage
+        elif get_pool_stats is not None:
+            # Hybrid caches account for full KV tokens and recurrent slots separately.
+            num_used = get_pool_stats().full_num_used
+            token_usage = num_used / capacity
+        else:
+            num_used = capacity - (
+                self.token_to_kv_pool_allocator.available_size()
+                + self.tree_cache.evictable_size()
+            )
+            token_usage = num_used / capacity
         num_running_reqs = len(self.running_batch.reqs)
         return {
             "num_running_reqs": num_running_reqs,
             "max_running_reqs": self.max_running_requests,
             "num_used_tokens": num_used,
-            "max_total_num_tokens": self.max_total_num_tokens,
-            "token_usage": num_used / self.max_total_num_tokens,
+            "max_total_num_tokens": capacity,
+            "token_usage": token_usage,
             "num_queue_reqs": len(self.waiting_queue),
         }
 
@@ -786,4 +981,4 @@ def run_scheduler_process(*args, **kwargs):
         "rlinf.hybrid_engines.sglang.common.sgl_scheduler.Scheduler",
     )
     Patcher.apply()
-    _run_scheduler_process(*args, **kwargs)
+    ORIG__run_scheduler_process(*args, **kwargs)

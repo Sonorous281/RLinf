@@ -19,7 +19,7 @@ import itertools
 import os
 from contextlib import contextmanager, nullcontext
 from functools import partial
-from typing import TYPE_CHECKING, Iterator, Optional
+from typing import TYPE_CHECKING, Callable, Iterator, Optional
 
 import megatron
 import torch
@@ -134,6 +134,25 @@ def get_specs(spec_name, transformer_config=None, use_te=False):
     return name_spec_dict[spec_name]
 
 
+def parameter_group_rates(optimizer) -> list[tuple]:
+    """Return each parameter group's scheduled ``max_lr`` and ``min_lr``."""
+    return [
+        (group.get("max_lr"), group.get("min_lr")) for group in optimizer.param_groups
+    ]
+
+
+def restore_parameter_group_rates(optimizer, scheduler, rates: list[tuple]) -> None:
+    """Give restored parameter groups the configured rates and reschedule them.
+
+    Megatron schedules each group from its own ``max_lr`` and ``min_lr``, which a
+    checkpoint restores; ``override_opt_param_scheduler`` alone resets only the
+    scheduler's values, so the restored rates would stay in effect.
+    """
+    for group, (max_lr, min_lr) in zip(optimizer.param_groups, rates, strict=True):
+        group["max_lr"], group["min_lr"] = max_lr, min_lr
+    scheduler.step(increment=0)
+
+
 # copied from verl
 class LinearForLastLayer(torch.nn.Linear):
     def __init__(
@@ -183,8 +202,10 @@ def patch_load_checkpoint_to_be_non_strict(enable: bool):
         load_checkpoint_orig = megatron.training.training.load_checkpoint
         load_checkpoint_patched = partial(load_checkpoint_orig, strict=False)
         megatron.training.training.load_checkpoint = load_checkpoint_patched
-        yield
-        megatron.training.training.load_checkpoint = load_checkpoint_orig
+        try:
+            yield
+        finally:
+            megatron.training.training.load_checkpoint = load_checkpoint_orig
 
     if enable:
         return context()
@@ -305,7 +326,9 @@ class MegatronModelManager:
         # Only override user-controllable runtime fields
         # e.g. multi_latent_attention=True -> False
         _model_type = getattr(self._cfg.model, "model_type", None)
-        if _model_type in ("deepseek_v3", "glm4_moe_lite"):
+        # These bridges set architecture fields (attention variants, gates,
+        # layer patterns) that generic TransformerConfig defaults would replace.
+        if _model_type in ("deepseek_v3", "glm4_moe_lite", "qwen3_5"):
             _mbridge_user_override_fields = {
                 "fp16",
                 "bf16",
@@ -318,6 +341,7 @@ class MegatronModelManager:
                 "pipeline_model_parallel_size",
                 "expert_model_parallel_size",
                 "context_parallel_size",
+                "attention_backend",
                 "gradient_accumulation_fusion",
                 "moe_aux_loss_coeff",
                 "moe_router_bias_update_rate",
@@ -338,6 +362,12 @@ class MegatronModelManager:
         provider.position_embedding_type = position_embedding_type
         if hasattr(provider, "vision_config"):
             provider.vision_config._attn_implementation = resolve_attn_implementation()
+        if _model_type == "qwen3_5":
+            # RL scores next tokens only; exported policies carry no MTP weights.
+            provider.mtp_num_layers = None
+        if self.is_dedicated_critic_model:
+            # Runs after the bridge hook that loads the language model weights.
+            provider.register_pre_wrap_hook(self._attach_value_head)
 
         # the Mbridge run the qwen3-vl-moe model will freeze the language model and vision model by default.
         provider.freeze_language_model = getattr(
@@ -457,16 +487,39 @@ class MegatronModelManager:
             )
 
         if self.is_dedicated_critic_model and post_process:
-            # replace lm head with value head if this is a critic model
-            model.output_layer = LinearForLastLayer(
-                input_size=self._cfg.model.hidden_size,
-                output_size=1,
-                sequence_parallel=self._cfg.model.sequence_parallel,
-                weight_init=self._cfg.get("value_head_init", "normal"),
-                init_std=self._cfg.model.get("init_method_std", 0.02),
+            model.output_layer = self._value_head(
+                self._cfg.model.hidden_size, self._cfg.model.sequence_parallel
             )
 
         return model
+
+    def _value_head(self, hidden_size: int, sequence_parallel: bool) -> torch.nn.Module:
+        """Return the scalar projection that replaces a critic's language-model head."""
+        return LinearForLastLayer(
+            input_size=hidden_size,
+            output_size=1,
+            sequence_parallel=sequence_parallel,
+            weight_init=self._cfg.get("value_head_init", "normal"),
+            init_std=self._cfg.model.get("init_method_std", 0.02),
+        )
+
+    def _attach_value_head(self, model_chunks: list) -> list:
+        """Replace the language-model head of bridge-built critic chunks."""
+        for chunk in model_chunks:
+            if not chunk.post_process:
+                continue
+            head = self._value_head(
+                chunk.config.hidden_size, chunk.config.sequence_parallel
+            ).to(next(chunk.parameters()).device)
+            if hasattr(chunk, "output_layer"):
+                # A value head never shares the input embedding weights.
+                chunk.share_embeddings_and_output_weights = False
+                chunk.output_layer = head
+            else:
+                # A vision-language chunk keeps its head on the language model.
+                chunk.language_model.share_embeddings_and_output_weights = False
+                chunk.language_model.output_layer = head
+        return model_chunks
 
     def optimizer_step(self, increment):
         success, grad_norm, num_zeros_in_grad = self.optimizer.step()
@@ -569,8 +622,9 @@ class MegatronModelManager:
 
     @contextmanager
     def ensure_onloaded_and_then_offload(self):
+        """Onload checkpoint state, then apply the configured residency policy."""
         # if weights and opt states are offloaded, recover them first
-        if self.is_weight_offloaded:
+        if self.is_weight_offloaded or self.is_grad_offloaded:
             self.onload_model_weights_and_grad()
         if self.is_optimizer_offloaded:
             self.onload_megatron_optimizer()
@@ -581,8 +635,57 @@ class MegatronModelManager:
         if hasattr(self, "megatron_type") and self.megatron_type == "sft":
             return
 
-        self.offload_model_weights_and_grad()
-        self.offload_megatron_optimizer()
+        offload_weight = self._cfg.get("offload_weight", True)
+        offload_grad = self._cfg.get("offload_grad", True)
+        if offload_weight or offload_grad:
+            self.offload_model_weights_and_grad(
+                offload_weight=offload_weight, offload_grad=offload_grad
+            )
+        if self._cfg.get("offload_optimizer", True):
+            self.offload_megatron_optimizer()
+
+    # Fields Bridge reads to decide whether the source checkpoint carries MTP
+    # layers. They mirror `MTP_CONFIG_FIELDS` in megatron.bridge.
+    _MTP_LAYER_FIELDS = (
+        "num_nextn_predict_layers",
+        "mtp_num_hidden_layers",
+        "mtp_num_layers",
+    )
+
+    def _mark_export_without_mtp(self) -> None:
+        """State that the exported policy has no MTP layers.
+
+        The trained model drops the MTP head, so the weight export cannot yield
+        the ``mtp.*`` tensors the source checkpoint declares. Bridge only removes
+        them from its expected key set when a config field reads zero; otherwise
+        every source shard stays incomplete and the export writes no weights at
+        all while still reporting success.
+        """
+        pretrained = getattr(self.bridge, "hf_pretrained", None)
+        config = getattr(pretrained, "config", pretrained)
+        for target in (getattr(config, "text_config", None), config):
+            if target is None:
+                continue
+            for field in self._MTP_LAYER_FIELDS:
+                value = getattr(target, field, None)
+                if value is None:
+                    continue
+                if int(value) != 0:
+                    setattr(target, field, 0)
+                break
+
+    @staticmethod
+    def _require_exported_weights(hf_save_path: str) -> None:
+        """Fail loudly when an export wrote configuration but no weight shard."""
+        if not os.path.isdir(hf_save_path):
+            raise RuntimeError(
+                f"Hugging Face export produced no directory: {hf_save_path}"
+            )
+        if not any(name.endswith(".safetensors") for name in os.listdir(hf_save_path)):
+            raise RuntimeError(
+                f"Hugging Face export wrote no weight shards under {hf_save_path}. "
+                "The trainer would report a policy checkpoint that no rollout can load."
+            )
 
     def save_checkpoint(
         self,
@@ -594,9 +697,11 @@ class MegatronModelManager:
             return
 
         with self.ensure_onloaded_and_then_offload():
-            if self.mbridge:
+            # A value head has no Hugging Face counterpart to export.
+            if self.mbridge and not self.is_dedicated_critic_model:
                 # save mbridge checkpoint to hf checkpoint
                 hf_save_path = os.path.join(save_path, "hf_checkpoint")
+                self._mark_export_without_mtp()
                 self.bridge.save_hf_pretrained(
                     self.model,
                     hf_save_path,
@@ -604,6 +709,7 @@ class MegatronModelManager:
                     show_progress=(torch.distributed.get_rank() == 0),
                     strict=True,
                 )
+                self._require_exported_weights(hf_save_path)
             # for the next training, we also need to save the megatron checkpoint
 
             args = get_args()
@@ -624,6 +730,11 @@ class MegatronModelManager:
             args.load = load_path
             if self.mbridge:
                 args.phase_transition_iterations = None
+            override_rates = self.optimizer is not None and self._cfg.get(
+                "lr_sched", {}
+            ).get("override_opt_param_scheduler", False)
+            if override_rates:
+                configured_rates = parameter_group_rates(self.optimizer)
             # [torch>=2.6 defaults torch.load to weights_only=True
             original_torch_load = torch.load
 
@@ -641,6 +752,10 @@ class MegatronModelManager:
                 )
             finally:
                 torch.load = original_torch_load
+            if override_rates:
+                restore_parameter_group_rates(
+                    self.optimizer, self.lr_scheduler, configured_rates
+                )
 
     def load_state_dict(self, state_dict, strict=True):
         if len(self.model) == 1:
@@ -677,28 +792,65 @@ class MegatronModelManager:
         max_batch_seqlen: int = 4096,
         padding_seqlen: Optional[int] = None,
         keep_left_padding: bool = False,
+        trim_right_padding: bool = False,
+        scoring_forward: Optional[Callable] = None,
+        multimodal_position_ids: Optional[torch.Tensor] = None,
         **model_forward_kwargs,
     ):
-        """Default forward pass for GPT models with optional sequence packing."""
+        """Pack model inputs and restore outputs to the caller's padded layout.
+
+        ``scoring_forward`` can replace the packed model/LM-head forward. It
+        receives the wrapper, unwrapped model and packed scoring arguments,
+        and returns per-token scores instead of vocabulary logits.
+        """
         pre_process = unwrap_model(model).pre_process
         post_process = unwrap_model(model).post_process
+        if scoring_forward is not None and (
+            value_model or logits_processor is None or not pack_seqs
+        ):
+            raise ValueError(
+                "A scoring forward requires packed Actor inputs and logits processor arguments"
+            )
+        if multimodal_position_ids is not None and not pack_seqs:
+            raise ValueError(
+                "Token-space verification requires the packed Bridge forward"
+            )
         if pack_seqs:
+            # Bridge Qwen-VL embeds images before its own THD/CP packing.
+            packs_in_model = any(
+                cls.__module__.startswith("megatron.bridge.models.qwen_vl.")
+                for cls in type(unwrap_model(model)).__mro__
+            )
             batch_size, seq_len = attention_mask.shape[:2]
             input_ids_rmpad, packed_seq_params = preprocess_packed_seqs(
                 input_ids,
                 attention_mask,
-                pre_process=pre_process,
+                pre_process=pre_process and not packs_in_model,
                 padding_seqlen=padding_seqlen,
             )
             input_ids_rmpad = input_ids_rmpad.contiguous()
-            output_orig = model(
+            model_attention_mask = attention_mask if packs_in_model else None
+            model_position_ids = position_ids
+            if packs_in_model and trim_right_padding:
+                # Qwen-VL embeds its dense inputs before packing. Do not run its
+                # vision/language path over context-cap padding. Keep the original
+                # mask below so logprobs/values return with the caller's full width.
+                columns = attention_mask.any(dim=0).nonzero(as_tuple=True)[0]
+                used = int(columns[-1]) + 1 if columns.numel() else 1
+                tp = parallel_state.get_tensor_model_parallel_world_size()
+                cp = parallel_state.get_context_parallel_world_size()
+                alignment = tp * (2 * cp if cp > 1 else 1)
+                used = min(seq_len, (used + alignment - 1) // alignment * alignment)
+                input_ids_rmpad = input_ids_rmpad[:, :used].contiguous()
+                model_attention_mask = attention_mask[:, :used].contiguous()
+                model_position_ids = position_ids[..., :used].contiguous()
+            model_inputs = dict(
                 input_ids=input_ids_rmpad,
-                attention_mask=None,
-                position_ids=position_ids,
+                attention_mask=model_attention_mask,
+                position_ids=model_position_ids,
                 packed_seq_params=packed_seq_params,
                 **model_forward_kwargs,
             )
-            output_orig /= temperature
             if post_process and logits_processor is not None:
                 args = {
                     k: preprocess_packed_seqs(
@@ -709,7 +861,34 @@ class MegatronModelManager:
                     )[0]
                     for k, v in logits_processor_args.items()
                 }
-                output_dict = logits_processor(output_orig, **args)
+            verification = nullcontext()
+            if multimodal_position_ids is not None:
+                from rlinf.hybrid_engines.megatron.qwen_vl_inputs import (
+                    verify_qwen_vl_positions,
+                )
+
+                verification = verify_qwen_vl_positions(
+                    unwrap_model(model),
+                    multimodal_position_ids[..., : input_ids_rmpad.shape[1]],
+                    model_attention_mask,
+                )
+            with verification:
+                if post_process and scoring_forward is not None:
+                    output_orig = scoring_forward(
+                        model,
+                        unwrap_model(model),
+                        **args,
+                        temperature=temperature,
+                        **model_inputs,
+                    )
+                else:
+                    output_orig = model(**model_inputs)
+                    output_orig /= temperature
+            if post_process and logits_processor is not None:
+                if scoring_forward is not None:
+                    output_dict = output_orig
+                else:
+                    output_dict = logits_processor(output_orig, **args)
                 output = {
                     k: postprocess_packed_seqs(
                         v,

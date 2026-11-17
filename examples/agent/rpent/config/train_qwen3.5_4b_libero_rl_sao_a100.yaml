@@ -1,0 +1,102 @@
+# Single-node A100 80 GB validation: TP2 learner, one server, four environments.
+defaults:
+  - train_qwen3.5_4b_libero_rl_sao
+  - _self_
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: 0-1
+    critic: 0-1
+    rollout: "2"
+    reward: "2"
+    agentloop: "3"
+
+runner:
+  experiment_name: rpent-libero-rl-a100
+  max_steps: 2
+  save_interval: 1
+  seq_length: 16384
+  max_tokens_per_mbs: 16384
+
+algorithm:
+  recompute_logprobs: true
+  importance_sampling_fix: true
+  importance_sampling_clip: 2.0
+  sampling_params:
+    max_new_tokens: 8192
+
+data:
+  rollout_batch_size: 8
+  shuffle: false
+  num_workers: 0
+
+agentloop:
+  max_turns: 25
+  max_infra_retries: 0
+  model_request_timeout_s: 180
+  episode_timeout_s: 900
+  history_compaction:
+    max_messages: 32
+    keep_messages: 16
+
+tools:
+  rpent:
+    # Start one SAM3 service on GPU 3; all four environments share it.
+    sam3_endpoint: http://127.0.0.1:18147
+    env_gpus: [3]
+    episodes_per_worker: 4
+    max_env_initializations_per_worker: 2
+    max_episode_steps: 1200
+    process_timeout_s: 960
+    store_images_on_disk: true
+
+rollout:
+  tensor_parallel_size: 1
+  max_running_requests: 4
+  cuda_graph_max_bs: 4
+  gpu_memory_utilization: 0.55
+  enforce_eager: true
+  return_logprobs: true
+  max_weight_staleness: 1
+  max_in_flight_rollouts: 4
+  rollout_buffer_capacity: 8
+  env_vars:
+    SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE: ""
+  sglang:
+    backend_type: server
+    enable_weights_cpu_backup: true
+    enable_shared_multi_modal_processor: true
+    enable_token_space_preprocess_cache: true
+    token_space_preprocess_cache_dir: ${runner.output_dir}/${runner.experiment_name}/preprocess-cache
+    token_space_preprocess_cache_trust_url: true
+    context_length: 16384
+
+actor:
+  multimodal:
+    prefetch_batches: 2
+    prefetch_bytes: 134217728
+  model:
+    tensor_model_parallel_size: 2
+    sequence_parallel: true
+    lm_head_chunk_size: 256
+  optim:
+    optimizer_enable_pin: false
+    optimizer_cpu_offload: true
+    optimizer_offload_fraction: 1.0
+  megatron:
+    mbridge: true
+
+critic:
+  multimodal:
+    prefetch_batches: 2
+    prefetch_bytes: 134217728
+  model:
+    tensor_model_parallel_size: 2
+    sequence_parallel: true
+  optim:
+    optimizer_enable_pin: false
+    optimizer_cpu_offload: true
+    optimizer_offload_fraction: 1.0
+  megatron:
+    mbridge: true
