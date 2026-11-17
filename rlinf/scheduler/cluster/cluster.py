@@ -155,15 +155,27 @@ class Cluster:
         Args:
             max_port_num (Optional[int]): Largest acceptable port. Use it for servers that
                 derive a second port from this one and would overflow past 65535.
+                A supplied limit must be between 1024 and 65535.
         """
+        import errno
+        import secrets
         import socket
 
-        for _ in range(1000):
+        if max_port_num is None:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind(("", 0))
-                port = s.getsockname()[1]
-            if max_port_num is None or port <= max_port_num:
-                return port
+                return s.getsockname()[1]
+        if not 1024 <= max_port_num <= 65535:
+            raise ValueError("max_port_num must be between 1024 and 65535")
+        for _ in range(1000):
+            port = 1024 + secrets.randbelow(max_port_num - 1023)
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("", port))
+                    return s.getsockname()[1]
+            except OSError as error:
+                if error.errno != errno.EADDRINUSE:
+                    raise
         raise RuntimeError(f"Failed to find a free port at most {max_port_num}.")
 
     @classmethod
@@ -454,32 +466,79 @@ class Cluster:
         except ValueError:
             raise Cluster.NamespaceConflictError
 
-        def signal_handler(sig, frame):
-            # Exit the main process if SIGUSR1 is received, which is sent by the worker group when an exception occurs.
+        signal.signal(signal.SIGUSR1, self._handle_worker_failure)
+
+    def _handle_worker_failure(self, sig: int, frame: Any) -> None:
+        """Stop this namespace and exit when a worker reports an error.
+
+        Args:
+            sig: Worker-failure signal number.
+            frame: Interrupted driver frame.
+        """
+        try:
             sys.stdout.flush()
             sys.stderr.flush()
             if self._distributed_log_collector is not None:
                 self._distributed_log_collector.stop()
 
-            with without_http_proxies():
-                alive_actors = list_actors(
-                    filters=[
-                        ("STATE", "=", "ALIVE"),
-                        ("RAY_NAMESPACE", "=", Cluster.NAMESPACE),
-                    ]
+            try:
+                with without_http_proxies():
+                    alive_actors = list_actors(
+                        filters=[
+                            ("STATE", "=", "ALIVE"),
+                            ("RAY_NAMESPACE", "=", Cluster.NAMESPACE),
+                        ]
+                    )
+                actor_names = [
+                    actor.name
+                    for actor in alive_actors
+                    if actor.name
+                    and getattr(actor, "ray_namespace", Cluster.NAMESPACE)
+                    == Cluster.NAMESPACE
+                ]
+            except Exception as exc:
+                self._logger.warning(
+                    "Ray State API unavailable during worker-failure cleanup; "
+                    "listing named actors through GCS: %s",
+                    exc,
                 )
-            for actor_state in alive_actors:
-                actor = ray.get_actor(actor_state.name)
-                ray.kill(actor, no_restart=True)
+                try:
+                    actor_names = [
+                        actor["name"]
+                        for actor in ray.util.list_named_actors(all_namespaces=True)
+                        if actor.get("namespace") == Cluster.NAMESPACE
+                        and actor.get("name")
+                    ]
+                except Exception as gcs_exc:
+                    self._logger.warning(
+                        "GCS actor discovery also failed during worker-failure "
+                        "cleanup: %s",
+                        gcs_exc,
+                    )
+                    actor_names = []
+
+            for name in actor_names:
+                try:
+                    actor = ray.get_actor(name, namespace=Cluster.NAMESPACE)
+                    ray.kill(actor, no_restart=True)
+                except Exception as exc:
+                    # A failed worker may disappear between discovery and lookup.
+                    self._logger.warning(
+                        "Could not stop actor %r in namespace %r: %s",
+                        name,
+                        Cluster.NAMESPACE,
+                        exc,
+                    )
 
             if ray.is_initialized():
-                # Mimic ray's sleep before shutdown to ensure log messages are flushed
+                # Let pending log messages flush before disconnecting the driver.
                 time.sleep(0.5)
                 ray.shutdown(_exiting_interpreter=True)
+        except Exception as exc:
+            self._logger.warning("Worker-failure cleanup did not finish: %s", exc)
+        finally:
             print("Exiting main process due to a failure upon worker execution.")
-            exit(-1)
-
-        signal.signal(signal.SIGUSR1, signal_handler)
+            sys.exit(-1)
 
     def _start_local_ray(self, ray_init_kwargs: dict[str, Any]):
         """Start a local Ray instance, retrying once if the node fails to come up.

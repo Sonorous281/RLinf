@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import logging
 import os
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import ray
@@ -1276,6 +1279,24 @@ def test_process_that_built_a_cluster_keeps_its_exit_code():
     assert result.returncode == 3, result.stderr
 
 
+@pytest.mark.parametrize("limit", [None, 8192])
+def test_cluster_find_free_port_respects_limit(limit):
+    port = Cluster.find_free_port(max_port_num=limit)
+    assert 1024 <= port <= (limit or 65535)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("", port))
+
+
+def test_cluster_find_free_port_reports_occupied_bounded_range():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        try:
+            listener.bind(("", 1024))
+        except OSError:
+            pytest.skip("Port 1024 cannot be held on this host")
+        with pytest.raises(RuntimeError, match="Failed to find a free port"):
+            Cluster.find_free_port(max_port_num=1024)
+
+
 @pytest.mark.skipif(not hasattr(signal, "SIGSEGV"), reason="POSIX SIGSEGV required")
 @pytest.mark.parametrize(
     ("assertion_expr", "expected_rc", "expected_marker"),
@@ -1314,3 +1335,134 @@ def test_npu_ray_pytest_teardown_preserves_status_and_summary(
     assert expected_marker in result.stdout, (
         f"Expected {expected_marker!r} in pytest stdout, got {result.stdout!r}"
     )
+
+
+@pytest.fixture
+def cleanup(monkeypatch):
+    module = importlib.import_module("rlinf.scheduler.cluster.cluster")
+    monkeypatch.setattr(module.Cluster, "NAMESPACE", "this-run")
+    looked_up = []
+    killed = []
+    shutdown = []
+
+    def get_actor(name, *, namespace):
+        looked_up.append((name, namespace))
+        return name
+
+    monkeypatch.setattr(module.ray, "get_actor", get_actor)
+    monkeypatch.setattr(
+        module.ray,
+        "kill",
+        lambda actor, *, no_restart: killed.append((actor, no_restart)),
+    )
+    monkeypatch.setattr(module.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        module.ray,
+        "shutdown",
+        lambda **kwargs: shutdown.append(kwargs),
+    )
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+    state = SimpleNamespace(
+        _distributed_log_collector=None,
+        _logger=logging.getLogger("test.cluster.worker_failure"),
+    )
+    return SimpleNamespace(
+        module=module,
+        state=state,
+        looked_up=looked_up,
+        killed=killed,
+        shutdown=shutdown,
+    )
+
+
+def _fail_worker(cleanup, capsys):
+    print("original worker error: missing scene asset", file=sys.stderr)
+    with pytest.raises(SystemExit) as result:
+        cleanup.module.Cluster._handle_worker_failure(
+            cleanup.state, signal.SIGUSR1, None
+        )
+    assert result.value.code == -1
+    output = capsys.readouterr()
+    assert "original worker error: missing scene asset" in output.err
+    assert "failure upon worker execution" in output.out
+    assert cleanup.shutdown == [{"_exiting_interpreter": True}]
+
+
+def test_state_api_cleanup_remains_namespace_scoped(cleanup, monkeypatch, capsys):
+    requests = []
+
+    def list_actors(**kwargs):
+        requests.append(kwargs)
+        return [
+            SimpleNamespace(name="worker", ray_namespace="this-run"),
+            SimpleNamespace(name="foreign", ray_namespace="another-run"),
+            SimpleNamespace(name="", ray_namespace="this-run"),
+        ]
+
+    monkeypatch.setattr(cleanup.module, "list_actors", list_actors)
+
+    def gcs_must_not_be_used(**kwargs):
+        pytest.fail("A working State API must keep its normal cleanup path")
+
+    monkeypatch.setattr(
+        cleanup.module.ray.util, "list_named_actors", gcs_must_not_be_used
+    )
+    _fail_worker(cleanup, capsys)
+    assert requests == [
+        {"filters": [("STATE", "=", "ALIVE"), ("RAY_NAMESPACE", "=", "this-run")]}
+    ]
+    assert cleanup.looked_up == [("worker", "this-run")]
+    assert cleanup.killed == [("worker", True)]
+
+
+@pytest.mark.parametrize("gcs_unavailable", [False, True])
+def test_headless_fallback_preserves_worker_failure_and_namespace(
+    cleanup, monkeypatch, capsys, caplog, gcs_unavailable
+):
+    def no_dashboard(**kwargs):
+        raise RuntimeError("Dashboard port 8265 unavailable")
+
+    requests = []
+
+    def named_actors(*, all_namespaces):
+        requests.append(all_namespaces)
+        if gcs_unavailable:
+            raise RuntimeError("GCS discovery unavailable too")
+        return [
+            {"name": "worker", "namespace": "this-run"},
+            {"name": "worker", "namespace": "another-run"},
+            {"name": "foreign", "namespace": "another-run"},
+            {"name": "", "namespace": "this-run"},
+        ]
+
+    monkeypatch.setattr(cleanup.module, "list_actors", no_dashboard)
+    monkeypatch.setattr(cleanup.module.ray.util, "list_named_actors", named_actors)
+    _fail_worker(cleanup, capsys)
+    assert requests == [True]
+    assert cleanup.looked_up == ([] if gcs_unavailable else [("worker", "this-run")])
+    assert cleanup.killed == ([] if gcs_unavailable else [("worker", True)])
+    assert "listing named actors through GCS" in caplog.text
+
+
+def test_disappearing_actor_does_not_skip_remaining_cleanup(
+    cleanup, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        cleanup.module,
+        "list_actors",
+        lambda **kwargs: [
+            SimpleNamespace(name="gone", ray_namespace="this-run"),
+            SimpleNamespace(name="worker", ray_namespace="this-run"),
+        ],
+    )
+
+    def get_actor(name, *, namespace):
+        cleanup.looked_up.append((name, namespace))
+        if name == "gone":
+            raise ValueError("actor already exited")
+        return name
+
+    monkeypatch.setattr(cleanup.module.ray, "get_actor", get_actor)
+    _fail_worker(cleanup, capsys)
+    assert cleanup.looked_up == [("gone", "this-run"), ("worker", "this-run")]
+    assert cleanup.killed == [("worker", True)]
