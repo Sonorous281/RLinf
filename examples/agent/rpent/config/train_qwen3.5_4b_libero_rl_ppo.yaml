@@ -3,6 +3,22 @@ defaults:
   - train_qwen3.5_4b_ppo
   - _self_
 
+cluster:
+  node_groups:
+    - label: rollout
+      node_ranks: all
+      env_configs:
+        - node_ranks: all
+          env_vars:
+            - SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE: rlinf.hybrid_engines.sglang.multimodal
+            # SGLang memory saver needs the non-expandable allocator.
+            - PYTORCH_ALLOC_CONF: expandable_segments:False
+            - PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+  component_placement:
+    rollout:
+      node_group: rollout
+      placement: 0-7
+
 runner:
   experiment_name: rpent-libero-rl-qwen3.5-4b-ppo
   max_epochs: 10
@@ -65,11 +81,6 @@ tools:
     process_timeout_s: 15000
 
 rollout:
-  # The SGLang memory saver requires the non-expandable allocator.
-  env_vars:
-    SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE: rlinf.hybrid_engines.sglang.multimodal
-    PYTORCH_ALLOC_CONF: expandable_segments:False
-    PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
   model:
     model_path: ???
   gpu_memory_utilization: 0.7

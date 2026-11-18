@@ -94,7 +94,7 @@ RLinf 使用 ``feat/rpent-planner-ppo-sao`` 分支，RPent 使用安装页指定
 运行
 ----
 
-``train_qwen3.5_4b_libero_rl_sao_a100`` 用于 Batch8/Env4 的小规模验证，已开启共享多模态预处理、Logprob 重算和 TIS。Thinking 默认不设 token budget，需主动配置才能限制。它需要安装页中的实验依赖环境，不能使用默认 SGLang 环境。本分支已通过 CPU 组件及配置检查，尚未验证 GPU smoke、训练或优化器恢复；请按以下步骤逐项验收。
+四卡 A100 配置每次更新用 8 个 episode，环境并发数为 4。默认开启共享多模态预处理、logprob 重算和 TIS，thinking 不限 token 数。
 
 .. list-table::
    :header-rows: 1
@@ -150,10 +150,23 @@ RLinf 使用 ``feat/rpent-planner-ppo-sao`` 分支，RPent 使用安装页指定
 
 同步 PPO 使用 ``train_qwen3.5_4b_libero_rl_ppo``，按实际资源覆盖 placement 与 batch。SAO 先更新 critic、重算 value，再更新 actor，并检查基础设施重试率。先验证小规模更新、同步和恢复，再考虑多节点或长上下文。
 
+八卡 SAO 训练与性能采集
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+八卡配置使用单机 8 张 A100 80 GB。GPU 0–3 运行 Actor 和 Critic（TP2、DP2），GPU 4–5 各运行一个 TP1 rollout 服务，GPU 6–7 各承载 16 个环境。所有环境共用 GPU 6 上端口为 18261 的 SAM3。按安装页的八卡设置启动 Ray 和 SAM3，训练数据使用 standard LIBERO 的 1,280 条记录（seed 1–32）。原实验为作业预留 576 GiB 主存，另留 144 GiB 余量。
+
+.. code-block:: bash
+
+   bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_libero_rl_sao_a100_8gpu \
+     --config-dir "$STACK_ROOT/config" +deployment@_global_=local \
+     rollout.collect_meta_stats=true
+
+每次更新使用 32 个 episode，每个 episode 最多 100 轮，每 5 次更新保存一次 checkpoint。设置 ``runner.max_steps=N`` 可将训练限制在 N 步。长视觉序列曾超过四卡配置的 CPU 预取预算，所以八卡配置按需加载训练图像。请求级统计默认关闭，上面的命令按 rollout rank 记录请求统计。SGLang 返回端到端延迟时，该值也会写入记录。
+
 结果与验证
 ----------
 
-本分支目前只有 CPU、配置及子进程恢复证据。原集成版本的 A100 训练结果不能作为拆分后代码的验收结果。
+以下 GPU 结果来自 RLinf ``a352ea10`` 加上本示例已纳入的运行修复，配套 RPent 为 ``5a98ff3``。八卡实验还开启了请求统计。两次实验均复用了已安装的固定版本依赖。
 
 .. list-table::
    :header-rows: 1
@@ -171,7 +184,7 @@ RLinf 使用 ``feat/rpent-planner-ppo-sao`` 分支，RPent 使用安装页指定
    * - 真实 GPU 数值
      - 未验收。默认与共享预处理路径须分别验证固定 96 点（报告 mean/P95/max，0.03/0.10 为诊断参考）、多轮图像及 M-RoPE。重算或 TIS 不等于消除原生 logprob 误差。
    * - Checkpoint 与恢复
-     - 本分支的 GPU 训练及优化器恢复尚未验证。须验证两套优化器、更新后权重同步及新进程恢复；SAO 还须核对 buffered/pending 状态与 policy 版本。
+     - 四卡 SAO 在第 2 步保存了 checkpoint。新训练进程从该 checkpoint 恢复，更新 Actor 和 Critic，在第 3 步再次保存 checkpoint。rollout 服务加载了第 3 版权重。八卡 Batch32/Env32 已完成首步更新，两个 rollout 服务均加载了第 1 版权重。八卡恢复仍待验证。
    * - 独立效果评测
      - 尚无证明学习收益的结果。比较相同任务、初始状态与预算下训练前后的原生成功率。
 

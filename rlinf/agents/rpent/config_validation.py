@@ -30,6 +30,12 @@ def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
     if rpent is None:
         return cfg
 
+    if cfg.rollout.get("env_vars"):
+        raise ValueError(
+            "Move rollout.env_vars to cluster.node_groups[].env_configs[].env_vars "
+            "and select that node group for rollout."
+        )
+
     if not rpent.env_gpus or rpent.episodes_per_worker < 1:
         raise ValueError(
             "tools.rpent needs at least one env GPU and one episode per worker, got "
@@ -58,10 +64,6 @@ def validate_rpent_cfg(cfg: DictConfig) -> DictConfig:
         ):
             raise ValueError(
                 "Shared multimodal preprocessing for RPent requires SGLang and store_images_on_disk=True"
-            )
-        if cfg.rollout.get("env_vars", {}).get("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"):
-            raise ValueError(
-                "Remove SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE when enabling shared multimodal preprocessing"
             )
         learner_roles = (
             ("actor", "critic") if cfg.runner.task_type == "reasoning" else ()

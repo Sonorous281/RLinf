@@ -89,7 +89,7 @@ def patch_sglang_presharded_weights(model: torch.nn.Module) -> None:
         @wraps(original)
         def load(param, weight, shard_id=None):
             if module.use_presharded_weights and isinstance(shard_id, tuple):
-                sizes = [module.output_sizes[i] // module.tp_size for i in shard_id]
+                sizes = [module.output_partition_sizes[i] for i in shard_id]
                 dim = param.output_dim
                 for index, chunk in zip(
                     shard_id, weight.split(sizes, dim), strict=True
@@ -424,8 +424,6 @@ class Scheduler(_Scheduler):
         assert self.weight_reload == "sync", (
             "only sglang with 'sync' can run 'sync_hf_weight'"
         )
-        use_cudagraph = not self.cfg.rollout.enforce_eager
-        assert use_cudagraph, "use_cudagraph must be True now."
 
         # Under overlap scheduling an already-launched batch may still be on
         # the GPU when a pause leaves it unprocessed; wait before load_weights.
@@ -500,8 +498,14 @@ class Scheduler(_Scheduler):
         if self.model_config.is_multimodal:
             from sglang.srt.managers import mm_utils
 
-            if mm_utils.embedding_cache is not None:
-                mm_utils.embedding_cache.clear()
+            if hasattr(mm_utils, "embedding_cache"):
+                embedding_cache = mm_utils.embedding_cache
+            else:
+                from sglang.srt.managers import mm_schedule
+
+                embedding_cache = mm_schedule.embedding_cache
+            if embedding_cache is not None:
+                embedding_cache.clear()
         self._handle_cache_after_sync(recv_req.pause_mode)
         if recv_req.weight_version is not None:
             self._rlinf_weight_version = recv_req.weight_version

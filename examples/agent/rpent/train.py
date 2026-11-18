@@ -19,14 +19,12 @@ import json
 import hydra
 from omegaconf import OmegaConf
 
-from rlinf.agents.rpent.async_runner import RPentAsyncRunner
 from rlinf.agents.rpent.placement import RPentComponentPlacement
 from rlinf.agents.rpent.rollout_buffer import RPentRolloutBufferWorker
 from rlinf.agents.rpent.rpent_agent_loop import RPentAgentLoopWorker
 from rlinf.config import validate_cfg
 from rlinf.data.datasets.reasoning import create_reasoning_datasets
 from rlinf.models.tokenization.hf import hf_tokenizer
-from rlinf.runners.agent_ppo_runner import AgentPPORunner
 from rlinf.scheduler import Cluster, NodePlacementStrategy
 from rlinf.utils.logging import get_logger
 from rlinf.utils.utils import output_redirector
@@ -36,6 +34,8 @@ from rlinf.workers.rollout.utils import get_rollout_backend_worker
 @hydra.main(version_base="1.1")
 @output_redirector
 def main(cfg) -> None:
+    from rlinf.agents.rpent.async_runner import RPentAsyncRunner
+    from rlinf.runners.agent_ppo_runner import AgentPPORunner
     from rlinf.workers.actor.ma_megatron_actor_worker import MAMegatronActor
     from rlinf.workers.critic.ma_megatron_critic_worker import MAMegatronCritic
 
@@ -53,11 +53,6 @@ def main(cfg) -> None:
             cluster,
             name=cfg.rollout.group_name,
             placement_strategy=rollout_strategy,
-            env_vars=OmegaConf.to_container(
-                cfg.rollout.get("env_vars", {}), resolve=True
-            )
-            if cfg.rollout.get("env_vars")
-            else None,
         )
     )
     agent_loop = RPentAgentLoopWorker.create_group(cfg, placement).launch(

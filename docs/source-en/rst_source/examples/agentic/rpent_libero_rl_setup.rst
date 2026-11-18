@@ -59,6 +59,20 @@ Install the separate simulator/SAM3 environment from the paired RPent checkout. 
    uv pip install --prerelease=allow --torch-backend cu128 -r requirements/libero-rl.txt
    python -c 'import rlinf, robots.libero_rl; print(rlinf.__file__, robots.libero_rl.__file__)'
 
+The profiled A100 host used separate CUDA runtimes for the learner and the simulator. To reproduce that setup, set ``tools.rpent.python`` in the deployment file to the absolute path of the launcher below. Set ``RPENT_EPISODE_LIBRARY_PATH`` before starting Ray if the simulator needs the driver compatibility directory. Leave it unset when using the system driver libraries.
+
+.. code-block:: bash
+
+   cat > "$STACK_ROOT/envs/episode-python" <<'SH'
+   #!/usr/bin/env bash
+   set -eu
+   stack_root=$(cd "$(dirname "$0")/.." && pwd)
+   export PYTHONPATH="$stack_root/repos/RPent:$stack_root/repos/RLinf"
+   export LD_LIBRARY_PATH="${RPENT_EPISODE_LIBRARY_PATH:-}"
+   exec "$stack_root/envs/rpent/bin/python" "$@"
+   SH
+   chmod +x "$STACK_ROOT/envs/episode-python"
+
 
 Prepare Models And Standard LIBERO Assets
 -----------------------------------------
@@ -116,7 +130,13 @@ These are initial-state splits over the same 40 tasks, not held-out task familie
 Start Single-Node A100 Services
 -------------------------------
 
-The TokenSpace profile uses GPUs 0–3. Check that all four are idle, then start a separate Ray cluster for this job. Put ``$STACK_ROOT`` on a data disk with enough space. Choose a short ``RPENT_RAY_TMP`` path to stay within the Unix socket path limit.
+Reserve GPUs 0–3 for the four-GPU profile or GPUs 0–7 for the eight-GPU profile. Check that all the selected GPUs are available before starting a Ray cluster for the job. Put ``$STACK_ROOT`` on a data disk with enough space. Choose a short ``RPENT_RAY_TMP`` path to stay within the Unix socket path limit.
+
+For four GPUs, use the defaults below. For the eight-GPU profile, set these variables in both the Ray and SAM3 terminals before starting either service.
+
+.. code-block:: bash
+
+   export RPENT_GPUS=0,1,2,3,4,5,6,7 RPENT_GPU_COUNT=8 RPENT_SAM3_GPU=6 RPENT_SAM3_PORT=18261
 
 .. code-block:: bash
 
@@ -124,13 +144,13 @@ The TokenSpace profile uses GPUs 0–3. Check that all four are idle, then start
    cd "$STACK_ROOT/repos/RLinf"
    export MEGATRON_PATH="$VIRTUAL_ENV/Megatron-LM"
    export PYTHONPATH="$STACK_ROOT/repos/RPent:$STACK_ROOT/repos/RLinf:$MEGATRON_PATH"
-   export CUDA_VISIBLE_DEVICES=0,1,2,3 RLINF_NODE_RANK=0
+   export CUDA_VISIBLE_DEVICES="${RPENT_GPUS:-0,1,2,3}" RLINF_NODE_RANK=0
    export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=""
    export NVTE_FLASH_ATTN=1 NVTE_FUSED_ATTN=0 TORCH_COMPILE_DISABLE=1
    export RLINF_TIMEOUT=10800
    export RPENT_RAY_TMP="$STACK_ROOT/ray"
    mkdir -p "$RPENT_RAY_TMP"
-   ray start --head --port 6387 --node-ip-address=127.0.0.1 --num-gpus 4 \
+   ray start --head --port 6387 --node-ip-address=127.0.0.1 --num-gpus "${RPENT_GPU_COUNT:-4}" \
      --temp-dir "$RPENT_RAY_TMP" --include-dashboard=false
    export RAY_ADDRESS=127.0.0.1:6387
    ray status --address="$RAY_ADDRESS"
@@ -142,11 +162,11 @@ Start shared SAM3 in a second terminal. Keep it running for training and recover
    export STACK_ROOT="$HOME/rpent-stack"  # same path used during installation
    source "$STACK_ROOT/envs/rpent/bin/activate"
    cd "$STACK_ROOT/repos/RPent"
-   export CUDA_VISIBLE_DEVICES=0,1,2,3
+   export CUDA_VISIBLE_DEVICES="${RPENT_GPUS:-0,1,2,3}"
    export SAM3_CHECKPOINT_PATH="$STACK_ROOT/models/sam3/sam3.pt"
    python -m rpent.robots.components.sam3_server \
-     --cuda-device 3 --host 127.0.0.1 --port 18147
+     --cuda-device "${RPENT_SAM3_GPU:-3}" --host 127.0.0.1 --port "${RPENT_SAM3_PORT:-18147}"
 
 If a port is occupied, identify its owner; do not stop another job. Choose a free port for this job and update its connection address. If an existing SAM3 service is available to share, configure its endpoint instead of loading another model.
 
-Once the services are ready, return to :doc:`rpent_libero_rl` to validate one episode, two training steps and recovery in a new process.
+Return to :doc:`rpent_libero_rl`. On four GPUs, run the one-episode smoke, two training steps and fresh-process recovery. For eight GPUs, follow “Eight-GPU SAO Profile”.

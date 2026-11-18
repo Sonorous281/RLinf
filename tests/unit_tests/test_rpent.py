@@ -461,10 +461,15 @@ def test_example_configs_preserve_planner_and_training_contracts(config_name):
     assert sampling.max_new_tokens == 32768
     assert cfg.agentloop.max_turns == 100
     assert cfg.agentloop.observation_mode == "adaptive"
+    placement = cfg.cluster.component_placement
+    group = cfg.cluster.node_groups[0]
     assert (
-        cfg.rollout.env_vars.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE
-        == "rlinf.hybrid_engines.sglang.multimodal"
+        placement.get("rollout", placement.get("rollout,reward")).node_group
+        == group.label
     )
+    assert {
+        "SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE": "rlinf.hybrid_engines.sglang.multimodal"
+    } in group.env_configs[0].env_vars
     if cfg.runner.task_type == "reasoning":
         for component in (cfg.actor, cfg.critic):
             assert not component.megatron.ckpt_convertor.hf_model_path.endswith("-text")
@@ -490,7 +495,7 @@ def test_legacy_image_budgets_normalize_and_reject_conflicts(field):
     cfg = compose(
         [
             "rollout.sglang.enable_shared_multi_modal_processor=true",
-            "rollout.env_vars.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=null",
+            "cluster.node_groups.0.env_configs.0.env_vars.0.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=''",
             "tools.rpent.store_images_on_disk=true",
         ]
     )
@@ -783,6 +788,7 @@ def test_forced_token_has_zero_loss_gradient_and_preserves_normalization():
         "train_qwen3.5_4b_ppo",
         "train_qwen3.5_4b_libero_rl_ppo",
         "train_qwen3.5_4b_libero_rl_sao_a100",
+        "train_qwen3.5_4b_libero_rl_sao_a100_8gpu",
     ],
 )
 def test_rpent_example_validation_and_component_placement(
@@ -800,7 +806,12 @@ def test_rpent_example_validation_and_component_placement(
 
     cfg = compose(config_name=config_name)
     cluster = create_fake_cluster(
-        num_nodes=cfg.cluster.num_nodes, accelerators_per_node=8
+        num_nodes=cfg.cluster.num_nodes,
+        accelerators_per_node=8,
+        extra_group_mapping={
+            group.label: list(range(cfg.cluster.num_nodes))
+            for group in cfg.cluster.get("node_groups", [])
+        },
     )
     import rlinf.config as common_config
 

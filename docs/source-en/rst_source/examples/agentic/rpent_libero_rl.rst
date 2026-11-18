@@ -94,7 +94,7 @@ Edit ``$STACK_ROOT/config/deployment/local.yaml`` and replace every ``???`` with
 Run It
 ------
 
-Use ``train_qwen3.5_4b_libero_rl_sao_a100`` for Batch8/Env4. It enables shared multimodal preprocessing, logprob recalculation and TIS. Thinking has no budget unless configured. This branch has CPU component and config checks. GPU smoke, training and optimizer recovery have not been run on this revision; use the steps below to validate them.
+The four-GPU A100 profile uses 8 episodes per update and 4 environments. It enables shared multimodal preprocessing, logprob recomputation and TIS. The thinking budget defaults to unlimited.
 
 .. list-table::
    :header-rows: 1
@@ -150,10 +150,23 @@ Both commands write under ``$STACK_ROOT/logs``. The second starts a fresh driver
 
 For synchronous PPO, use ``train_qwen3.5_4b_libero_rl_ppo`` and adjust placement and batch size. SAO updates the critic, recomputes values, then updates the actor. It also checks the infrastructure retry rate. Validate small updates, synchronization and recovery before trying more nodes or longer contexts.
 
+Eight-GPU SAO Profile
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Reserve eight A100 80 GB GPUs. Actor and Critic use GPUs 0–3 (TP2, DP2), two TP1 rollout servers use GPUs 4–5, and GPUs 6–7 render 16 environments each. The environments share one SAM3 service on GPU 6, port 18261. Use the eight-GPU Ray and SAM3 settings on the setup page and the 1,280-row standard LIBERO training file (seeds 1–32). The original job reserved 576 GiB of host RAM plus 144 GiB of headroom.
+
+.. code-block:: bash
+
+   bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_libero_rl_sao_a100_8gpu \
+     --config-dir "$STACK_ROOT/config" +deployment@_global_=local \
+     rollout.collect_meta_stats=true
+
+This profile admits 32 episodes per update, allows 100 turns per episode and saves every five updates. Set ``runner.max_steps=N`` for a bounded run. Long visual sequences exceeded the four-GPU profile’s CPU prefetch budget, so this profile loads learner images on demand. Request profiling is optional. The override above records per-rank request metadata, including end-to-end latency when SGLang supplies it.
+
 Visualization and Results
 -------------------------
 
-This branch has CPU, config and subprocess queue-recovery evidence only. A100 results from the original integration do not validate the reorganized code.
+The GPU observations below are from RLinf ``a352ea10`` with the runtime fixes included in this recipe and RPent ``5a98ff3``. The eight-GPU run also enabled request profiling. These runs used an existing installation of the pinned dependencies.
 
 .. list-table::
    :header-rows: 1
@@ -171,7 +184,7 @@ This branch has CPU, config and subprocess queue-recovery evidence only. A100 re
    * - Real GPU numerical checks
      - Not yet validated. Validate the default and shared preprocessing paths separately on the fixed 96 points (mean/P95/max; 0.03/0.10 are diagnostic references), multi-turn images and M-RoPE. Recomputing logprobs or using TIS does not eliminate native logprob error.
    * - Checkpoint and recovery
-     - GPU training and optimizer recovery have not been validated on this branch. Verify both optimizers, post-update weight synchronization and fresh-process resume; SAO also needs buffer/pending-state and policy-version checks.
+     - On four A100s, SAO saved a checkpoint at step 2. A new training process restored it, updated the actor and critic, and saved a checkpoint at step 3. The rollout server loaded weight version 3. On eight A100s, the first Batch32/Env32 update completed and both rollout servers loaded version 1. Eight-GPU recovery still needs verification.
    * - Independent evaluation
      - No result establishes a learning gain. Compare native success before and after training with matched tasks, initial states and budgets.
 

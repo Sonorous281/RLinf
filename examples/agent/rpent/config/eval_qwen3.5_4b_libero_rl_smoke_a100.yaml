@@ -4,8 +4,16 @@ defaults:
   - _self_
 
 cluster:
+  node_groups:
+    - label: rollout
+      node_ranks: all
+      env_configs:
+        - node_ranks: all
+          env_vars:
+            - SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE: ""
   component_placement:
-    rollout,reward: 2
+    rollout,reward:
+      placement: 2
     agentloop:
       placement: "0:3"
 
@@ -17,8 +25,6 @@ tools:
 
 rollout:
   gpu_memory_utilization: 0.55
-  env_vars:
-    SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE: ""
   sglang:
     backend_type: server
     enable_shared_multi_modal_processor: true

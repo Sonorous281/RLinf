@@ -7,7 +7,8 @@ defaults:
 cluster:
   num_nodes: 1
   component_placement:
-    rollout,reward: 0
+    rollout,reward:
+      placement: 0
     agentloop:
       node_group: node
       placement: "0:1"

@@ -8,7 +8,8 @@ cluster:
   component_placement:
     actor: 0-15
     critic: 0-15
-    rollout: 0-15
+    rollout:
+      placement: 0-15
     reward: 0-15
     agentloop:
       node_group: node

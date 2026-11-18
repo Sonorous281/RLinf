@@ -5,10 +5,21 @@ defaults:
 
 cluster:
   num_nodes: 1
+  node_groups:
+    - label: rollout
+      node_ranks: all
+      env_configs:
+        - node_ranks: all
+          env_vars:
+            - SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE: ""
+            # SGLang memory saver needs the non-expandable allocator.
+            - PYTORCH_ALLOC_CONF: expandable_segments:False
+            - PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
   component_placement:
     actor: 0-1
     critic: 0-1
-    rollout: "2"
+    rollout:
+      placement: "2"
     reward: "2"
     agentloop: "3"
 
@@ -59,8 +70,6 @@ rollout:
   gpu_memory_utilization: 0.55
   enforce_eager: true
   return_logprobs: true
-  env_vars:
-    SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE: ""
   sglang:
     backend_type: server
     enable_weights_cpu_backup: true

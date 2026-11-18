@@ -935,10 +935,12 @@ class SGLangWorker(Worker):
             result_dict.update(
                 version_start=version_start, version_end=self._weight_version
             )
-            if return_prompt_token_ids:
+            if return_prompt_token_ids and "prompt_token_ids" not in result_dict:
                 result_dict["prompt_token_ids"] = result["meta_info"][
                     "prompt_token_ids"
                 ]
+            if self._collect_meta_stats:
+                self._collect_stats([result])
 
         except Exception as e:
             self.log_error(

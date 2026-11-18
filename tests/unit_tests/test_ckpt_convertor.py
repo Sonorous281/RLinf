@@ -731,7 +731,12 @@ def test_sglang_weight_sync_common_bucket_lifecycle(
         header=header,
     )
     embedding_cache = {"image": object()}
-    monkeypatch.setattr(mm_utils, "embedding_cache", embedding_cache)
+    cache_owner = mm_utils
+    if not hasattr(cache_owner, "embedding_cache"):
+        from sglang.srt.managers import mm_schedule
+
+        cache_owner = mm_schedule
+    monkeypatch.setattr(cache_owner, "embedding_cache", embedding_cache)
     if pause_mode in ("in_place", "retract"):
         scheduler.waiting_queue.append(object())
     waiting_queue = scheduler.waiting_queue

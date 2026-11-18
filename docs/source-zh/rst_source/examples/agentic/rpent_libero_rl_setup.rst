@@ -59,6 +59,20 @@ SAM3 和 LIBERO 使用 Transformers 4.57.6，A100 训练环境使用 5.19.0，�
    uv pip install --prerelease=allow --torch-backend cu128 -r requirements/libero-rl.txt
    python -c 'import rlinf, robots.libero_rl; print(rlinf.__file__, robots.libero_rl.__file__)'
 
+实测的 A100 主机为训练和模拟器使用了不同版本的 CUDA 运行库。复现该设置时，在部署文件的 ``tools.rpent.python`` 中填写下面这个启动脚本的绝对路径。如果模拟器需要驱动兼容库，启动 Ray 前将 ``RPENT_EPISODE_LIBRARY_PATH`` 设为该目录。使用系统驱动库时可留空。
+
+.. code-block:: bash
+
+   cat > "$STACK_ROOT/envs/episode-python" <<'SH'
+   #!/usr/bin/env bash
+   set -eu
+   stack_root=$(cd "$(dirname "$0")/.." && pwd)
+   export PYTHONPATH="$stack_root/repos/RPent:$stack_root/repos/RLinf"
+   export LD_LIBRARY_PATH="${RPENT_EPISODE_LIBRARY_PATH:-}"
+   exec "$stack_root/envs/rpent/bin/python" "$@"
+   SH
+   chmod +x "$STACK_ROOT/envs/episode-python"
+
 
 准备模型和标准 LIBERO 资产
 --------------------------
@@ -116,7 +130,13 @@ LIBERO 的部分 XML/mesh 路径直接相对安装包构造，独立于 config.y
 启动单机 A100 服务
 ------------------
 
-TokenSpace 单机配置使用 GPU 0–3。确认四张卡无人使用，再启动本任务独立的 Ray 集群；临时目录放在容量足够的数据盘，避免填满系统盘。以下路径示例要求 ``$STACK_ROOT`` 位于数据盘。Ray 的 Unix socket 路径有长度限制，请为 ``RPENT_RAY_TMP`` 选择简短路径。
+四卡配置使用 GPU 0–3，八卡配置使用 GPU 0–7。确认所选 GPU 均可用，再为作业启动独立的 Ray 集群；临时目录放在容量足够的数据盘，避免填满系统盘。以下路径示例要求 ``$STACK_ROOT`` 位于数据盘。Ray 的 Unix socket 路径有长度限制，请为 ``RPENT_RAY_TMP`` 选择简短路径。
+
+四卡验证直接使用下面的默认值。跑八卡配置时，在 Ray 终端和 SAM3 终端都先执行以下命令，再分别启动服务。
+
+.. code-block:: bash
+
+   export RPENT_GPUS=0,1,2,3,4,5,6,7 RPENT_GPU_COUNT=8 RPENT_SAM3_GPU=6 RPENT_SAM3_PORT=18261
 
 .. code-block:: bash
 
@@ -124,13 +144,13 @@ TokenSpace 单机配置使用 GPU 0–3。确认四张卡无人使用，再启�
    cd "$STACK_ROOT/repos/RLinf"
    export MEGATRON_PATH="$VIRTUAL_ENV/Megatron-LM"
    export PYTHONPATH="$STACK_ROOT/repos/RPent:$STACK_ROOT/repos/RLinf:$MEGATRON_PATH"
-   export CUDA_VISIBLE_DEVICES=0,1,2,3 RLINF_NODE_RANK=0
+   export CUDA_VISIBLE_DEVICES="${RPENT_GPUS:-0,1,2,3}" RLINF_NODE_RANK=0
    export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=""
    export NVTE_FLASH_ATTN=1 NVTE_FUSED_ATTN=0 TORCH_COMPILE_DISABLE=1
    export RLINF_TIMEOUT=10800
    export RPENT_RAY_TMP="$STACK_ROOT/ray"
    mkdir -p "$RPENT_RAY_TMP"
-   ray start --head --port 6387 --node-ip-address=127.0.0.1 --num-gpus 4 \
+   ray start --head --port 6387 --node-ip-address=127.0.0.1 --num-gpus "${RPENT_GPU_COUNT:-4}" \
      --temp-dir "$RPENT_RAY_TMP" --include-dashboard=false
    export RAY_ADDRESS=127.0.0.1:6387
    ray status --address="$RAY_ADDRESS"
@@ -142,11 +162,11 @@ TokenSpace 单机配置使用 GPU 0–3。确认四张卡无人使用，再启�
    export STACK_ROOT="$HOME/rpent-stack"  # same path used during installation
    source "$STACK_ROOT/envs/rpent/bin/activate"
    cd "$STACK_ROOT/repos/RPent"
-   export CUDA_VISIBLE_DEVICES=0,1,2,3
+   export CUDA_VISIBLE_DEVICES="${RPENT_GPUS:-0,1,2,3}"
    export SAM3_CHECKPOINT_PATH="$STACK_ROOT/models/sam3/sam3.pt"
    python -m rpent.robots.components.sam3_server \
-     --cuda-device 3 --host 127.0.0.1 --port 18147
+     --cuda-device "${RPENT_SAM3_GPU:-3}" --host 127.0.0.1 --port "${RPENT_SAM3_PORT:-18147}"
 
 端口已被占用时，先核对服务归属；不要停止别人的 Ray 或 SAM3。可为本任务改用空闲端口，并同步修改连接地址。已有 SAM3 可共享时，直接配置其 endpoint，不重复加载模型。
 
-服务就绪后，返回 :doc:`rpent_libero_rl`，依次验证单 episode 采集、两步训练和新进程恢复。
+服务就绪后，返回 :doc:`rpent_libero_rl`。四卡按顺序验证单个 episode、两步训练及新进程恢复；八卡可直接使用“八卡 SAO 训练与性能采集”的命令。
