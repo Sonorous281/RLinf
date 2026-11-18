@@ -689,3 +689,14 @@ The model still produces the full vocabulary logits; this setting does not
 chunk the vocabulary projection. Smaller chunks trade more computation for
 smaller temporary tensors. Measure peak GPU memory and step time on your workload
 before choosing a chunk size.
+
+To reduce memory in the projection itself on a Qwen3.5 MBridge Actor, set
+``actor.model.lm_head_chunk_size`` to a positive token count, such as 256.
+The Actor projects one chunk of decoder states at a time and recomputes that
+chunk during backpropagation. This mode requires dynamic batches, PP1, CP1
+and ``actor.model.load_mtp: false``. Keep ``algorithm.entropy_bonus`` at zero. You can still log entropy. A chunk size of 0 keeps the model's default output layer.
+
+For packed batches with long prompts, ``actor.response_only_logits: true``
+projects only positions that predict response tokens. This option requires context parallel size 1 and defaults to false.
+A chunked LM head already selects response positions when entropy is disabled.
+Logging entropy requires scoring every position.

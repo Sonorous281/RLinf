@@ -19,7 +19,7 @@ import itertools
 import os
 from contextlib import contextmanager, nullcontext
 from functools import partial
-from typing import TYPE_CHECKING, Iterator, Optional
+from typing import TYPE_CHECKING, Callable, Iterator, Optional
 
 import megatron
 import torch
@@ -690,28 +690,45 @@ class MegatronModelManager:
         max_batch_seqlen: int = 4096,
         padding_seqlen: Optional[int] = None,
         keep_left_padding: bool = False,
+        scoring_forward: Optional[Callable] = None,
         **model_forward_kwargs,
     ):
-        """Default forward pass for GPT models with optional sequence packing."""
+        """Pack model inputs and restore outputs to the caller's padded layout.
+
+        ``scoring_forward`` can replace the packed model/LM-head forward. It
+        receives the wrapper, unwrapped model and packed scoring arguments,
+        and returns per-token scores instead of vocabulary logits.
+        """
         pre_process = unwrap_model(model).pre_process
         post_process = unwrap_model(model).post_process
+        if scoring_forward is not None and (
+            value_model or logits_processor is None or not pack_seqs
+        ):
+            raise ValueError(
+                "A scoring forward requires packed Actor inputs and logits processor arguments"
+            )
         if pack_seqs:
+            # Bridge Qwen-VL embeds images before its own THD/CP packing.
+            packs_in_model = scoring_forward is not None and any(
+                cls.__module__.startswith("megatron.bridge.models.qwen_vl.")
+                for cls in type(unwrap_model(model)).__mro__
+            )
             batch_size, seq_len = attention_mask.shape[:2]
             input_ids_rmpad, packed_seq_params = preprocess_packed_seqs(
                 input_ids,
                 attention_mask,
-                pre_process=pre_process,
+                pre_process=pre_process and not packs_in_model,
                 padding_seqlen=padding_seqlen,
             )
             input_ids_rmpad = input_ids_rmpad.contiguous()
-            output_orig = model(
+            model_attention_mask = attention_mask if packs_in_model else None
+            model_inputs = dict(
                 input_ids=input_ids_rmpad,
-                attention_mask=None,
+                attention_mask=model_attention_mask,
                 position_ids=position_ids,
                 packed_seq_params=packed_seq_params,
                 **model_forward_kwargs,
             )
-            output_orig /= temperature
             if post_process and logits_processor is not None:
                 args = {
                     k: preprocess_packed_seqs(
@@ -722,7 +739,22 @@ class MegatronModelManager:
                     )[0]
                     for k, v in logits_processor_args.items()
                 }
-                output_dict = logits_processor(output_orig, **args)
+            if post_process and scoring_forward is not None:
+                output_orig = scoring_forward(
+                    model,
+                    unwrap_model(model),
+                    **args,
+                    temperature=temperature,
+                    **model_inputs,
+                )
+            else:
+                output_orig = model(**model_inputs)
+                output_orig /= temperature
+            if post_process and logits_processor is not None:
+                if scoring_forward is not None:
+                    output_dict = output_orig
+                else:
+                    output_dict = logits_processor(output_orig, **args)
                 output = {
                     k: postprocess_packed_seqs(
                         v,
