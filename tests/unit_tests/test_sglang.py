@@ -515,3 +515,58 @@ def test_qwen_image_processor_keeps_text_request_behavior(qwen_image_processor):
     output = asyncio.run(processor.process_mm_data_async(images, text, request))
     assert output.input_ids == expected.input_ids[0].tolist()
     assert torch.equal(output.mm_items[0].feature, expected.pixel_values)
+
+
+def test_qwen_release_capture_replays_only_real_images(qwen_image_processor):
+    from tempfile import TemporaryDirectory
+    from uuid import uuid4
+
+    from PIL import Image
+
+    from rlinf.hybrid_engines.sglang.multimodal.replay import (
+        CAPTURE_KEY,
+        capture_file,
+        finish_capture,
+    )
+
+    processor, _, config = qwen_image_processor
+    start, pad, end = (
+        config.vision_start_token_id,
+        config.image_token_id,
+        config.vision_end_token_id,
+    )
+    images = [Image.new("RGB", (64, 64), color) for color in ("red", "blue")]
+    ids, spans, history = [], [], None
+    for turn, sampled in enumerate(([pad], [start]), start=1):
+        spans = [*spans, [len(ids) + 1, len(ids) + 2]]
+        ids = [*ids, start, pad, end]
+        with TemporaryDirectory(prefix="rlinf-qwen-") as directory:
+            ticket, rid = Path(directory).name, uuid4().hex
+            request = SimpleNamespace(
+                video_data=None,
+                audio_data=None,
+                rid=rid,
+                sampling_params={
+                    "custom_params": {
+                        CAPTURE_KEY: {
+                            "ticket": ticket,
+                            "image_spans": spans,
+                            "prefix_length": history["length"] if history else 0,
+                        }
+                    }
+                },
+            )
+            output = asyncio.run(
+                processor.process_mm_data_async(images[:turn], ids, request)
+            )
+            entry, history = finish_capture(
+                capture_file(ticket, rid), sampled, history, None
+            )
+        assert entry["prompt_token_ids"] == output.input_ids
+        assert torch.equal(
+            entry["pixel_values"], torch.cat([i.feature.cpu() for i in output.mm_items])
+        )
+        assert len(entry["image_spans"]) == turn
+        assert entry["prompt_token_ids"][: spans[-1][0]] == ids[: spans[-1][0]]
+        ids = output.input_ids + sampled + [start, pad, end]
+        spans = entry["image_spans"]

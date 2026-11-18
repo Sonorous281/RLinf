@@ -105,8 +105,9 @@ Check the Input Contract
 
 When adding a second image, check that the previous image span, pixels and
 sampled IDs remain intact. The release processor records the served prompt IDs
-and M-RoPE positions for each turn. Megatron verifies the positions at the
-language model input and runs its vision encoder on the saved pixels. Compare
+and M-RoPE positions for each turn. Only recorded image spans contribute
+visual positions. Sampled image markers retain their token IDs. Megatron verifies
+the positions at the language model input and runs its vision encoder on the saved pixels. Compare
 final logprobs separately using the same weights and tokens.
 
 .. warning::

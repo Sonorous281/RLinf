@@ -380,3 +380,49 @@ def test_mrope_verification_removes_hook_after_failure():
         with verify_qwen_vl_positions(model, positions, torch.ones(1, 2)):
             model.language_model(position_ids=positions + 1)
     assert not model.language_model._forward_pre_hooks
+
+
+def test_bridge_replays_literal_media_ids_as_text():
+    pytest.importorskip("megatron.bridge")
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.rope import get_rope_index
+
+    from rlinf.hybrid_engines.megatron.qwen_vl_inputs import qwen_vl_replay_inputs
+
+    class EchoIDs(torch.nn.Module):
+        def forward(self, input_ids, **kwargs):
+            return input_ids
+
+    class BridgeModel(torch.nn.Module):
+        __module__ = "megatron.bridge.models.qwen_vl.test"
+
+    model = BridgeModel()
+    model.image_token_id, model.vision_start_token_id = 2, 1
+    model.language_model = EchoIDs()
+    model.language_model.embedding = EchoIDs()
+    # One real 2x2 image, then a literal image triplet, a pad and a trailing start.
+    ids = torch.tensor([[1, 2, 2, 2, 2, 3, 1, 2, 3, 2, 1]])
+    mask = torch.zeros_like(ids, dtype=torch.bool)
+    mask[:, 1:5] = True
+    expected = torch.tensor(
+        [
+            [0, 1, 1, 1, 1, 3, 4, 5, 6, 7, 8],
+            [0, 1, 1, 2, 2, 3, 4, 5, 6, 7, 8],
+            [0, 1, 2, 1, 2, 3, 4, 5, 6, 7, 8],
+        ]
+    ).unsqueeze(1)
+    inputs = {
+        "input_ids": ids,
+        "image_input_mask": mask,
+        "attention_mask": torch.ones_like(mask),
+    }
+    with qwen_vl_replay_inputs(model, expected, inputs) as replay:
+        geometry = replay["input_ids"]
+        positions, _ = get_rope_index(
+            2, 2, 4, 1, geometry, image_grid_thw=torch.tensor([[1, 4, 4]])
+        )
+        assert torch.equal(geometry == model.image_token_id, mask)
+        assert torch.equal(model.language_model.embedding(input_ids=geometry), ids)
+        assert torch.equal(
+            model.language_model(input_ids=geometry, position_ids=positions), ids
+        )
+    assert not model.language_model.embedding._forward_pre_hooks

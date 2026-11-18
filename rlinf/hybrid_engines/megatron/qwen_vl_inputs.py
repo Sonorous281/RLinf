@@ -70,3 +70,62 @@ def verify_qwen_vl_positions(
             )
     finally:
         handle.remove()
+
+
+@contextmanager
+def qwen_vl_replay_inputs(
+    model, expected: torch.Tensor, inputs: dict
+) -> Iterator[dict]:
+    """Use real image spans for Bridge geometry and sampled IDs for language."""
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import (
+        preprocess_packed_seqs,
+    )
+
+    attention_mask = inputs["attention_mask"]
+    with verify_qwen_vl_positions(model, expected, attention_mask):
+        image_mask = inputs.get("image_input_mask")
+        if image_mask is None:
+            yield inputs
+            return
+
+        # Bridge 0.5 scans IDs for M-RoPE and again after packing for the
+        # visual mask. Only a recorded span may participate in either scan.
+        original_ids = inputs["input_ids"]
+        structure = torch.zeros_like(original_ids)
+        structure[:, :-1].masked_fill_(
+            image_mask[:, 1:] & ~image_mask[:, :-1], model.vision_start_token_id
+        )
+        structure.masked_fill_(image_mask, model.image_token_id)
+        geometry_inputs = dict(inputs, input_ids=structure)
+        del geometry_inputs["image_input_mask"]
+        embedded = False
+
+        def embed_tokens(module, args, kwargs):
+            nonlocal embedded
+            if kwargs.get("input_ids") is structure:
+                kwargs["input_ids"] = original_ids
+                embedded = True
+
+        def restore_tokens(module, args, kwargs):
+            if not embedded:
+                raise RuntimeError("Bridge did not embed the replay token IDs")
+            token_ids = original_ids
+            if kwargs.get("packed_seq_params") is not None:
+                token_ids, _ = preprocess_packed_seqs(
+                    token_ids,
+                    attention_mask,
+                    pre_process=True,
+                    pg_collection=model.pg_collection,
+                )
+            kwargs["input_ids"] = token_ids
+
+        language_model = model.language_model
+        with (
+            language_model.embedding.register_forward_pre_hook(
+                embed_tokens, with_kwargs=True, prepend=True
+            ),
+            language_model.register_forward_pre_hook(
+                restore_tokens, with_kwargs=True, prepend=True
+            ),
+        ):
+            yield geometry_inputs
