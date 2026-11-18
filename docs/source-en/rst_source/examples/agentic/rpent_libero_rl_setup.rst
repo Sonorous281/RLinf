@@ -59,7 +59,7 @@ Install the separate simulator/SAM3 environment from the paired RPent checkout. 
    uv pip install --prerelease=allow --torch-backend cu128 -r requirements/libero-rl.txt
    python -c 'import rlinf, robots.libero_rl; print(rlinf.__file__, robots.libero_rl.__file__)'
 
-The profiled A100 host used separate CUDA runtimes for the learner and the simulator. To reproduce that setup, set ``tools.rpent.python`` in the deployment file to the absolute path of the launcher below. Set ``RPENT_EPISODE_LIBRARY_PATH`` before starting Ray if the simulator needs the driver compatibility directory. Leave it unset when using the system driver libraries.
+The profiled A100 host used separate CUDA runtimes for the learner and the simulator. The A100 deployment profile uses the launcher below to start the simulator with its own runtime. Set ``RPENT_EPISODE_LIBRARY_PATH`` before starting Ray if the simulator needs the driver compatibility directory. Leave it unset when using the system driver libraries.
 
 .. code-block:: bash
 

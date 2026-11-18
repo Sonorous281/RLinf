@@ -1,0 +1,48 @@
+# Selected settings from formal150-v3 on LIBERO-Pro (run record).
+# RLinf base 289944270f2d014fc4b64a6ae7b517547ef80792, local patch SHA-256:
+# d532aa5493d8c4fb680b0e831cc0761c043d0bf62755e3c22aa2e9d4ac68a85d
+# RPent 762a57c2b78278aff8d5c2c8f752ee42501bd5dc
+# Transformer Engine 2.17.0 with the FA4 window adapter from NVIDIA/TransformerEngine#3540.
+# Initial checkpoint: qwen3.5-4b-sft595-e3.
+# train.jsonl: 1,500 rows, SHA-256 281362f083cdb9be9b664ec0d9a01f2ea0f6303b2c444f6a966fb2e209d42456
+runner:
+  synchronous: true
+  seq_length: 262144
+  max_steps: 150
+  save_interval: 10
+data:
+  rollout_batch_size: 32
+  sampling_batch_size: 40
+algorithm:
+  group_size: 8
+  adv_type: grpo_dynamic
+  advantage_mode: trajectory
+  normalize_advantages: false
+  loss_type: actor
+  loss_scales: [group_level, agent_level, turn_level]
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.28
+  recompute_logprobs: true
+  importance_sampling_fix: true
+  importance_sampling_clip: 2
+  sampling_params:
+    temperature: 1.0
+    top_k: -1
+    top_p: 1.0
+    max_new_tokens: 16384
+agentloop:
+  max_turns: 50
+  thinking_token_budget: null
+tools:
+  rpent:
+    workflow: episode
+    libero_type: pro
+    episodes_per_worker: 10
+    max_episode_steps: 10000
+actor:
+  model:
+    tensor_model_parallel_size: 2
+  optim:
+    lr: 1.0e-6
+critic:
+  use_critic_model: false

@@ -17,14 +17,13 @@ The following examples include math reasoning RL and agentic AI workflows, such 
          Exploring Width Scaling for Broad Information Seeking via Multi-Agent Reinforcement Learning
        </p>
        <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
-       <a href="rpent.html" style="display: block;"><img src="https://github.com/RLinf/misc/raw/main/pic/rpent_framework.png"
+       <a href="rpent/index.html" style="display: block;"><img src="https://github.com/RLinf/misc/raw/main/pic/rpent_framework.png"
             style="width: 100%; height: 200px; object-fit: contain; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);" /></a>
        <p style="margin-top: 8px; font-size: 14px; line-height: 1.4;">
-        <a href="rpent.html" style="text-decoration: underline; color: blue;">
+        <a href="rpent/index.html" style="text-decoration: underline; color: blue;">
           <b>RPent Planner RL</b>
          </a><br>
-         <a href="rpent.html">Original Pi0.5 / text Planner PPO</a>;
-         <a href="rpent_libero_rl.html">multimodal Planner PPO / SAO with direct end-effector control</a>
+         LIBERO planner recipes for PPO and SAO, with GRPO training results
        </p>
      </div>
 
@@ -116,7 +115,6 @@ The following examples include math reasoning RL and agentic AI workflows, such 
    Coding Online RL <coding_online_rl>
    Search-R1 <searchr1/index>
    rStar2 <rstar2>
-   RPent <rpent>
-   RPent Multimodal RL <rpent_libero_rl>
+   RPent <rpent/index>
    Math Reasoning <math_reasoning/index>
    Qwen3 VL GRPO <qwen3_vl_geo3k>

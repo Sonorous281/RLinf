@@ -1,0 +1,16 @@
+# Paths created by the single-node setup guide.
+runner:
+  output_dir: ${oc.env:STACK_ROOT}/logs
+data:
+  train_data_paths:
+    - ${oc.env:STACK_ROOT}/data/libero-rl-tasks/train.jsonl
+  val_data_paths:
+    - ${oc.env:STACK_ROOT}/data/libero-rl-eval/eval.jsonl
+tools:
+  rpent:
+    python: ${oc.env:STACK_ROOT}/envs/episode-python
+    libero_config_path: ${oc.env:STACK_ROOT}/data/libero-standard-config
+    output_dir: ${runner.output_dir}/${runner.experiment_name}/episodes
+rollout:
+  model:
+    model_path: ${oc.env:STACK_ROOT}/models/Qwen3.5-4B

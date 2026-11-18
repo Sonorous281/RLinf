@@ -59,7 +59,7 @@ SAM3 和 LIBERO 使用 Transformers 4.57.6，A100 训练环境使用 5.19.0，�
    uv pip install --prerelease=allow --torch-backend cu128 -r requirements/libero-rl.txt
    python -c 'import rlinf, robots.libero_rl; print(rlinf.__file__, robots.libero_rl.__file__)'
 
-实测的 A100 主机为训练和模拟器使用了不同版本的 CUDA 运行库。复现该设置时，在部署文件的 ``tools.rpent.python`` 中填写下面这个启动脚本的绝对路径。如果模拟器需要驱动兼容库，启动 Ray 前将 ``RPENT_EPISODE_LIBRARY_PATH`` 设为该目录。使用系统驱动库时可留空。
+实测的 A100 主机为训练和模拟器使用了不同版本的 CUDA 运行库。A100 部署配置通过以下脚本启动模拟器，让它使用自己的 CUDA 运行库。如果模拟器需要驱动兼容库，启动 Ray 前将 ``RPENT_EPISODE_LIBRARY_PATH`` 设为该目录。使用系统驱动库时可留空。
 
 .. code-block:: bash
 

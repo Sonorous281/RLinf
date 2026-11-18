@@ -77,19 +77,17 @@ The task generator writes ``train.jsonl`` and a manifest with task IDs, initial-
 
 The suite/task pair selects the simulator task; use the generator to obtain its actual instruction. Rollouts retain sampled token IDs, behavior logprobs, image inputs, policy versions and the native outcome. Only model-generated response tokens contribute to the policy loss. Tool observations and forced closing tokens have zero loss mask.
 
-Configure Deployment Paths
---------------------------
+Configure Single-Node Paths
+---------------------------
 
-After installation, copy the deployment path template outside the repository:
+Set ``STACK_ROOT`` as shown in the setup guide. The commands below use ``+deployment@_global_=a100`` to locate the model, task lists and simulator interpreter. Run them in the terminal where you started Ray:
 
 .. code-block:: bash
 
    source "$STACK_ROOT/envs/rlinf-token-space/bin/activate"
    cd "$STACK_ROOT/repos/RLinf"
-   mkdir -p "$STACK_ROOT/config/deployment"
-   cp examples/agent/rpent/config/deployment/paths.yaml "$STACK_ROOT/config/deployment/local.yaml"
 
-Edit ``$STACK_ROOT/config/deployment/local.yaml`` and replace every ``???`` with an absolute path. Set ``data.train_data_paths`` and ``data.val_data_paths`` to YAML lists of training and evaluation JSONL files. Fill the remaining fields with the log directory, RPent interpreter, LIBERO config directory, episode directory and full-model directory. Training, evaluation and resume share this file; command-line overrides still take precedence. Retain it with Hydra's resolved configuration to reproduce the run.
+For a different layout, copy ``examples/agent/rpent/config/deployment/paths.yaml`` to ``deployment/local.yaml`` under your own config directory and fill in the absolute paths. Replace the deployment option below with ``--config-dir /path/to/config +deployment@_global_=local``.
 
 Run It
 ------
@@ -121,11 +119,11 @@ Generate the seed-0 evaluation list and select one episode. Use the same Ray and
 .. code-block:: bash
 
    "$STACK_ROOT/envs/rpent/bin/python" examples/agent/rpent/prepare_tasks.py \
-     --workflow libero_rl --libero-type standard --libero-config-path "$LIBERO_CONFIG_PATH" \
+     --workflow libero_rl --libero-type standard --libero-config-path "$STACK_ROOT/data/libero-standard-config" \
      --seeds 0 --split eval --output-dir "$STACK_ROOT/data/libero-rl-eval"
    head -n 1 "$STACK_ROOT/data/libero-rl-eval/eval.jsonl" > "$STACK_ROOT/data/libero-rl-eval/smoke.jsonl"
    bash examples/agent/rpent/run_eval.sh eval_qwen3.5_4b_libero_rl_smoke_a100 \
-     --config-dir "$STACK_ROOT/config" +deployment@_global_=local \
+     +deployment@_global_=a100 \
      data.val_data_paths="[$STACK_ROOT/data/libero-rl-eval/smoke.jsonl]"
 
 Append ``--cfg job --resolve`` to inspect the final configuration without loading a model. The smoke writes ``runner.output_dir/rpent-libero-rl-smoke/eval_results.json`` with ``summary.episodes=1``. Check the native outcome and episode subprocess cleanup; a failed task within this short budget can still validate collection.
@@ -136,13 +134,11 @@ After the one-episode smoke passes, run two updates, then restore in a new train
 
    source "$STACK_ROOT/envs/rlinf-token-space/bin/activate"
    bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_libero_rl_sao_a100 \
-     --config-dir "$STACK_ROOT/config" +deployment@_global_=local \
-     runner.output_dir="$STACK_ROOT/logs"
+     +deployment@_global_=a100
 
    bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_libero_rl_sao_a100 \
-     --config-dir "$STACK_ROOT/config" +deployment@_global_=local \
+     +deployment@_global_=a100 \
      runner.experiment_name=rpent-libero-rl-a100-resume \
-     runner.output_dir="$STACK_ROOT/logs" \
      runner.resume_dir="$STACK_ROOT/logs/rpent-libero-rl-a100/checkpoints/global_step_2" \
      runner.max_steps=3
 
@@ -158,7 +154,7 @@ Reserve eight A100 80 GB GPUs. Actor and Critic use GPUs 0–3 (TP2, DP2), two T
 .. code-block:: bash
 
    bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_libero_rl_sao_a100_8gpu \
-     --config-dir "$STACK_ROOT/config" +deployment@_global_=local \
+     +deployment@_global_=a100 \
      rollout.collect_meta_stats=true
 
 This profile admits 32 episodes per update, allows 100 turns per episode and saves every five updates. Set ``runner.max_steps=N`` for a bounded run. Long visual sequences exceeded the four-GPU profile’s CPU prefetch budget, so this profile loads learner images on demand. Request profiling is optional. The override above records per-rank request metadata, including end-to-end latency when SGLang supplies it.
@@ -216,7 +212,7 @@ The export needs the same full VLM used to initialize training, because it retai
      --output "$STACK_ROOT/models/policy-step5"
 
    bash examples/agent/rpent/run_eval.sh eval_qwen3.5_4b_libero_rl \
-     --config-dir "$STACK_ROOT/config" +deployment@_global_=local \
+     +deployment@_global_=a100 \
      runner.output_dir="$STACK_ROOT/logs/eval-step5" \
      rollout.model.model_path="$STACK_ROOT/models/policy-step5" \
      tools.rpent.output_dir="$STACK_ROOT/data/eval-episodes-step5"

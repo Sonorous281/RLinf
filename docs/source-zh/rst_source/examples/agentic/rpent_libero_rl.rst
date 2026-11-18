@@ -77,19 +77,17 @@ RLinf 使用 ``feat/rpent-planner-ppo-sao`` 分支，RPent 使用安装页指定
 
 ``suite`` 和 ``task`` 指定模拟器任务；实际指令由生成器读取。Rollout 保留采样 token ID、behavior logprob、图像、policy 版本与原生结果。Policy loss 只覆盖模型生成的回复 token；工具观测和强制闭合 token 的 loss mask 为 0。
 
-填写部署路径
+配置单机路径
 ------------
 
-安装后，将部署路径模板复制到仓库外：
+按安装页设置 ``STACK_ROOT`` 后，下面的命令用 ``+deployment@_global_=a100`` 读取模型、任务清单和模拟器解释器的路径。在启动 Ray 的终端运行：
 
 .. code-block:: bash
 
    source "$STACK_ROOT/envs/rlinf-token-space/bin/activate"
    cd "$STACK_ROOT/repos/RLinf"
-   mkdir -p "$STACK_ROOT/config/deployment"
-   cp examples/agent/rpent/config/deployment/paths.yaml "$STACK_ROOT/config/deployment/local.yaml"
 
-编辑 ``$STACK_ROOT/config/deployment/local.yaml``，把每个 ``???`` 替换为实际绝对路径。``data.train_data_paths`` 和 ``data.val_data_paths`` 填 YAML 列表，分别指向训练与评测 JSONL；其余字段填写日志目录、RPent 解释器、LIBERO 配置目录、episode 目录和完整模型目录。训练、评测和恢复共用这个文件，命令末尾仍可覆盖单次运行的值。保留该文件和 Hydra 输出的最终配置，便于复现运行参数。
+若使用其他目录，复制 ``examples/agent/rpent/config/deployment/paths.yaml`` 到自选目录的 ``deployment/local.yaml``，填写绝对路径，然后将命令中的部署选项换为 ``--config-dir /path/to/config +deployment@_global_=local``。
 
 运行
 ----
@@ -121,11 +119,11 @@ RLinf 使用 ``feat/rpent-planner-ppo-sao`` 分支，RPent 使用安装页指定
 .. code-block:: bash
 
    "$STACK_ROOT/envs/rpent/bin/python" examples/agent/rpent/prepare_tasks.py \
-     --workflow libero_rl --libero-type standard --libero-config-path "$LIBERO_CONFIG_PATH" \
+     --workflow libero_rl --libero-type standard --libero-config-path "$STACK_ROOT/data/libero-standard-config" \
      --seeds 0 --split eval --output-dir "$STACK_ROOT/data/libero-rl-eval"
    head -n 1 "$STACK_ROOT/data/libero-rl-eval/eval.jsonl" > "$STACK_ROOT/data/libero-rl-eval/smoke.jsonl"
    bash examples/agent/rpent/run_eval.sh eval_qwen3.5_4b_libero_rl_smoke_a100 \
-     --config-dir "$STACK_ROOT/config" +deployment@_global_=local \
+     +deployment@_global_=a100 \
      data.val_data_paths="[$STACK_ROOT/data/libero-rl-eval/smoke.jsonl]"
 
 命令末尾可添加 ``--cfg job --resolve``，不加载模型即可检查最终配置。Smoke 输出 ``runner.output_dir/rpent-libero-rl-smoke/eval_results.json``，其中 ``summary.episodes=1``。检查原生终态及 episode 子进程退出；短预算内任务失败不等于采集链路失败。
@@ -136,13 +134,11 @@ RLinf 使用 ``feat/rpent-planner-ppo-sao`` 分支，RPent 使用安装页指定
 
    source "$STACK_ROOT/envs/rlinf-token-space/bin/activate"
    bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_libero_rl_sao_a100 \
-     --config-dir "$STACK_ROOT/config" +deployment@_global_=local \
-     runner.output_dir="$STACK_ROOT/logs"
+     +deployment@_global_=a100
 
    bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_libero_rl_sao_a100 \
-     --config-dir "$STACK_ROOT/config" +deployment@_global_=local \
+     +deployment@_global_=a100 \
      runner.experiment_name=rpent-libero-rl-a100-resume \
-     runner.output_dir="$STACK_ROOT/logs" \
      runner.resume_dir="$STACK_ROOT/logs/rpent-libero-rl-a100/checkpoints/global_step_2" \
      runner.max_steps=3
 
@@ -158,7 +154,7 @@ RLinf 使用 ``feat/rpent-planner-ppo-sao`` 分支，RPent 使用安装页指定
 .. code-block:: bash
 
    bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_libero_rl_sao_a100_8gpu \
-     --config-dir "$STACK_ROOT/config" +deployment@_global_=local \
+     +deployment@_global_=a100 \
      rollout.collect_meta_stats=true
 
 每次更新使用 32 个 episode，每个 episode 最多 100 轮，每 5 次更新保存一次 checkpoint。设置 ``runner.max_steps=N`` 可将训练限制在 N 步。长视觉序列曾超过四卡配置的 CPU 预取预算，所以八卡配置按需加载训练图像。请求级统计默认关闭，上面的命令按 rollout rank 记录请求统计。SGLang 返回端到端延迟时，该值也会写入记录。
@@ -216,7 +212,7 @@ RLinf 使用 ``feat/rpent-planner-ppo-sao`` 分支，RPent 使用安装页指定
      --output "$STACK_ROOT/models/policy-step5"
 
    bash examples/agent/rpent/run_eval.sh eval_qwen3.5_4b_libero_rl \
-     --config-dir "$STACK_ROOT/config" +deployment@_global_=local \
+     +deployment@_global_=a100 \
      runner.output_dir="$STACK_ROOT/logs/eval-step5" \
      rollout.model.model_path="$STACK_ROOT/models/policy-step5" \
      tools.rpent.output_dir="$STACK_ROOT/data/eval-episodes-step5"
