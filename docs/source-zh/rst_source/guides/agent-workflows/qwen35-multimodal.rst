@@ -3,21 +3,49 @@
 
 共享预处理让 SGLang rollout 与 Megatron 训练复用相同的图像输入。本指南适用于已经接入图像观测、并在多轮对话中保留采样 Token ID 的 Qwen3.5 智能体工作流。
 
-安装预处理依赖
---------------
+使用 SGLang 0.5.12.post1
+------------------------
 
-默认图像路径使用模型的 Hugging Face Processor。共享预处理需要主动启用 SGLang TokenSpace，并使用固定版本的实验依赖。机器需有兼容 CUDA 13 的驱动，以及源码编译所需的 Rust。在独立环境中安装：
+在 agentic 环境中使用 PyTorch 2.11.0、SGLang 0.5.12.post1、Megatron Core 0.18.0 和 Transformer Engine 2.17。Qwen3.5 的 Gated Delta 层还需要训练环境中的 ``fla-core==0.6.0``\ 。使用 SGLang 发布包时，在 rollout worker 的环境中设置以下变量，再启动服务。
 
 .. code-block:: bash
 
+   export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=rlinf.hybrid_engines.sglang.multimodal
+
+从零安装训练环境时，可将 Megatron Core 固定到实测标签，再运行 agentic 安装脚本。
+
+.. code-block:: bash
+
+   git clone --depth 1 --branch core_v0.18.0 https://github.com/NVIDIA/Megatron-LM.git Megatron-LM-0.18.0
+   MEGATRON_PATH="$PWD/Megatron-LM-0.18.0" bash requirements/install.sh agentic --sglang 0.5.12.post1 --venv .venv-agentic
+
+开启 ``rollout.sglang.enable_shared_multi_modal_processor`` 和 ``actor.expect_multi_modal_inputs``\ 。使用 Critic 时也为它开启图像输入。流水线并行和上下文并行规模均设为 1。每个 rollout worker 和本机的 tokenizer 进程需能访问同一个临时目录。
+
+将新输入的 token ID 追加到上一轮的实际 prompt 和采样输出之后。按图片在 prompt 中出现的顺序传入所有原图及对应区间。区间使用左闭右开的下标，仅包含图像占位 token。旧图沿用返回的展开区间，新图用一个占位 token。第一轮的 ``history`` 设为 ``None``\ ，后续使用上一轮的返回值：
+
+.. code-block:: python
+
+   result = await self.generate(
+       prompt_ids, image_data=images, image_spans=spans, image_history=history,
+       image_store_dir=shared_directory,
+   )
+   history = result["image_history"]
+   prefix = result["prompt_token_ids"] + result["output_ids"]
+   spans = result["multimodal_input"]["image_spans"]
+
+将 ``multimodal_input`` 保存在训练样本中。训练端直接读取采样时保存的像素、网格和位置。共享目录为每个不同的像素张量保存一份文件，训练样本或 checkpoint 引用期间需保留。省略目录时，轨迹直接携带张量。后续轮次中，SGLang 会再次处理历史图片并与上轮记录核对。发布版无需开启实验性预处理缓存。
+
+实验版 TokenSpace 接口
+----------------------
+
+沿用 ``prepare_multimodal()`` 预处理接口和 SGLang 原生预处理缓存的工作流需要固定源码版本及兼容 CUDA 13 的驱动。请使用独立环境并取消设置上述外部 Processor 环境变量：
+
+.. code-block:: bash
+
+   unset SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE
    bash requirements/install.sh agentic --sglang token-space --venv .venv-token-space
 
-命令安装固定提交的 SGLang 及配套 Megatron 依赖，默认的 agentic 安装方式保持不变。
-
-配置回放与缓存预算
-------------------
-
-在已有的 Qwen3.5 Megatron 智能体配置中设置以下配置项。将流水线并行和上下文并行规模均设为 1。缓存目录需替换为 rollout 与 learner 均可访问的绝对路径：
+实验版可按下例配置共享缓存和每个训练进程的预取预算。
 
 .. code-block:: yaml
 
@@ -50,9 +78,7 @@
 检查输入一致性
 --------------
 
-rollout 记录实际使用的 prompt ID、图像网格、Processor 配置、像素校验值和 M-RoPE 校验值。文件、像素或位置编码发生变化时，训练端回放会报错。例如，第二轮加入图片后，第一轮的采样 ID 和已展开图像区间应保持不变，仅展开新图片对应的区间。
-
-磁盘缓存保存的是图像预处理结果，learner 仍执行视觉编码器前向计算。输入相同不能证明 SGLang 与 Megatron 的视觉 Embedding 或最终 Logprob 相同；视觉 Embedding 和最终 Logprob 需要分别验证，比较时使用相同的冻结权重和 Token。
+加入第二张图后，检查旧图的区间、像素和第一轮的采样 token 是否保留。发布版会为每轮记录实际使用的 prompt ID 和 M-RoPE 位置。Megatron 在语言模型入口校验位置，并用保存的像素执行视觉编码器前向计算。要比较最终 logprob，需在相同权重和 token 上单独测量。
 
 .. warning::
 

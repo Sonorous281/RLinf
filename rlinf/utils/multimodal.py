@@ -30,6 +30,12 @@ from typing import ContextManager
 
 import torch
 
+from rlinf.hybrid_engines.sglang.multimodal.replay import (
+    REPLAY_FORMAT,
+    replay_pixels,
+    replay_positions,
+)
+
 
 def store_image_refs(images: list[bytes], directory: Path) -> list[dict[str, str]]:
     """Publish images by content hash and return references in prompt order."""
@@ -185,6 +191,7 @@ def materialize_multimodal_inputs(
         payloads = [None] * input_ids.shape[0]
     if token_space and len(payloads) != input_ids.shape[0]:
         raise ValueError("Token-space media rows must align with the training batch")
+    image_mask = None
     _processed_image_cache.trim(cache_bytes)
     for row, entry in enumerate(payloads):
         if token_space:
@@ -192,11 +199,24 @@ def materialize_multimodal_inputs(
             row_ids = input_ids[row].detach().cpu()[row_mask].tolist()
             if not entry:
                 positions[:, row, row_mask] = torch.arange(len(row_ids))
+            elif entry.get("format") == REPLAY_FORMAT:
+                positions[:, row, row_mask] = replay_positions(entry, row_ids)
+                if image_mask is None:
+                    image_mask = torch.zeros_like(
+                        attention_mask, device="cpu", dtype=torch.bool
+                    )
+                mask = torch.zeros(len(row_ids), dtype=torch.bool)
+                for start, end in entry["image_spans"]:
+                    mask[start:end] = True
+                image_mask[row, row_mask] = mask
+                pixels.append(replay_pixels(entry))
+                grids.append(entry["image_grid_thw"])
+                continue
             elif entry.get("format") != "sglang-token-space-v1":
                 raise ValueError(
                     "Legacy media cannot enter a token-space batch; generate fresh rollouts"
                 )
-        elif entry and entry.get("format") == "sglang-token-space-v1":
+        elif entry and entry.get("format") in (REPLAY_FORMAT, "sglang-token-space-v1"):
             raise ValueError(
                 "Token-space media requires token-space training to be enabled"
             )
@@ -239,6 +259,12 @@ def materialize_multimodal_inputs(
             pixels.append(entry["pixel_values"])
         grids.append(grid)
     result = {"multimodal_position_ids": positions.to(device)} if token_space else {}
+    if image_mask is not None:
+        if any(e and e.get("format") != REPLAY_FORMAT for e in payloads):
+            raise ValueError(
+                "Cannot mix captured and legacy vision inputs in one microbatch"
+            )
+        result["image_input_mask"] = image_mask.to(device)
     if not pixels:
         return result
     return {
@@ -302,16 +328,21 @@ class MultimodalBatchPreparer:
 
     def _result_bytes(self, batch: dict) -> int:
         size = 3 * batch["input_ids"].numel() * 8 if self.token_space else 0
-        for entry in batch.get("multi_modal_inputs") or []:
+        entries = batch.get("multi_modal_inputs") or []
+        if any(entry and entry.get("format") == REPLAY_FORMAT for entry in entries):
+            size += batch["input_ids"].numel()
+        for entry in entries:
             if not entry:
                 continue
-            if "image_refs" in entry:
+            if "image_refs" in entry or "pixel_refs" in entry:
                 if "pixel_values_bytes" not in entry:
                     raise ValueError(
                         "Image prefetch needs pixel_values_bytes; generate fresh "
                         "token-space rollouts or disable multimodal.prefetch_batches."
                     )
                 size += entry["pixel_values_bytes"]
+            elif entry.get("format") == REPLAY_FORMAT:
+                size += entry["pixel_values"].numel() * 2
             else:
                 size += entry["pixel_values"].nbytes
             size += entry["image_grid_thw"].nbytes

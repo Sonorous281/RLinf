@@ -5,28 +5,67 @@ Use shared preprocessing to replay the same image inputs in SGLang rollout and
 Megatron training. This guide assumes a Qwen3.5 agent workflow that sends image
 observations and preserves the sampled token IDs across turns.
 
-Install the Processor Stack
----------------------------
+SGLang 0.5.12.post1
+-------------------
 
-The model's Hugging Face processor handles images by default. To share image
-preprocessing between rollout and training, install the experimental SGLang
-TokenSpace dependencies.
-It requires a CUDA 13 compatible driver and Rust for source builds. Install it in
-a separate environment:
+Use the agentic environment with PyTorch 2.11.0, SGLang 0.5.12.post1,
+Megatron Core 0.18.0 and Transformer Engine 2.17. For the Qwen3.5 gated
+delta layers, the learner also needs the agentic stack's ``fla-core==0.6.0``.
+This path uses the released SGLang wheel. Set the following in the rollout
+worker environment before the server starts:
 
 .. code-block:: bash
 
+   export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=rlinf.hybrid_engines.sglang.multimodal
+
+For a fresh learner environment matching the tested Core release, point the
+agentic installer at the tagged checkout:
+
+.. code-block:: bash
+
+   git clone --depth 1 --branch core_v0.18.0 https://github.com/NVIDIA/Megatron-LM.git Megatron-LM-0.18.0
+   MEGATRON_PATH="$PWD/Megatron-LM-0.18.0" bash requirements/install.sh agentic --sglang 0.5.12.post1 --venv .venv-agentic
+
+Set ``rollout.sglang.enable_shared_multi_modal_processor=true`` and
+``actor.expect_multi_modal_inputs=true`` (also set the latter on any critic).
+Use pipeline and context parallel sizes of one. Each rollout worker and its
+local tokenizer process must share the same temporary directory.
+
+For each image turn, append new input to the previous served prompt and sampled
+output IDs. Supply all raw images in prompt order and their half-open pad spans
+(excluding the vision delimiters). Keep the previous expanded spans and use one
+pad for each new image. Pass ``None`` on the first call and the returned history on subsequent calls:
+
+.. code-block:: python
+
+   result = await self.generate(
+       prompt_ids, image_data=images, image_spans=spans, image_history=history,
+       image_store_dir=shared_directory,
+   )
+   history = result["image_history"]
+   prefix = result["prompt_token_ids"] + result["output_ids"]
+   spans = result["multimodal_input"]["image_spans"]
+
+Store ``multimodal_input`` with the training row. The learner reads the captured
+pixels, grid and positions. The shared directory contains one file per distinct
+pixel tensor. Keep it accessible until all pending rows and checkpoints have
+expired. Omit ``image_store_dir`` to carry tensors inline. Old images are
+processed again by SGLang on later turns and checked against the recorded
+history. This mode does not require the experimental preprocessing cache.
+
+Experimental TokenSpace API
+---------------------------
+
+Workflows using the separate ``prepare_multimodal()`` preflight and SGLang's
+native preprocessing cache require the pinned build and a CUDA 13 driver.
+Install it in a separate environment and unset the external processor variable:
+
+.. code-block:: bash
+
+   unset SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE
    bash requirements/install.sh agentic --sglang token-space --venv .venv-token-space
 
-This installs the pinned SGLang source and the matching Megatron dependencies.
-The default agentic installation remains unchanged.
-
-Configure Replay and Cache Budgets
-----------------------------------
-
-Apply these overrides to an existing Qwen3.5 Megatron agent configuration with
-pipeline and context parallel sizes set to one. Replace the cache directory with
-an absolute path visible to rollout and learner processes:
+Configure the shared storage and per-rank budgets on the experimental path:
 
 .. code-block:: yaml
 
@@ -64,15 +103,11 @@ in both training and rollout.
 Check the Input Contract
 ------------------------
 
-Rollout records the served prompt IDs, image grids, processor settings, pixel
-checksums and M-RoPE checksums. Replay rejects changed files, pixels or positions.
-For example, adding a second image must leave the first turn's sampled IDs and
-expanded image span intact; only the new image span is expanded.
-
-The disk cache stores image preprocessing results. The learner still runs
-a forward pass through the vision encoder. Matching these inputs does not establish equal
-vision embeddings or final logprobs between SGLang and Megatron; measure those
-separately on the same frozen weights and tokens.
+When adding a second image, check that the previous image span, pixels and
+sampled IDs remain intact. The release processor records the served prompt IDs
+and M-RoPE positions for each turn. Megatron verifies the positions at the
+language model input and runs its vision encoder on the saved pixels. Compare
+final logprobs separately using the same weights and tokens.
 
 .. warning::
 

@@ -470,3 +470,96 @@ Path(sys.argv[2]).write_text(json.dumps({"hits": len(hits), "digests": {
     assert actual["digests"] == {
         key: tensor_digest(value) for key, value in expected.items()
     }
+
+
+def test_release_capture_replays_positions_and_verifies_shared_pixels(tmp_path):
+    from rlinf.hybrid_engines.sglang.multimodal.replay import (
+        REPLAY_FORMAT,
+        store_pixels,
+    )
+    from rlinf.utils.multimodal import materialize_multimodal_inputs
+
+    pixels = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    data = {
+        "format": REPLAY_FORMAT,
+        "prompt_token_ids": [10, 11, 12],
+        "image_spans": [[1, 2]],
+        "pixel_values": pixels,
+        "image_grid_thw": torch.tensor([[1, 2, 2]]),
+        "mrope_positions": torch.tensor([[0, 1, 2]] * 3),
+        "mrope_position_delta": torch.tensor([0]),
+    }
+    store_pixels(data, tmp_path)
+    ids = torch.tensor([[10, 11, 12, 13, 0]])
+
+    def replay():
+        return materialize_multimodal_inputs(
+            [data],
+            "unused",
+            "cpu",
+            input_ids=ids,
+            attention_mask=ids.ne(0),
+            token_space=True,
+        )
+
+    result = replay()
+    assert torch.equal(result["pixel_values"], pixels.bfloat16())
+    assert result["image_input_mask"].tolist() == [[False, True, False, False, False]]
+    assert result["multimodal_position_ids"][:, 0].tolist() == [[0, 1, 2, 3, 0]] * 3
+    ids[0, 0] = 2
+    with pytest.raises(ValueError, match="prompt"):
+        replay()
+    ids[0, 0] = 10
+    Path(data["pixel_refs"][0]["path"]).write_bytes(b"corrupt")
+    with pytest.raises(ValueError, match="checksum"):
+        replay()
+
+
+def test_release_capture_checks_sampled_history_and_request_id():
+    from rlinf.hybrid_engines.sglang.multimodal.replay import (
+        CAPTURE_KEY,
+        capture_file,
+        generate_with_capture,
+        save_capture,
+    )
+
+    rid = "a" * 32
+    pixels = torch.ones(4, 2)
+
+    async def generate(input_ids, image_data, sampling_params, return_logprob):
+        capture = sampling_params["custom_params"][CAPTURE_KEY]
+        output = SimpleNamespace(
+            input_ids=input_ids,
+            mrope_positions=torch.arange(len(input_ids)).repeat(3, 1),
+            mrope_position_delta=0,
+            mm_items=[
+                SimpleNamespace(
+                    offsets=[(1, 1)],
+                    feature=pixels,
+                    image_grid_thw=torch.tensor([[1, 2, 2]]),
+                )
+            ],
+        )
+        save_capture(capture_file(capture["ticket"], rid), output)
+        return {"meta_info": {"id": rid}, "output_ids": [23]}
+
+    def sample(ids, history=None):
+        return asyncio.run(
+            generate_with_capture(
+                generate,
+                ids,
+                ["image"],
+                {},
+                {"image_spans": [[1, 2]], "history": history},
+                False,
+            )
+        )
+
+    _, _, history = sample([10, 11, 12])
+    _, row, _ = sample([10, 11, 12, 23, 24], history)
+    assert row["prompt_token_ids"] == [10, 11, 12, 23, 24]
+    with pytest.raises(ValueError, match="sampled token history"):
+        sample([10, 11, 12, 99, 24], history)
+    pixels.zero_()
+    with pytest.raises(ValueError, match="pixels"):
+        sample([10, 11, 12, 23, 24], history)

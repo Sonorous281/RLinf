@@ -770,6 +770,10 @@ class MegatronModelManager:
                 input_ids_rmpad = input_ids_rmpad[:, :used].contiguous()
                 model_attention_mask = attention_mask[:, :used].contiguous()
                 model_position_ids = position_ids[..., :used].contiguous()
+                if "image_input_mask" in model_forward_kwargs:
+                    model_forward_kwargs["image_input_mask"] = model_forward_kwargs[
+                        "image_input_mask"
+                    ][:, :used].contiguous()
             model_inputs = dict(
                 input_ids=input_ids_rmpad,
                 attention_mask=model_attention_mask,

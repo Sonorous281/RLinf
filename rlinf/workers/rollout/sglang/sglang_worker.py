@@ -38,7 +38,7 @@ from rlinf.scheduler.dynamic_scheduler.utils import (
 )
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.workers.rollout.backend import RlinfContext
-from rlinf.workers.rollout.sglang import require_supported_sglang
+from rlinf.workers.rollout.sglang import require_supported_sglang, sglang_version
 from rlinf.workers.rollout.sglang.backends import make_backend
 from rlinf.workers.rollout.sglang.rendezvous import (
     broadcast_instance_readiness,
@@ -272,7 +272,17 @@ class SGLangWorker(Worker):
                     f"the configured value {value!r} is ignored"
                 )
 
-        if shared_multi_modal_processor_enabled(self._cfg_rollout.sglang):
+        shared_processor = shared_multi_modal_processor_enabled(
+            self._cfg_rollout.sglang
+        )
+        if shared_processor and str(sglang_version) == "0.5.12.post1":
+            if os.environ.get("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE") != (
+                "rlinf.hybrid_engines.sglang.multimodal"
+            ):
+                raise ValueError(
+                    "Release image capture requires the RLinf external Qwen processor"
+                )
+        elif shared_processor:
             from rlinf.hybrid_engines.sglang.multimodal.token_space import (
                 require_token_space_support,
             )
@@ -504,7 +514,10 @@ class SGLangWorker(Worker):
                     "node_rank": node_rank,
                 }
         server_args = self._build_server_args()
-        if shared_multi_modal_processor_enabled(self._cfg_rollout.sglang):
+        if (
+            shared_multi_modal_processor_enabled(self._cfg_rollout.sglang)
+            and str(sglang_version) != "0.5.12.post1"
+        ):
             from rlinf.hybrid_engines.sglang.multimodal.token_space import (
                 SGLangTokenSpace,
                 processor_settings,
@@ -887,6 +900,7 @@ class SGLangWorker(Worker):
         prepare_multimodal: Optional[dict] = None,
         return_prompt_token_ids: bool = False,
         mm_token_expansion_start_len: Optional[int] = None,
+        capture_images: Optional[dict] = None,
     ):
         # Backstop for rollout_serverless's entry-rank gate; return instead
         # of raising because nobody awaits this task.
@@ -913,18 +927,41 @@ class SGLangWorker(Worker):
                 ).async_wait()
                 return
             extra = {}
-            if return_prompt_token_ids:
+            if return_prompt_token_ids and capture_images is None:
                 extra["return_prompt_token_ids"] = True
             if mm_token_expansion_start_len is not None:
                 extra["mm_token_expansion_start_len"] = mm_token_expansion_start_len
             version_start = self._weight_version
-            result = await self._backend.async_generate(
-                input_ids=prompt_ids,
-                sampling_params=final_sampling_params,
-                image_data=image_data or None,
-                return_logprob=self._return_logprobs,
-                **extra,
-            )
+            captured = None
+            if capture_images is not None:
+                from rlinf.hybrid_engines.sglang.multimodal.replay import (
+                    generate_with_capture,
+                )
+
+                if (
+                    not shared_multi_modal_processor_enabled(self._cfg_rollout.sglang)
+                    or str(sglang_version) != "0.5.12.post1"
+                    or extra
+                ):
+                    raise ValueError(
+                        "Release capture requires shared preprocessing and explicit image spans"
+                    )
+                result, captured, history = await generate_with_capture(
+                    self._backend.async_generate,
+                    prompt_ids,
+                    image_data,
+                    final_sampling_params,
+                    capture_images,
+                    self._return_logprobs,
+                )
+            else:
+                result = await self._backend.async_generate(
+                    input_ids=prompt_ids,
+                    sampling_params=final_sampling_params,
+                    image_data=image_data or None,
+                    return_logprob=self._return_logprobs,
+                    **extra,
+                )
             # sglang will trim matched stop in result text, so we should only return output_ids
             result_dict = {
                 "output_ids": result["output_ids"],
@@ -935,7 +972,11 @@ class SGLangWorker(Worker):
                 "version_start": version_start,
                 "version_end": self._weight_version,
             }
-            if return_prompt_token_ids:
+            if captured is not None:
+                result_dict["multimodal_input"] = captured
+                result_dict["image_history"] = history
+                result_dict["prompt_token_ids"] = captured["prompt_token_ids"]
+            elif return_prompt_token_ids:
                 payload = (
                     result if "prompt_token_ids" in result else result["meta_info"]
                 )
@@ -983,6 +1024,7 @@ class SGLangWorker(Worker):
                     sampling_params=rollout_request.get("sampling_params", None),
                     image_data=rollout_request.get("image_data"),
                     prepare_multimodal=rollout_request.get("prepare_multimodal"),
+                    capture_images=rollout_request.get("capture_images"),
                     return_prompt_token_ids=rollout_request.get(
                         "return_prompt_token_ids", False
                     ),
