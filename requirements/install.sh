@@ -4766,6 +4766,15 @@ install_agentic() {
     megatron_dir=$(clone_or_reuse_repo MEGATRON_PATH "$VENV_DIR/Megatron-LM" https://github.com/NVIDIA/Megatron-LM.git -b "$megatron_branch")
 
 
+    if [ "$engine:$engine_ver" = "sglang:token-space" ] && [ -z "${MEGATRON_PATH:-}" ]; then
+        # Preserve CPU-offloaded master weights and Adam counters on resume.
+        # Explicit MEGATRON_PATH checkouts remain under the caller's control.
+        local resume_patch="$SCRIPT_DIR/agentic/megatron-core-r0.18.0-cpu-offload.patch"
+        if ! git -C "$megatron_dir" apply --reverse --check "$resume_patch" 2>/dev/null; then
+            git -C "$megatron_dir" apply "$resume_patch" || return $?
+        fi
+    fi
+
     echo "export PYTHONPATH=$(realpath "$megatron_dir"):\$PYTHONPATH" >> "$VENV_DIR/bin/activate"
 
     # If TEST_BUILD is 1, skip the heavy transformer-engine build (megatron.txt
