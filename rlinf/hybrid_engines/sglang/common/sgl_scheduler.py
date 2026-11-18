@@ -228,12 +228,13 @@ class Scheduler(_Scheduler):
             super()._add_request_to_queue(req)
 
     def _park_requests(self) -> None:
-        """Park unfinished requests and acknowledge an idle engine before offload."""
+        """Retract unfinished requests and retain their generation state for resume."""
         from sglang.srt.managers.io_struct import PauseGenerationReqInput
 
         if self._parked_requests is not None:
             return
         self._parked_requests = {}
+        self._parked_cache_flushed = False
         super().pause_generation(PauseGenerationReqInput(mode="retract"))
         if self.enable_overlap:
             while self.result_queue:
@@ -256,10 +257,6 @@ class Scheduler(_Scheduler):
         self.last_batch = self.cur_batch = self.chunked_req = None
         self._chunked_req_scheduled_last_iter = False
         self._rlinf_worker.torch_platform.synchronize()
-        if not self.flush_cache():
-            raise RuntimeError(
-                "Retraction left active GPU state; refusing memory offload."
-            )
 
     def _restore_requests(self) -> None:
         """Restore parked requests after weights, KV memory, and graphs are ready."""
@@ -281,6 +278,13 @@ class Scheduler(_Scheduler):
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         if self._engine_paused and not self.is_fully_idle():
             self._park_requests()
+        # An earlier flush can fail after retraction has emptied the queues.
+        if self._parked_requests is not None and not self._parked_cache_flushed:
+            if not self.flush_cache():
+                raise RuntimeError(
+                    "Retraction left active GPU state; refusing memory offload."
+                )
+            self._parked_cache_flushed = True
         requested_tags = self.resolve_memory_tags(recv_req)
         already_offloaded = {
             tag for tag in requested_tags if self.offloaded_tags.get(tag, False)
@@ -580,6 +584,13 @@ class Scheduler(_Scheduler):
             return
 
         saved_queue = self.waiting_queue
+        for req in saved_queue:
+            # Removing the queue hides these rows from SGLang's idle check.
+            kv = getattr(req, "kv", None)
+            if kv is not None and (kv.holds_kv or kv.holds_mamba):
+                raise RuntimeError(
+                    f"Retracted request {req.rid} still owns a GPU cache row."
+                )
         self.waiting_queue = []
         try:
             # Reuse sglang's own flush so the prefix tree and the KV

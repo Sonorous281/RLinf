@@ -47,6 +47,9 @@ def test_shared_sglang_retraction_retains_prefix_logprobs_and_late_requests(
 
     from rlinf.hybrid_engines.sglang.common.sgl_scheduler import Scheduler, _Scheduler
 
+    if not hasattr(_Scheduler, "release_memory_occupation"):
+        pytest.skip("This release delegates offload to its weight updater")
+
     class VendorBatch:
         def __init__(self, reqs):
             self.reqs = reqs
@@ -75,6 +78,7 @@ def test_shared_sglang_retraction_retains_prefix_logprobs_and_late_requests(
     )
     scheduler.is_weight_offloaded = False
     scheduler.weight_reload = "sync"
+    scheduler._sync_draft_model = None
     scheduler._rlinf_worker = SimpleNamespace(
         torch_platform=SimpleNamespace(synchronize=lambda: None)
     )
@@ -111,6 +115,17 @@ def test_shared_sglang_retraction_retains_prefix_logprobs_and_late_requests(
     monkeypatch.setattr(
         _Scheduler, "resume_memory_occupation", lambda self, request: None
     )
+    with monkeypatch.context() as blocked:
+        blocked.setattr(_Scheduler, "flush_cache", lambda self: False)
+        release = mock.Mock()
+        blocked.setattr(_Scheduler, "release_memory_occupation", release)
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="refusing memory offload"):
+                scheduler.release_memory_occupation(SimpleNamespace(tags=["weights"]))
+        release.assert_not_called()
+        assert not any(scheduler.offloaded_tags.values())
+        assert scheduler._parked_requests == {"active": req}
+
     for cycle in range(2):
         prefix, logprobs = list(req.output_ids), list(req.output_token_logprobs_val)
         scheduler.release_memory_occupation(

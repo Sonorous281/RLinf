@@ -21,6 +21,7 @@ import os
 import sys
 from pathlib import Path
 from types import MethodType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -567,6 +568,31 @@ def test_token_space_http_and_generation_metadata_preserve_prompt_ids(monkeypatc
     legacy = InferenceHTTPClient._generate_body(None, [1, 2], {}, False)
     assert "return_prompt_token_ids" not in legacy
     assert "mm_token_expansion_start_len" not in legacy
+
+
+@pytest.mark.parametrize("held", ["holds_kv", "holds_mamba"])
+def test_retract_refuses_to_flush_owned_cache_rows(held):
+    pytest.importorskip("sglang")
+    from rlinf.hybrid_engines.sglang.common.sgl_scheduler import Scheduler
+
+    kv = SimpleNamespace(holds_kv=False, holds_mamba=False)
+    setattr(kv, held, True)
+    queue = [SimpleNamespace(rid="episode", kv=kv)]
+    scheduler = SimpleNamespace(
+        running_batch=SimpleNamespace(is_empty=lambda: True),
+        chunked_req=None,
+        enable_overlap=False,
+        waiting_queue=queue,
+        flush_cache=Mock(return_value=True),
+    )
+    with pytest.raises(RuntimeError, match="episode still owns a GPU cache row"):
+        Scheduler._handle_cache_after_sync(scheduler, "retract")
+    assert scheduler.waiting_queue is queue
+    scheduler.flush_cache.assert_not_called()
+    setattr(kv, held, False)
+    Scheduler._handle_cache_after_sync(scheduler, "retract")
+    scheduler.flush_cache.assert_called_once_with()
+    assert scheduler.waiting_queue is queue
 
 
 def test_token_versions_survive_retraction_and_multiple_weight_updates():
