@@ -21,6 +21,7 @@ import os
 import sys
 from pathlib import Path
 from types import MethodType, SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
@@ -83,6 +84,42 @@ def sglang_args_modules(monkeypatch):
         spec.loader.exec_module(module)
         modules.append(module)
     return modules
+
+
+@pytest.mark.parametrize("location", ["top", "meta", "missing"])
+def test_serverless_generation_returns_requested_prompt_ids(
+    sglang_args_modules, location
+):
+    _, worker_module, _ = sglang_args_modules
+    result = {
+        "output_ids": [4],
+        "meta_info": {"finish_reason": {"type": "stop"}, "prompt_tokens": 2},
+    }
+    if location == "top":
+        result["prompt_token_ids"] = [1, 3]
+    elif location == "meta":
+        result["meta_info"]["prompt_token_ids"] = [1, 3]
+    worker = SimpleNamespace(
+        _is_model_instance_entry=True,
+        _weight_version=2,
+        _sampling_params={},
+        _return_logprobs=False,
+        _backend=SimpleNamespace(async_generate=AsyncMock(return_value=result)),
+        log_error=Mock(),
+    )
+    channel = Mock()
+    channel.put.return_value.async_wait = AsyncMock()
+    asyncio.run(
+        worker_module.SGLangWorker.generate_and_send(
+            worker, channel, "episode", [1, 3], return_prompt_token_ids=True
+        )
+    )
+    payload = channel.put.call_args.args[0]
+    if location == "missing":
+        assert "prompt_token_ids" in payload["error"]
+    else:
+        assert payload["prompt_token_ids"] == [1, 3]
+        assert payload["version_start"] == payload["version_end"] == 2
 
 
 @pytest.fixture

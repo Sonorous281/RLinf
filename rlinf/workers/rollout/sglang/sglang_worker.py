@@ -936,9 +936,10 @@ class SGLangWorker(Worker):
                 "version_end": self._weight_version,
             }
             if return_prompt_token_ids:
-                result_dict["prompt_token_ids"] = result["meta_info"][
-                    "prompt_token_ids"
-                ]
+                payload = (
+                    result if "prompt_token_ids" in result else result["meta_info"]
+                )
+                result_dict["prompt_token_ids"] = payload["prompt_token_ids"]
             if self._return_logprobs:
                 result_dict["logprobs"] = [
                     item[0] for item in result["meta_info"]["output_token_logprobs"]

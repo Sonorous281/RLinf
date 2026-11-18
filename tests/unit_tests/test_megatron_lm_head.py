@@ -269,6 +269,100 @@ def test_chunked_forward_restores_postprocess_after_failure(instance_override):
     assert language._postprocess == original
 
 
+@pytest.mark.parametrize("load_mtp", [None, True, False])
+def test_chunked_qwen_scoring_requires_explicit_mtp_disable(load_mtp):
+    from omegaconf import OmegaConf
+
+    from rlinf.config import validate_qwen_vl_chunked_cfg
+
+    model = {
+        "model_type": "qwen3_5",
+        "lm_head_chunk_size": 256,
+        "pipeline_model_parallel_size": 1,
+    }
+    if load_mtp is not None:
+        model["load_mtp"] = load_mtp
+    cfg = OmegaConf.create(
+        {
+            "actor": {
+                "training_backend": "megatron",
+                "model": model,
+                "megatron": {"mbridge": True},
+            },
+            "agentloop": {"is_dynamic_rollout_batch": True},
+            "algorithm": {
+                "calculate_entropy": False,
+                "entropy_bonus": 0,
+                "sampling_params": {"temperature": 1.0},
+            },
+        }
+    )
+    if load_mtp is False:
+        assert validate_qwen_vl_chunked_cfg(cfg) == 256
+    else:
+        with pytest.raises(ValueError, match="load_mtp=False"):
+            validate_qwen_vl_chunked_cfg(cfg)
+
+
+def test_qwen_chunked_adapter_bypasses_dense_projection(monkeypatch):
+    from types import SimpleNamespace
+
+    from rlinf.hybrid_engines.megatron.qwen_vl import (
+        forward_qwen_vl_with_chunked_log_probs,
+    )
+
+    torch.manual_seed(12)
+    hidden = torch.randn(7, 1, 4, requires_grad=True)
+    head = torch.nn.Linear(4, 11)
+    head.gradient_accumulation_fusion = False
+    labels = torch.tensor([[2, 4, 1, 3, 5, 2, 8]])
+    mask = labels.remainder(2).bool()
+    temperature = 0.7
+    logits = head(hidden).transpose(0, 1) / temperature
+    expected = logits.log_softmax(-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    expected = expected.masked_fill(~mask, 0)
+    parameters = (hidden, head.weight, head.bias)
+    gradients = torch.autograd.grad(expected.sum(), parameters)
+
+    # This is the Bridge/Core output-processor boundary. A regular head call
+    # after the decoder would materialize the full vocabulary tensor.
+    def postprocess(*, output_processor):
+        return output_processor(
+            hidden_states=hidden,
+            output_layer=head,
+            output_weight=None,
+            labels=None,
+            inference_context=None,
+        )
+
+    language = SimpleNamespace(
+        post_process=True,
+        mtp_process=False,
+        pg_collection=SimpleNamespace(tp=None),
+        config=SimpleNamespace(
+            mtp_num_layers=0,
+            use_mup=False,
+            defer_embedding_wgrad_compute=False,
+            fp8=False,
+        ),
+        _postprocess=postprocess,
+    )
+    monkeypatch.setattr(head, "forward", lambda *_: pytest.fail("dense projection"))
+    result = forward_qwen_vl_with_chunked_log_probs(
+        lambda: language._postprocess(),
+        SimpleNamespace(post_process=True, language_model=language),
+        label=labels,
+        label_mask=mask,
+        chunk_size=2,
+        temperature=temperature,
+    )["log_probs"]
+    torch.testing.assert_close(result, expected)
+    for actual, reference in zip(
+        torch.autograd.grad(result.sum(), parameters), gradients
+    ):
+        torch.testing.assert_close(actual, reference)
+
+
 def test_mrope_verification_removes_hook_after_failure():
     pytest.importorskip("megatron.bridge")
     from rlinf.hybrid_engines.megatron.qwen_vl_inputs import verify_qwen_vl_positions

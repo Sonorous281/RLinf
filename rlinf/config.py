@@ -2542,6 +2542,12 @@ def validate_qwen_vl_chunked_cfg(cfg) -> int:
         )
     if size == 0:
         return 0
+    if cfg.actor.get("training_backend") != "megatron" or not OmegaConf.select(
+        cfg, "agentloop.is_dynamic_rollout_batch", default=False
+    ):
+        raise ValueError(
+            "Chunked LM-head scoring requires a dynamic-batch Megatron Actor"
+        )
     if (
         not cfg.actor.megatron.get("mbridge", False)
         or cfg.actor.model.model_type != "qwen3_5"
