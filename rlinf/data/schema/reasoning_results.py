@@ -53,7 +53,7 @@ class RolloutResult:
     response_texts: Optional[list[str]] = None
     answers: Optional[list[str | dict]] = None
     image_data: Optional[Union[list[list[bytes]], list[list[str]]]] = None
-    multi_modal_inputs: Optional[list[dict]] = None
+    multi_modal_inputs: Optional[list[Optional[dict]]] = None
     response_mask: Optional[list[list[int]]] = None
     # Inference
     # Logprobs returned by rollout engines

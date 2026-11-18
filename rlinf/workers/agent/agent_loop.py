@@ -60,10 +60,6 @@ class AgentLoopOutput:
     response_mask: Optional[list[int]] = None
     """Log probabilities for the response tokens."""
     response_logprobs: Optional[list[float]] = None
-    """Published rollout version that generated each response token."""
-    response_weight_versions: Optional[list[int]] = None
-    """Images the prompt expanded, as the processor's token grid and PNG bytes."""
-    response_images: Optional[dict[str, Any]] = None
     """Number of chat turns, including user, assistant, tool."""
     num_turns: int = 0
     """Whether the sequence ends."""
@@ -82,6 +78,10 @@ class AgentLoopOutput:
     """
     version_start: Optional[int] = None
     version_end: Optional[int] = None
+    """Ordered image payload for replaying this turn on the learner."""
+    response_images: Optional[dict[str, Any]] = None
+    """Published rollout version that generated each response token."""
+    response_weight_versions: Optional[list[int]] = None
 
 
 @dataclass
@@ -247,8 +247,8 @@ class AgentLoopWorker(Worker):
         result = await self.generate_output_channel.get(
             channel_key, async_op=True
         ).async_wait()
-        if "error" in result:
-            raise RuntimeError(f"rollout generation failed: {result['error']}")
+        if isinstance(result, dict) and "error" in result:
+            raise RuntimeError(f"Rollout generate request failed: {result['error']}")
         return result
 
     async def state_less_tool_call_with_channel(
@@ -555,6 +555,7 @@ class AgentLoopWorker(Worker):
             ]
         is_end = [True for _ in task_results]
         answers = [answer] * len(task_results)
+        images = [getattr(r, "response_images", None) for r in task_results]
         return RolloutResult(
             num_sequence=len(task_results),
             group_size=len(task_results),
@@ -566,6 +567,7 @@ class AgentLoopWorker(Worker):
             response_texts=response_texts,
             is_end=is_end,
             answers=answers,
+            multi_modal_inputs=images if any(v is not None for v in images) else None,
             response_mask=response_mask,
             rollout_logprobs=response_logprobs,
         )
@@ -920,7 +922,7 @@ class MultiAgentLoopWorker(AgentLoopWorker):
                     ), "response_logprobs should have the same length as response_ids"
                     rollout_logprobs.append(single_turn_output.response_logprobs)
                 weight_versions.append(single_turn_output.response_weight_versions)
-                images.append(single_turn_output.response_images)
+                images.append(getattr(single_turn_output, "response_images", None))
                 is_end.append(single_turn_output.is_end)
                 rewards.append(single_turn_output.reward_score)
                 response_masks.append(single_turn_output.response_mask)

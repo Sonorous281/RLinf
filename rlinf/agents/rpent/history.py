@@ -19,15 +19,14 @@ from __future__ import annotations
 import base64
 import binascii
 import copy
-import hashlib
 import io
 import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 from typing import Any
 
 from rlinf.agents.tokenization import AgenticTokenizer
+from rlinf.utils.multimodal import store_image_refs
 
 IMAGE_DATA_PREFIX = "data:"
 """A data URI carries the bytes of one image inside its `image_url` part."""
@@ -142,22 +141,7 @@ class ImagePrompt:
         The directory must remain visible to learners and checkpoint recovery.
         A turn retains its own ordered references even when history is compacted.
         """
-        directory.mkdir(parents=True, exist_ok=True)
-        references = []
-        for image in self.images:
-            digest = hashlib.sha256(image).hexdigest()
-            path = directory / digest
-            if not path.exists():
-                # Concurrent writers have identical bytes. Publish only complete files.
-                with NamedTemporaryFile(dir=directory, delete=False) as stream:
-                    temporary = Path(stream.name)
-                    try:
-                        stream.write(image)
-                        stream.flush()
-                        temporary.replace(path)
-                    finally:
-                        temporary.unlink(missing_ok=True)
-            references.append({"path": str(path.resolve()), "sha256": digest})
+        references = store_image_refs(self.images, directory)
         return {
             "image_refs": references,
             "image_grid_thw": self.image_grid_thw,

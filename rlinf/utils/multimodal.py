@@ -24,10 +24,32 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from functools import lru_cache
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from threading import RLock
 from typing import ContextManager
 
 import torch
+
+
+def store_image_refs(images: list[bytes], directory: Path) -> list[dict[str, str]]:
+    """Publish images by content hash and return references in prompt order."""
+    directory.mkdir(parents=True, exist_ok=True)
+    references = []
+    for image in images:
+        digest = hashlib.sha256(image).hexdigest()
+        path = directory / digest
+        if not path.exists():
+            # Concurrent writers have identical bytes. Publish only complete files.
+            with NamedTemporaryFile(dir=directory, delete=False) as stream:
+                temporary = Path(stream.name)
+                try:
+                    stream.write(image)
+                    stream.flush()
+                    temporary.replace(path)
+                finally:
+                    temporary.unlink(missing_ok=True)
+        references.append({"path": str(path.resolve()), "sha256": digest})
+    return references
 
 
 @lru_cache(maxsize=2)
