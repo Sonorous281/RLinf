@@ -60,6 +60,18 @@ def _accumulate_weight_gradient(hidden, dlogits, grad_weight, use_fusion):
         )
 
 
+# Limit the last FP32-to-parameter-dtype cast to a quarter of the weight shard.
+_WEIGHT_GRAD_TILES = 4
+
+
+def _accumulate_weight_tiles(tiles, hidden, dlogits):
+    hidden = hidden.float()
+    for tile, update in zip(
+        tiles, dlogits.chunk(_WEIGHT_GRAD_TILES, dim=1), strict=True
+    ):
+        tile.addmm_(update.t().float(), hidden)
+
+
 class _ChunkedLogProbs(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -118,8 +130,15 @@ class _ChunkedLogProbs(torch.autograd.Function):
             torch.float32 if weight.dtype != torch.float64 else weight.dtype
         )
         grad_weight = ctx.main_grad
+        weight_tiles = []
         if grad_weight is None and ctx.needs_input_grad[1]:
-            grad_weight = torch.zeros_like(weight, dtype=accumulation_dtype)
+            if weight.dtype == accumulation_dtype:
+                grad_weight = torch.zeros_like(weight)
+            else:
+                weight_tiles = [
+                    torch.zeros_like(tile, dtype=accumulation_dtype)
+                    for tile in weight.chunk(_WEIGHT_GRAD_TILES)
+                ]
         grad_bias = (
             torch.zeros_like(bias)
             if bias is not None and ctx.needs_input_grad[2]
@@ -147,6 +166,8 @@ class _ChunkedLogProbs(torch.autograd.Function):
                 _accumulate_weight_gradient(
                     hidden[start:end], dlogits, grad_weight, ctx.main_grad is not None
                 )
+            elif weight_tiles:
+                _accumulate_weight_tiles(weight_tiles, hidden[start:end], dlogits)
             if grad_bias is not None:
                 grad_bias.add_(dlogits.sum(dim=0))
             del probabilities, dlogits
@@ -157,8 +178,11 @@ class _ChunkedLogProbs(torch.autograd.Function):
                 grad_weight = torch.zeros_like(weight)
             else:
                 grad_weight = None
-        elif grad_weight is not None:
-            grad_weight = grad_weight.to(weight.dtype)
+        elif weight_tiles:
+            # Release each FP32 tile before converting the next one.
+            for i in range(len(weight_tiles)):
+                weight_tiles[i] = weight_tiles[i].to(weight.dtype)
+            grad_weight = torch.cat(weight_tiles)
         return grad_hidden, grad_weight, grad_bias, None, None, None, None, None, None
 
 
