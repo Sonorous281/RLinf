@@ -665,6 +665,8 @@ Megatron 智能体训练使用动态批次时，将 ``actor.logprob_chunk_size``
 
 块大小为 256 时，每次 softmax 处理最多 256 个序列位置。模型仍会生成完整词表 logits，这个设置不会对词表投影分块。减小块大小可以降低临时张量的显存占用，但会增加计算开销。在实际任务上测量峰值显存和单步耗时，再选择块大小。
 
+用公开的 Qwen3.5 权重训练 Actor，先确认所用版本包含\ `PR #1862 <https://github.com/RLinf/RLinf/pull/1862>`_\ 的权重加载改动。下方的词表投影显存测试无需模型权重。
+
 Qwen3.5 MBridge Actor 还可以在词表投影时节省显存。将 ``actor.model.lm_head_chunk_size`` 设为每块的 token 数（如 256），Actor 会分块投影解码器的隐状态，反向传播时再逐块重算。此模式要求使用动态批次、PP1、CP1，并设置 ``actor.model.load_mtp: false``\。熵可以作为指标记录，熵奖励系数须为零。分块大小默认为 0，沿用模型原有的输出层。
 
 长提示词的打包批次还可以设置 ``actor.response_only_logits: true``，只对预测回复 token 的位置做投影。此选项要求 CP1，默认关闭。分块词表投影在关闭熵计算时自动选择回复位置，在记录熵时计算所有位置。
