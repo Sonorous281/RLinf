@@ -671,8 +671,9 @@ Reduce Logprob Memory
 For Megatron agent training with dynamic batches, set ``actor.logprob_chunk_size``
 to a positive value to compute vocabulary softmax in token chunks. The backward
 pass recomputes each chunk instead of retaining the full FP32 softmax output.
-The default value, ``0``, disables chunking. Disable entropy calculation when
-using chunks.
+Disable entropy calculation when setting a positive chunk size.
+At the default value of 0, dense projection uses one softmax pass unless
+response-only scoring is enabled with entropy off. That mode uses 256-token chunks.
 
 Add these settings to your agent training config:
 
@@ -699,7 +700,19 @@ and ``actor.model.load_mtp: false``. Keep ``algorithm.entropy_bonus`` at zero. Y
 For packed batches with long prompts, ``actor.response_only_logits: true``
 projects only positions that predict response tokens. This option requires context parallel size 1 and defaults to false.
 A chunked LM head already selects response positions when entropy is disabled.
-Logging entropy requires scoring every position.
+The chunked LM head scores every position when logging entropy.
+
+To compare projection memory on one CUDA GPU, run this command from the
+repository root in your RLinf training environment:
+
+.. code-block:: bash
+
+   PYTHONPATH=. python tests/unit_tests/bench_lm_head.py --tokens 4096 --chunk-size 256
+
+The script warms up each mode once, then reports peak allocated GPU memory in
+GiB for the BF16 forward and backward passes. Both modes score all 4,096 tokens
+in the same synthetic input. The benchmark covers the output layer alone.
+The Actor measurements below include the decoder and training state.
 
 Each value is the highest peak memory allocation that PyTorch recorded on
 any GPU during one Qwen3.5-4B BF16 Actor update. The runs used 80 GiB A100s,

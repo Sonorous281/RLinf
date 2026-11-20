@@ -200,14 +200,17 @@ def test_vocab_log_probs_match_dense_gradient(
 
 def test_response_only_logits_match_full_logits_at_scored_positions():
     pytest.importorskip("megatron.training")
-    from rlinf.hybrid_engines.megatron.utils import output_layer_positions
+    from rlinf.hybrid_engines.megatron.utils import (
+        align_next_token_scores,
+        output_layer_positions,
+    )
     from rlinf.workers.actor.ma_megatron_actor_worker import _at_positions
 
     torch.manual_seed(0)
     module = torch.nn.Module()
     module.output_layer = torch.nn.Linear(4, 7)
     hidden = torch.randn(6, 1, 4)  # [tokens, batch, hidden]
-    positions = torch.tensor([1, 2, 5])
+    positions = torch.tensor([0, 2, 4])
     full = module.output_layer(hidden)
     with output_layer_positions(module, positions):
         partial = module.output_layer(hidden)
@@ -216,16 +219,34 @@ def test_response_only_logits_match_full_logits_at_scored_positions():
 
     def logprobs(logits, label, label_mask):
         values = logits.log_softmax(-1).gather(-1, label.unsqueeze(-1)).squeeze(-1)
-        return {"log_probs": values.masked_fill(~label_mask, 0.0)}
+        return {
+            "log_probs": values.masked_fill(~label_mask, 0.0),
+            "entropy": -(logits.softmax(-1) * logits.log_softmax(-1)).sum(-1),
+        }
 
     label = torch.randint(0, 7, (1, 6))
-    label_mask = torch.ones(1, 6, dtype=torch.bool)
-    expected = logprobs(full.transpose(0, 1), label, label_mask)["log_probs"]
-    scored = _at_positions(logprobs, positions)(
+    response_mask = torch.tensor([[False, True, False, True, False, True]])
+    label_mask = torch.nn.functional.pad(response_mask[:, 1:], (0, 1))
+    dense = logprobs(full.transpose(0, 1), label, label_mask)
+    sparse = _at_positions(logprobs, positions)(
         partial.transpose(0, 1), label, label_mask
-    )["log_probs"]
-    torch.testing.assert_close(scored[:, positions], expected[:, positions])
-    assert scored[:, [0, 3, 4]].count_nonzero() == 0
+    )
+    # A response token consumes the distribution at the preceding position.
+    expected = dense["entropy"][:, positions].mean()
+    for scores in (dense, sparse):
+        entropy = align_next_token_scores(scores["entropy"])[response_mask].mean()
+        log_probs = align_next_token_scores(scores["log_probs"])[response_mask].mean()
+        loss = -log_probs - 0.1 * entropy
+        reference = -dense["log_probs"][:, positions].mean() - 0.1 * expected
+        torch.testing.assert_close(entropy, expected)
+        torch.testing.assert_close(loss, reference)
+        torch.testing.assert_close(
+            torch.autograd.grad(loss, module.output_layer.weight, retain_graph=True)[0],
+            torch.autograd.grad(
+                reference, module.output_layer.weight, retain_graph=True
+            )[0],
+        )
+    assert sparse["log_probs"][~label_mask].count_nonzero() == 0
 
 
 @pytest.mark.parametrize("instance_override", [False, True])
@@ -405,3 +426,29 @@ def test_chunked_actor_scores_ragged_rows_without_crossing_boundaries(monkeypatc
     }
     packed, collect = MAMegatronActor.get_forward_step_func(actor)(iter([batch]), model)
     assert [row.tolist() for row in collect(packed)] == [[0, 2, 0], [0], [0, 6]]
+
+
+def test_fp32_output_only_reaches_wrappers_that_consume_it():
+    pytest.importorskip("megatron.core")
+    from rlinf.hybrid_engines.megatron.utils import supports_fp32_output
+
+    class Wrapper(torch.nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+
+        def forward(self, *args, **kwargs):
+            return self.module(*args, **kwargs)
+
+    class PrecisionWrapper(Wrapper):
+        def forward(self, *args, fp32_output=True, **kwargs):
+            result = super().forward(*args, **kwargs)
+            return result.float() if fp32_output else result
+
+    inputs = torch.ones(1, dtype=torch.bfloat16)
+    for wrapper in (Wrapper, PrecisionWrapper):
+        model = Wrapper(wrapper(torch.nn.Identity()))
+        supported = supports_fp32_output(model)
+        assert supported == (wrapper is PrecisionWrapper)
+        kwargs = {"fp32_output": False} if supported else {}
+        assert model(inputs, **kwargs).dtype == inputs.dtype
