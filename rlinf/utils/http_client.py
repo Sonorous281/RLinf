@@ -114,11 +114,19 @@ class InferenceHTTPClient:
         sampling_params: Optional[list[dict] | dict] = None,
         return_logprob: list[bool] | bool = False,
         image_data: Optional[list] = None,
+        return_prompt_token_ids: bool = False,
+        mm_token_expansion_start_len: Optional[int] = None,
     ) -> dict | list:
         return self.post(
             "/generate",
             self._generate_body(
-                prompt, input_ids, sampling_params, return_logprob, image_data
+                prompt,
+                input_ids,
+                sampling_params,
+                return_logprob,
+                image_data,
+                return_prompt_token_ids,
+                mm_token_expansion_start_len,
             ),
         )
 
@@ -152,11 +160,19 @@ class InferenceHTTPClient:
         sampling_params: Optional[list[dict] | dict] = None,
         return_logprob: list[bool] | bool = False,
         image_data: Optional[list] = None,
+        return_prompt_token_ids: bool = False,
+        mm_token_expansion_start_len: Optional[int] = None,
     ) -> dict | list:
         return await self._apost(
             "/generate",
             self._generate_body(
-                prompt, input_ids, sampling_params, return_logprob, image_data
+                prompt,
+                input_ids,
+                sampling_params,
+                return_logprob,
+                image_data,
+                return_prompt_token_ids,
+                mm_token_expansion_start_len,
             ),
         )
 
@@ -261,8 +277,14 @@ class InferenceHTTPClient:
         sampling_params: Optional[list[dict] | dict],
         return_logprob: list[bool] | bool,
         image_data: Optional[list] = None,
+        return_prompt_token_ids: bool = False,
+        mm_token_expansion_start_len: Optional[int] = None,
     ) -> dict:
         body: dict = {"return_logprob": return_logprob}
+        if return_prompt_token_ids:
+            body["return_prompt_token_ids"] = True
+        if mm_token_expansion_start_len is not None:
+            body["mm_token_expansion_start_len"] = mm_token_expansion_start_len
         if prompt is not None:
             body["text"] = prompt
         if input_ids is not None:

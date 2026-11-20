@@ -130,6 +130,53 @@ history.
    * - ``pixel_refs``, ``pixel_values_bytes``
      - With shared storage, a list of path/SHA-256 pairs replaces inline pixels. The byte count budgets the BF16 learner copy.
 
+Experimental TokenSpace API
+---------------------------
+
+Workflows using the separate ``prepare_multimodal()`` preflight and SGLang's
+native preprocessing cache require the pinned build and a CUDA 13 driver.
+Install it in a separate environment and unset the external processor variable:
+
+.. code-block:: bash
+
+   unset SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE
+   bash requirements/install.sh agentic --sglang token-space --venv .venv-token-space
+
+Configure the shared storage and per-rank budgets on the experimental path:
+
+.. code-block:: yaml
+
+   rollout:
+     sglang:
+       enable_shared_multi_modal_processor: true
+       enable_token_space_preprocess_cache: true
+       token_space_preprocess_cache_dir: /absolute/shared/image-cache
+       token_space_preprocess_cache_trust_url: true
+   actor:
+     expect_multi_modal_inputs: true
+     model:
+       load_mtp: false
+       lm_head_chunk_size: 256
+     multimodal:
+       cache_bytes: 268435456
+       prefetch_batches: 2
+       prefetch_bytes: 536870912
+   critic:
+     expect_multi_modal_inputs: true
+     multimodal:
+       cache_bytes: 268435456
+       prefetch_batches: 2
+       prefetch_bytes: 536870912
+
+The example gives each learner rank 256 MiB of processed-image cache and a
+512 MiB prefetch budget. With two actor and two critic ranks, these budgets sum
+to 3 GiB of host memory; model state, raw images and processor scratch space are
+additional. Cache and prefetch are disabled when their budgets are zero.
+
+Chunked scoring requires MTP to be disabled explicitly. It supports entropy
+metrics with zero entropy bonus. Keep the vision encoder and projection frozen
+in both training and rollout.
+
 Check the Input Contract
 ------------------------
 

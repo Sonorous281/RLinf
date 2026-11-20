@@ -102,6 +102,46 @@
    * - ``pixel_refs``, ``pixel_values_bytes``
      - 启用共享存储时，每张图以路径和 SHA-256 引用代替内联像素。字节数用于预估训练侧 BF16 张量大小。
 
+实验版 TokenSpace 接口
+----------------------
+
+沿用 ``prepare_multimodal()`` 预处理接口和 SGLang 原生预处理缓存的工作流需要固定源码版本及兼容 CUDA 13 的驱动。请使用独立环境并取消设置上述外部 Processor 环境变量：
+
+.. code-block:: bash
+
+   unset SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE
+   bash requirements/install.sh agentic --sglang token-space --venv .venv-token-space
+
+实验版可按下例配置共享缓存和每个训练进程的预取预算。
+
+.. code-block:: yaml
+
+   rollout:
+     sglang:
+       enable_shared_multi_modal_processor: true
+       enable_token_space_preprocess_cache: true
+       token_space_preprocess_cache_dir: /absolute/shared/image-cache
+       token_space_preprocess_cache_trust_url: true
+   actor:
+     expect_multi_modal_inputs: true
+     model:
+       load_mtp: false
+       lm_head_chunk_size: 256
+     multimodal:
+       cache_bytes: 268435456
+       prefetch_batches: 2
+       prefetch_bytes: 536870912
+   critic:
+     expect_multi_modal_inputs: true
+     multimodal:
+       cache_bytes: 268435456
+       prefetch_batches: 2
+       prefetch_bytes: 536870912
+
+示例为每个 learner rank 分配 256 MiB 图像预处理缓存和 512 MiB 预取预算。两个 actor rank 和两个 critic rank 的缓存与预取预算合计为 3 GiB，模型状态、原图和 Processor 临时空间另计。预算为零时关闭相应功能。
+
+分块评分需要显式关闭 MTP；可以计算熵指标，但熵奖励系数必须为零。训练与 rollout 两端都应冻结视觉编码器和投影层的参数。
+
 检查输入一致性
 --------------
 
