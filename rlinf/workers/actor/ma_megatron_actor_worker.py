@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from dataclasses import replace
+from functools import partial
 from typing import Optional
 
 import torch
@@ -36,8 +38,11 @@ from rlinf.data.schema.actor_batch import (
 )
 from rlinf.data.schema.reasoning_results import DynamicRolloutResult
 from rlinf.hybrid_engines.megatron.utils import (
+    align_next_token_scores,
+    output_layer_positions,
     postprocess_ragged_seqs,
     preprocess_ragged_seqs,
+    supports_fp32_output,
 )
 from rlinf.scheduler import Channel
 from rlinf.utils.data_iter_utils import (
@@ -70,13 +75,44 @@ from rlinf.workers.actor.megatron_actor_worker import (
 from rlinf.workers.megatron_worker import DynamicMegatronBatchMixin
 
 
+def _at_positions(logits_processor, positions: torch.Tensor):
+    """Run ``logits_processor`` on logits computed only at packed ``positions``.
+
+    Labels are selected at the same positions, and each output is scattered
+    back to the packed layout with zeros elsewhere.
+    """
+
+    def processor(logits, label, label_mask):
+        outputs = logits_processor(
+            logits, label[:, positions], label_mask[:, positions]
+        )
+        return {
+            key: value.new_zeros(label.shape).index_copy(1, positions, value)
+            for key, value in outputs.items()
+        }
+
+    return processor
+
+
 class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
     """The class for running the actor training using Megatron."""
 
     def __init__(
         self, cfg: DictConfig, placement: ModelParallelComponentPlacement, role="actor"
     ):
+        self.lm_head_chunk_size = cfg.actor.model.get("lm_head_chunk_size", 0)
         super().__init__(cfg, placement)
+        self.scoring_forward = None
+        if self.lm_head_chunk_size:
+            from rlinf.hybrid_engines.megatron.qwen_vl import (
+                forward_qwen_vl_with_chunked_log_probs,
+            )
+
+            self.scoring_forward = partial(
+                forward_qwen_vl_with_chunked_log_probs,
+                chunk_size=self.lm_head_chunk_size,
+                calculate_entropy=self.calculate_entropy,
+            )
         self._init_auto_scheduler(role)
         self.is_dynamic_rollout_batch = self.cfg.agentloop.is_dynamic_rollout_batch
         assert self.is_dynamic_rollout_batch
@@ -92,6 +128,14 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
         loss_scales = self.cfg.algorithm.get("loss_scales", [])
         self.loss_scale_fns = get_loss_scales(loss_scales)
         self.pack_traj = self.cfg.actor.get("pack_traj", True)
+
+        self.response_only_logits = self.cfg.actor.get("response_only_logits", False)
+        if self.response_only_logits and (
+            parallel_state.get_context_parallel_world_size() > 1
+        ):
+            raise ValueError(
+                "actor.response_only_logits requires context_parallel_size=1"
+            )
 
     def _restore_source_normalization(
         self, batch: DynamicActorBatch, scale_context: dict
@@ -121,9 +165,26 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
             )
             labels = [torch.cat((row[1:], row.new_zeros(1))) for row in rows]
             label, _ = preprocess_ragged_seqs(labels)
-            label_mask, _ = preprocess_ragged_seqs(
-                [torch.arange(n, device=input_ids.device) < n - 1 for n in lengths]
-            )
+            positions = None
+            if self.lm_head_chunk_size or self.response_only_logits:
+                # Shift within each real row before adding the TP alignment padding.
+                masks = [
+                    torch.cat((mask[1:], mask.new_zeros(1))).to(input_ids.device)
+                    for mask in batch["response_mask"]
+                ]
+                label_mask, _ = preprocess_ragged_seqs(masks)
+                if self.response_only_logits and not self.lm_head_chunk_size:
+                    positions = label_mask[0].nonzero(as_tuple=True)[0]
+                    if positions.numel() == 0:
+                        positions = positions.new_zeros(1)
+            else:
+                label_mask, _ = preprocess_ragged_seqs(
+                    [torch.arange(n, device=input_ids.device) < n - 1 for n in lengths]
+                )
+
+            logprob_chunk_size = self.cfg.actor.get("logprob_chunk_size", 0)
+            chunked_logprobs = self.response_only_logits and not self.calculate_entropy
+            temperature = self.cfg.algorithm.sampling_params.temperature
 
             def logits_processor(logits, label, label_mask):
                 assert logits.shape[:2] == label.shape[:2]
@@ -138,7 +199,13 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
                     log_probs = log_probs.masked_fill(~label_mask, 0.0)
                     ret = {"log_probs": log_probs, "entropy": entropy}
                 else:
-                    log_probs = vocab_parallel_log_probs_from_logits(logits, label)
+                    log_probs = vocab_parallel_log_probs_from_logits(
+                        logits,
+                        label,
+                        chunk_size=logprob_chunk_size
+                        or (256 if chunked_logprobs else 0),
+                        temperature=temperature if chunked_logprobs else 1.0,
+                    )
                     log_probs = log_probs.masked_fill(~label_mask, 0.0)
                     ret = {"log_probs": log_probs}
 
@@ -146,17 +213,40 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
 
             logits_processor_args = {"label": label, "label_mask": label_mask}
 
-            output = self.custom_forward(
-                model,
-                input_ids,
-                None,
-                position_ids,
-                sequence_parallel=self.transformer_config.sequence_parallel,
-                logits_processor=logits_processor,
-                logits_processor_args=logits_processor_args,
-                temperature=self.cfg.algorithm.sampling_params.temperature,
-                packed_seq_params=packed_params,
-            )
+            module = unwrap_model(model)
+            if self.scoring_forward is not None:
+                output = self.scoring_forward(
+                    model,
+                    module,
+                    input_ids=input_ids,
+                    attention_mask=None,
+                    position_ids=position_ids,
+                    packed_seq_params=packed_params,
+                    temperature=temperature,
+                    **logits_processor_args,
+                )
+            else:
+                projection = nullcontext()
+                if positions is not None and module.post_process:
+                    projection = output_layer_positions(module, positions)
+                    logits_processor = _at_positions(logits_processor, positions)
+                with projection:
+                    output = self.custom_forward(
+                        model,
+                        input_ids,
+                        None,
+                        position_ids,
+                        sequence_parallel=self.transformer_config.sequence_parallel,
+                        logits_processor=logits_processor,
+                        logits_processor_args=logits_processor_args,
+                        temperature=1.0 if chunked_logprobs else temperature,
+                        packed_seq_params=packed_params,
+                        **(
+                            {"fp32_output": False}
+                            if chunked_logprobs and supports_fp32_output(model)
+                            else {}
+                        ),
+                    )
 
             if unwrap_model(model).post_process:
                 output_rows = {
@@ -165,7 +255,7 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
                 }
                 if not self.return_loss:
                     logprob_rows = [
-                        torch.cat((row.new_zeros(1), row[:-1])).detach().cpu()
+                        align_next_token_scores(row).detach().cpu()
                         for row in output_rows["log_probs"]
                     ]
                     # Megatron inspects the tensor device before collecting non-loss data.
@@ -203,10 +293,7 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
                 return output, id_func
 
             def loss_func(output):
-                curr_logprobs_ori = output["log_probs"]
-                curr_logprobs = curr_logprobs_ori.clone()
-                curr_logprobs[:, 1:] = curr_logprobs_ori[:, :-1].clone()
-                curr_logprobs[:, 0] = 0.0  # first token has no previous token
+                curr_logprobs = align_next_token_scores(output["log_probs"])
 
                 advantages = batch["advantages"]
                 advantages *= batch["loss_scales"]
@@ -253,7 +340,7 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
 
                 entropy_loss = torch.zeros(1, device=loss.device)
                 if self.calculate_entropy:
-                    entropy = output["entropy"]
+                    entropy = align_next_token_scores(output["entropy"])
                     entropy_loss = self.loss_agg_func(entropy, mask=mask)
                     if self.calculate_entropy_loss:
                         loss = loss - self.cfg.algorithm.entropy_bonus * entropy_loss
