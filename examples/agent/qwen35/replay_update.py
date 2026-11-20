@@ -92,9 +92,12 @@ def update(worker, rows_file, critic):
         raise RuntimeError(
             f"Optimizer update failed: loss={loss.item()}, grad_norm={norm}, changed={changed}"
         )
-    return dict(
-        rank=worker._rank, loss=loss.item(), grad_norm=float(norm), changed=changed
-    )
+    return {
+        "rank": worker._rank,
+        "loss": loss.item(),
+        "grad_norm": float(norm),
+        "changed": changed,
+    }
 
 
 class ReplayActor(MAMegatronActor):
