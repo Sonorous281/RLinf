@@ -504,7 +504,11 @@ def test_chunked_actor_scores_ragged_rows_without_crossing_boundaries(monkeypatc
         assert label_mask.nonzero(as_tuple=True)[1].tolist() == [0, 6]
         return {"log_probs": label.float().masked_fill(~label_mask, 0)}
 
-    actor = SimpleNamespace(
+    class Actor(MAMegatronActor):
+        torch_platform = SimpleNamespace(current_device=lambda: "cpu")
+
+    actor = Actor.__new__(Actor)
+    actor.__dict__.update(
         torch_platform=SimpleNamespace(current_device=lambda: "cpu"),
         cfg=SimpleNamespace(
             actor={},

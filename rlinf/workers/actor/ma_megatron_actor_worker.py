@@ -214,39 +214,36 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
             logits_processor_args = {"label": label, "label_mask": label_mask}
 
             module = unwrap_model(model)
-            if self.scoring_forward is not None:
-                output = self.scoring_forward(
-                    model,
-                    module,
-                    input_ids=input_ids,
-                    attention_mask=None,
-                    position_ids=position_ids,
-                    packed_seq_params=packed_params,
-                    temperature=temperature,
-                    **logits_processor_args,
-                )
-            else:
-                projection = nullcontext()
-                if positions is not None and module.post_process:
-                    projection = output_layer_positions(module, positions)
-                    logits_processor = _at_positions(logits_processor, positions)
-                with projection:
-                    output = self.custom_forward(
+            with self.ragged_model_inputs(
+                batch, module, input_ids, position_ids, packed_params
+            ) as model_inputs:
+                if self.scoring_forward is not None:
+                    output = self.scoring_forward(
                         model,
-                        input_ids,
-                        None,
-                        position_ids,
-                        sequence_parallel=self.transformer_config.sequence_parallel,
-                        logits_processor=logits_processor,
-                        logits_processor_args=logits_processor_args,
-                        temperature=1.0 if chunked_logprobs else temperature,
-                        packed_seq_params=packed_params,
-                        **(
-                            {"fp32_output": False}
-                            if chunked_logprobs and supports_fp32_output(model)
-                            else {}
-                        ),
+                        module,
+                        **model_inputs,
+                        temperature=temperature,
+                        **logits_processor_args,
                     )
+                else:
+                    projection = nullcontext()
+                    if positions is not None and module.post_process:
+                        projection = output_layer_positions(module, positions)
+                        logits_processor = _at_positions(logits_processor, positions)
+                    with projection:
+                        output = self.custom_forward(
+                            model,
+                            **model_inputs,
+                            sequence_parallel=self.transformer_config.sequence_parallel,
+                            logits_processor=logits_processor,
+                            logits_processor_args=logits_processor_args,
+                            temperature=1.0 if chunked_logprobs else temperature,
+                            **(
+                                {"fp32_output": False}
+                                if chunked_logprobs and supports_fp32_output(model)
+                                else {}
+                            ),
+                        )
 
             if unwrap_model(model).post_process:
                 output_rows = {
