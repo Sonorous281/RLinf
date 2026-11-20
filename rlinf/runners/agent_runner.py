@@ -208,6 +208,13 @@ class AgentRunner(ReasoningRunner):
         }
         return rollout_metrics, training_metrics, durations
 
+    def _start_rollout(self) -> Handle:
+        """Start one finite agent rollout batch."""
+        return self.agent_loop.run_agentloop_rollout(
+            input_channel=self.dataloader_channel,
+            output_channel=self.rollout_output_channels,
+        )
+
     def run(self):
         epoch_iter = range(self.epoch, self.cfg.runner.max_epochs)
         if len(epoch_iter) <= 0 or self.global_steps >= self.max_steps:
@@ -244,10 +251,7 @@ class AgentRunner(ReasoningRunner):
                             self._sync_weights()
 
                         # Rollout
-                        rollout_handle: Handle = self.agent_loop.run_agentloop_rollout(
-                            input_channel=self.dataloader_channel,
-                            output_channel=self.rollout_output_channels,
-                        )
+                        rollout_handle: Handle = self._start_rollout()
 
                         if not self.is_pipeline:
                             agent_metrics = rollout_handle.wait()[0]

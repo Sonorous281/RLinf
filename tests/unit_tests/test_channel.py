@@ -1731,3 +1731,37 @@ def test_returns_none_when_nothing_resolves(group_type):
 def test_unregistered_group_name_is_skipped(group_type):
     """An unknown name yields None instead of raising, so creation can proceed."""
     assert resolve_colocation_node_rank("Missing") is None
+
+
+def test_channel_work_propagates_remote_failure_and_releases_next_operation():
+    from concurrent.futures import Future
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from rlinf.scheduler.collective.async_work import AsyncChannelWork
+
+    pending = [Future(), Future()]
+    replies = iter(pending)
+    actor = SimpleNamespace(
+        put=SimpleNamespace(
+            remote=lambda: SimpleNamespace(future=lambda: next(replies))
+        )
+    )
+    name = "failure-" + uuid4().hex
+    first = AsyncChannelWork(name, "key", actor, "put")
+    second = AsyncChannelWork(name, "key", actor, "put")
+    try:
+        pending[0].set_exception(RuntimeError("channel transport failed"))
+        assert first.done()
+        with pytest.raises(RuntimeError, match="channel transport failed"):
+            first.wait()
+        pending[1].set_result("next operation")
+        assert second.wait() == "next operation"
+
+        async def wait_for_failure():
+            with pytest.raises(RuntimeError, match="channel transport failed"):
+                await asyncio.wait_for(first.async_wait(), timeout=1)
+
+        asyncio.run(wait_for_failure())
+    finally:
+        AsyncChannelWork.last_future_per_key.pop(name + ":key", None)

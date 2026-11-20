@@ -3,6 +3,8 @@ RPent Installation And Deployment
 
 Prepare the paired sources, model assets and services used by :doc:`rpent_libero_rl`. Run these steps once per deployment; use the main example for training and evaluation.
 
+This page describes the separate training and simulator environments. For the H200 ``reason`` image with one shared interpreter and unmodified Core/Bridge, use :doc:`rpent_episode_sync` instead.
+
 Install Code And Environments
 -----------------------------
 
@@ -20,8 +22,6 @@ Use Linux NVIDIA hosts with a compatible driver, CUDA 12.8 toolkit, EGL/OpenGL l
    git -C "$STACK_ROOT/repos/Megatron-LM" checkout dc0ee41ada177d4c74ba46bb501bba5967264815
    export MEGATRON_PATH="$STACK_ROOT/repos/Megatron-LM"
    cd "$STACK_ROOT/repos/RLinf"
-   git -C "$MEGATRON_PATH" apply \
-     "$STACK_ROOT/repos/RLinf/requirements/agentic/megatron-core-r0.18.0-cpu-offload.patch"
    UV_TORCH_BACKEND=cu128 UNINSTALL_FA4=1 bash requirements/install.sh agentic \
      --venv "$STACK_ROOT/envs/rlinf" --python 3.12.12 --torch 2.11.0 \
      --engine sglang --sglang 0.5.12.post1 --transformers 5.6.1 \
@@ -29,7 +29,7 @@ Use Linux NVIDIA hosts with a compatible driver, CUDA 12.8 toolkit, EGL/OpenGL l
 
 The installer honors an existing ``MEGATRON_PATH``. It temporarily edits dependency metadata while resolving, so use an idle checkout and a new environment. ``--no-root`` requires native system dependencies to be installed already. ``UNINSTALL_FA4=1`` selects the validated FA2 route. See ``bash requirements/install.sh --help`` for other platforms.
 
-Apply the patch once before installing. It lets Megatron restore CPU-offloaded master weights and Adam step counters from a Torch checkpoint. If you set ``MEGATRON_PATH``, apply the patch yourself.
+The Core CPU-optimizer patch is needed only for the HybridDeviceOptimizer checkpoint path. It is not required for stage offload with ``actor.optim.optimizer_cpu_offload=false``. Keep the original Core and Bridge for the minimal H200 deployment.
 
 Install the separate simulator/SAM3 environment from the paired RPent checkout. Its requirements install RLinf from the sibling checkout, so both environments use the same source revision. Verify the printed module paths before launching:
 

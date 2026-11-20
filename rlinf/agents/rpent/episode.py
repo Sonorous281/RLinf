@@ -16,11 +16,12 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field, replace
 
 from rlinf.agents.rpent.history import AppendOnlyHistory
-from rlinf.workers.agent.agent_loop import AgentLoopOutput
+from rlinf.workers.agent.agent_loop import AgentLoopOutput, MultiAgentLoopOutput
 
 
 class RPentEpisodeError(RuntimeError):
@@ -43,6 +44,16 @@ class Episode:
     history: AppendOnlyHistory
     started: float = field(default_factory=time.monotonic)
     turns: list[AgentLoopOutput] = field(default_factory=list)
+    weight_version: int | None = None
+
+
+def episode_task(answer: list[str]) -> dict:
+    """Decode the single task carried by one reasoning dataset row."""
+    if len(answer) != 1:
+        raise ValueError(
+            f"an RPent dataset row must specify exactly one task, got {len(answer)}"
+        )
+    return json.loads(answer[0])
 
 
 def merge_prefix_turns(
@@ -87,6 +98,7 @@ def merge_prefix_turns(
             # The row now ends at this turn, whose prompt already expands every
             # image of the chain in order, so the row adopts its image set.
             last.response_images = turn.response_images
+            last.version_end = turn.version_end
             last.response_text, last.is_end = turn.response_text, turn.is_end
             last.reward_score = turn.reward_score
             last.extra_fields = {
@@ -112,3 +124,34 @@ def merge_prefix_turns(
             )
         )
     return merged
+
+
+def episode_output(
+    turns: list[AgentLoopOutput],
+    *,
+    task: dict,
+    episode_id: str,
+    status: dict,
+    elapsed_s: float,
+    merge: bool,
+    max_scored_tokens: int,
+) -> MultiAgentLoopOutput:
+    """Score sampled turns and retain their chronological episode identity."""
+    for turn in turns:
+        turn.reward_score = float(status["success"])
+    output_turns = merge_prefix_turns(turns, max_scored_tokens) if merge else turns
+    return MultiAgentLoopOutput(
+        single_turn_outputs=output_turns,
+        extra_fields={
+            "success": status["success"],
+            "init_state_id": status["init_state_id"],
+            "memory_entries": status["memory_entries"],
+            "truncated": status["truncated"],
+            "task": task,
+            "terminal": status["terminal"],
+            "termination_reason": status["termination_reason"],
+            "episode_id": episode_id,
+            "elapsed_s": elapsed_s,
+            "turns": len(turns),
+        },
+    )

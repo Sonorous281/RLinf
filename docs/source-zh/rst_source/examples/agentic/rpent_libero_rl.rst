@@ -120,7 +120,11 @@ RPent 多模态强化学习
    bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_libero_rl_sao_local \
      --config-dir "$STACK_ROOT/config" +deployment@_global_=local
 
-同步 PPO 使用 ``train_qwen3.5_4b_libero_rl_ppo``，并按实际资源覆盖 placement 与 batch。SAO 除了异步采集，还使用 DIS loss、SAO GAE，并先更新 Critic、重算 value 再更新 Actor；它不只是同步 PPO 的调度变体。训练前先验证有限 loss/梯度、实际参数更新、权重同步与恢复。短 smoke 不能证明最长 262144-token 工作负载能放入显存。
+同步 PPO 使用 ``train_qwen3.5_4b_libero_rl_ppo``，并按实际资源覆盖 placement 与 batch。SAO 除了异步采集，还使用 DIS loss、SAO GAE，并先更新 Critic、重算 value 再更新 Actor；它不只是同步 PPO 的调度变体。训练前先确认 loss 和梯度均为有限值、实际参数更新、权重同步与恢复。短时运行检查 不能证明最长 262144-token 工作负载能放入显存。
+
+使用 ``train_qwen3.5_4b_episode_sync_grpo`` 运行原 episode 工作流的分组 GRPO。RPent 代码中须包含 ``robots.rl.rl_episode``\ 。配置每批训练 32 组、每组 8 条 episode，同时启动 40 个候选组。同组共享任务和初始状态，分别独立采样。最先完整结束的 32 组用于训练；其余组取消并清理后才开始学习。组内 reward 全相同的组也保留。该配置不使用 critic，clip 上界为 0.28。``group_level``\ 、``agent_level`` 和 ``turn_level`` 三层 loss scale 使用现有的轨迹、agent 和有效 token 字段。
+
+GRPO 配置保存推理实际使用的 prompt token 和多模态输入，供 learner 回放。H200 最小环境使用未修改的 SGLang 0.5.12.post1，不需要定制 serving wheel 或预处理缓存路径。启用输入保存后重新采集 rollout；旧图像记录缺少这些输入，不能用于 learner 回放。规划器仍使用原 episode 工作流、提示词、工具和动作格式。单环境安装与 27B 五步验收配置见 :doc:`rpent_episode_sync`。
 
 结果与验证
 ----------

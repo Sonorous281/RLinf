@@ -1371,7 +1371,8 @@ class MegatronWorker(MegatronModelManager, Worker):
     def del_reshard_state_dict(self):
         if hasattr(self, "reshard_state_dict"):
             del self.reshard_state_dict
-            clear_memory()
+        # Streaming buckets also leave allocator and CUDA IPC cache to release.
+        clear_memory()
 
     def _compute_rollout_metrics(self, batch):
         rollout_metrics_compute_data_group = self.get_rollout_metrics_group(batch)

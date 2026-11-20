@@ -14,37 +14,299 @@
 
 """Synchronous PPO scheduling for multi-turn agents."""
 
+import asyncio
+import json
+import time
+from pathlib import Path
 from typing import Any, Optional
+from uuid import uuid4
 
 from rlinf.data.schema.agent_trajectory import prepare_agent_ppo_targets
+from rlinf.data.schema.reasoning_requests import build_rollout_requests_from_batch
+from rlinf.data.schema.reasoning_results import DynamicRolloutResult
 from rlinf.runners.agent_runner import AgentRunner
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
 
 
 class AgentPPORunner(AgentRunner):
-    """Complete both model updates and weight installation before each rollout."""
+    """Install each synchronous PPO or GRPO update before the next rollout."""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         placement = self.component_placement
         actor_gpus = set(placement.get_hardware_ranks("actor"))
-        critic_gpus = set(placement.get_hardware_ranks("critic"))
+        critic_gpus = (
+            set(placement.get_hardware_ranks("critic"))
+            if self.critic is not None
+            else set()
+        )
         rollout_gpus = set(placement.get_hardware_ranks("rollout"))
         self.shared_training = bool(actor_gpus & critic_gpus)
         self.release_rollout = bool(rollout_gpus & (actor_gpus | critic_gpus))
 
         self.rollout_output_channels = [self.rollout_channel]
-        if not self.shared_training and self.recompute_logprobs:
+        if (
+            self.critic is not None
+            and not self.shared_training
+            and self.recompute_logprobs
+        ):
             self.actor_rollout_channel = Channel.create("ActorRollout")
             self.rollout_output_channels.append(self.actor_rollout_channel)
         self.training_channel = Channel.create("PPOTraining")
+        if self._sampling_batch_size() > self.cfg.data.rollout_batch_size:
+            self.candidate_channel = Channel.create("SynchronousCandidates")
+            if self.cfg.algorithm.group_size > 1:
+                self.candidate_result_channel = Channel.create("SelectedEpisodes")
+
+    def _sampling_batch_size(self) -> int:
+        from rlinf.config import sampling_batch_size
+
+        return sampling_batch_size(self.cfg)
+
+    def _put_batch(self, batch: dict, split_size: Optional[int] = None) -> None:
+        if self._sampling_batch_size() == self.cfg.data.rollout_batch_size:
+            return super()._put_batch(batch, split_size)
+        if self.solid_rollouts:
+            raise ValueError(
+                "Synchronous oversampling requires one policy rollout group."
+            )
+        requests = build_rollout_requests_from_batch(
+            batch,
+            group_size=self.cfg.algorithm.group_size,
+            split_size=split_size or self.batch_split_num,
+            enforce_divisible_batch=False,
+            split_trajectories=True,
+        )
+        cohort_id = f"step-{self.global_steps}-{uuid4().hex}"
+        candidate_id = 0
+        for request in requests:
+            request.cohort_id = cohort_id
+            request.weight_version = self.global_steps
+            request.group_ids = list(
+                range(candidate_id, candidate_id + len(request.input_ids))
+            )
+            candidate_id += len(request.input_ids)
+            self.dataloader_channel.put(request, async_op=True)
+        expected = self._sampling_batch_size() * self.cfg.algorithm.group_size
+        if candidate_id != expected:
+            raise ValueError(
+                f"Expected {expected} episode candidates, got {candidate_id}."
+            )
+        self._sampling_cohort_id = cohort_id
+
+    def _start_rollout(self) -> Handle:
+        if self._sampling_batch_size() == self.cfg.data.rollout_batch_size:
+            return super()._start_rollout()
+        cohort_id = self._sampling_cohort_id
+        candidate_channel = self.candidate_channel
+        handle = self.agent_loop.run_agentloop_rollout(
+            input_channel=self.dataloader_channel,
+            output_channel=candidate_channel,
+        )
+        selected = []
+        selected_groups = []
+        complete = {}
+        group_size = self.cfg.algorithm.group_size
+        expected_candidates = self._sampling_batch_size() * group_size
+        expected_selected = self.cfg.data.rollout_batch_size * group_size
+        completions = []
+        selection_error = None
+        cleanup = []
+        generation_cleanup = []
+        started_at = time.time()
+        try:
+            while len(selected) < expected_selected:
+                event = candidate_channel.get()
+                if event["cohort_id"] != cohort_id:
+                    raise RuntimeError(
+                        f"Expected candidate cohort {cohort_id}, got {event['cohort_id']}."
+                    )
+                completions.append(dict(event))
+                if event["status"] == "error":
+                    raise RuntimeError(
+                        f"Candidate {event['candidate_id']} infrastructure failure: "
+                        f"{event['error']}"
+                    )
+                candidate_id = event["candidate_id"]
+                if not 0 <= candidate_id < expected_candidates:
+                    raise RuntimeError(f"Unexpected episode candidate {candidate_id}.")
+                if candidate_id in complete:
+                    raise RuntimeError(
+                        f"Candidate {event['candidate_id']} completed more than once."
+                    )
+                complete[candidate_id] = event
+                group_id = candidate_id // group_size
+                member_ids = range(group_id * group_size, (group_id + 1) * group_size)
+                if all(member_id in complete for member_id in member_ids):
+                    selected_groups.append(group_id)
+                    selected.extend(complete[member_id] for member_id in member_ids)
+        except BaseException as error:
+            selection_error = error
+        finally:
+            selection_finished_at = time.time()
+            selected_ids = [event["candidate_id"] for event in selected]
+            cancel_handle = self.agent_loop.cancel_rollout_candidates(
+                cohort_id, selected_ids
+            )
+            try:
+                # Abort only this fixed-policy cohort. Closing the cohort also
+                # rejects late queued requests before they enter the engine.
+                try:
+                    generation_cleanup.extend(
+                        self.rollout.finish_generation_cohort(cohort_id).wait()
+                    )
+                except BaseException as error:
+                    selection_error = selection_error or error
+                try:
+                    cleanup = cancel_handle.wait()
+                finally:
+                    handle.wait()
+                # All agent/session owners have stopped: fence their final puts.
+                generation_cleanup.extend(
+                    self.rollout.finish_generation_cohort(cohort_id).wait()
+                )
+                while True:
+                    try:
+                        event = candidate_channel.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if event["cohort_id"] != cohort_id:
+                        raise RuntimeError(
+                            "Candidate cleanup received a foreign cohort."
+                        )
+                    completions.append(dict(event))
+            except BaseException as error:
+                selection_error = selection_error or error
+            candidates = [
+                record for worker in cleanup for record in worker["candidates"]
+            ]
+            if selection_error is None:
+                errors = [
+                    record for record in candidates if record["status"] == "error"
+                ]
+                if errors:
+                    selection_error = RuntimeError(
+                        f"Candidate infrastructure failures cannot be replaced by "
+                        f"oversampling: {errors}"
+                    )
+                elif (
+                    len(candidates) != expected_candidates
+                    or {record["candidate_id"] for record in candidates}
+                    != set(range(expected_candidates))
+                    or not all(record["cleanup_complete"] for record in candidates)
+                ):
+                    selection_error = RuntimeError(
+                        f"Expected cleanup of all {expected_candidates} unique "
+                        "candidates before learner admission."
+                    )
+            audit = {
+                "cohort_id": cohort_id,
+                "weight_version": self.global_steps,
+                "sampling_batch_size": self._sampling_batch_size(),
+                "effective_batch_size": self.cfg.data.rollout_batch_size,
+                "group_size": group_size,
+                "sampling_episode_count": expected_candidates,
+                "effective_episode_count": expected_selected,
+                "selected_group_ids": selected_groups,
+                "started_at": started_at,
+                "finished_at": time.time(),
+                "status": "cleanup_passed" if selection_error is None else "failed",
+                "selection_finished_at": selection_finished_at,
+                "error": None if selection_error is None else repr(selection_error),
+                "selected_ids": selected_ids,
+                "completion_order": completions,
+                "workers": cleanup,
+                "generation_cleanup": generation_cleanup,
+            }
+            self._write_sampling_audit(audit)
+        if selection_error is not None:
+            self.agent_loop.admit_rollout_candidates(cohort_id, None).wait()
+            raise selection_error
+        try:
+            output_channels = (
+                [self.candidate_result_channel]
+                if group_size > 1
+                else self.rollout_output_channels
+            )
+            admissions = self.agent_loop.admit_rollout_candidates(
+                cohort_id, output_channels
+            ).wait()
+            audit["admissions"] = admissions
+            admitted = sum(worker["admitted"] for worker in admissions)
+            admitted_ids = [
+                candidate_id
+                for worker in admissions
+                for candidate_id in worker["admitted_ids"]
+            ]
+            if (
+                admitted != expected_selected
+                or len(admitted_ids) != admitted
+                or set(admitted_ids) != set(selected_ids)
+            ):
+                raise RuntimeError(
+                    f"Expected admission of {expected_selected} episodes, "
+                    f"got {admitted}."
+                )
+            if group_size > 1:
+                self._admit_selected_groups(audit)
+        except BaseException as error:
+            audit.update(status="failed", error=repr(error))
+            self._write_sampling_audit(audit)
+            raise
+        audit.update(status="passed", admission_finished_at=time.time())
+        self._write_sampling_audit(audit)
+        return handle
+
+    def _admit_selected_groups(self, audit: dict) -> None:
+        """Reassemble members only after all candidate owners and queues are clean."""
+        episodes = {}
+        for _ in audit["selected_ids"]:
+            result = self.candidate_result_channel.get()
+            if (
+                result.group_id in episodes
+                or result.group_id not in audit["selected_ids"]
+            ):
+                raise ValueError(
+                    "Selected episode payloads must have unique candidate IDs."
+                )
+            episodes[result.group_id] = result
+        group_size = self.cfg.algorithm.group_size
+        groups = []
+        payloads = []
+        for group_id in audit["selected_group_ids"]:
+            result = DynamicRolloutResult.from_trajectory_group(
+                [
+                    episodes[group_id * group_size + member]
+                    for member in range(group_size)
+                ],
+                group_id,
+            )
+            rewards = result.group_metadata().rewards
+            groups.append({"group_id": group_id, "rewards": rewards})
+            payloads.append(result)
+        for result in payloads:
+            for channel in self.rollout_output_channels:
+                channel.put(result)
+        audit["selected_groups"] = groups
+        audit["zero_variance_groups"] = sum(
+            len(set(group["rewards"])) == 1 for group in groups
+        )
+
+    def _write_sampling_audit(self, audit: dict) -> None:
+        audit_dir = Path(self.cfg.runner.logger.log_path) / "sampling"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        audit_path = audit_dir / f"{audit['cohort_id']}.json"
+        temporary = audit_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(audit, indent=2) + "\n")
+        temporary.replace(audit_path)
 
     def init_rollout_workers(self) -> None:
         """Reuse agent initialization and convert the independent critic checkpoint."""
         super().init_rollout_workers()
         if (
-            self.cfg.runner.resume_dir is None
+            self.critic is not None
+            and self.cfg.runner.resume_dir is None
             and self.cfg.critic.megatron.use_hf_ckpt
             and not self.cfg.critic.megatron.get("mbridge", False)
         ):
@@ -99,6 +361,8 @@ class AgentPPORunner(AgentRunner):
         self, rollout_handle: Handle
     ) -> tuple[Optional[dict], list[dict], dict]:
         """Prepare fixed targets and update models on shared or separate devices."""
+        if self.critic is None:
+            return super()._run_training(rollout_handle)
         if self.cfg.algorithm.adv_type == "gae_dynamic":
             return self._run_critic_owned_training(rollout_handle)
         # Old predictions: independent devices can infer in parallel.
@@ -134,6 +398,7 @@ class AgentPPORunner(AgentRunner):
                     if self.shared_training or not self.recompute_logprobs
                     else self.actor_inference_channel
                 ),
+                expected_weight_version=self.global_steps,
             )
 
         # Updates: serialize shared devices; otherwise train in parallel.

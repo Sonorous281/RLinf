@@ -28,6 +28,77 @@ import torch
 from rlinf.agents.rpent.thinking_budget import ThinkingBudget
 
 
+@pytest.mark.parametrize("component_api", [True, False])
+def test_sglang_memory_requests_track_split_resume(monkeypatch, component_api):
+    native = pytest.importorskip("sglang.srt.managers.scheduler")
+    from sglang.srt.managers.io_struct import (
+        ReleaseMemoryOccupationReqInput,
+        ResumeMemoryOccupationReqInput,
+    )
+    from sglang.utils import TypeBasedDispatcher
+
+    from rlinf.hybrid_engines.sglang.common.sgl_scheduler import Scheduler
+
+    resident = {"weights", "kv_cache", "cuda_graph"}
+
+    class MemoryManager:
+        def release_memory_occupation(self, request):
+            resident.difference_update(request.tags or resident.copy())
+
+        def resume_memory_occupation(self, request):
+            resident.update(request.tags or ["weights", "kv_cache", "cuda_graph"])
+
+    manager = MemoryManager()
+
+    def initialize(self, *args, **kwargs):
+        self.tp_rank = 0
+        self.tp_worker = SimpleNamespace(worker=SimpleNamespace())
+        if component_api:
+            self.weight_updater = manager
+            release = manager.release_memory_occupation
+            resume = manager.resume_memory_occupation
+        else:
+            release = self.release_memory_occupation
+            resume = self.resume_memory_occupation
+        self._request_dispatcher = TypeBasedDispatcher(
+            [
+                (ReleaseMemoryOccupationReqInput, release),
+                (ResumeMemoryOccupationReqInput, resume),
+            ]
+        )
+
+    monkeypatch.setattr(native.Scheduler, "__init__", initialize)
+    if not component_api:
+        monkeypatch.setattr(
+            native.Scheduler,
+            "release_memory_occupation",
+            lambda self, request: manager.release_memory_occupation(request),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            native.Scheduler,
+            "resume_memory_occupation",
+            lambda self, request: manager.resume_memory_occupation(request),
+            raising=False,
+        )
+    scheduler = Scheduler(SimpleNamespace(device="cpu"))
+    scheduler.weight_reload = "sync"
+    scheduler._request_dispatcher(ReleaseMemoryOccupationReqInput())
+    assert not resident
+    assert scheduler.is_weight_offloaded
+    scheduler._request_dispatcher(ResumeMemoryOccupationReqInput(tags=["weights"]))
+    assert resident == {"weights"}
+    assert not scheduler.is_weight_offloaded
+    assert (
+        scheduler.offloaded_tags["kv_cache"] and scheduler.offloaded_tags["cuda_graph"]
+    )
+    scheduler._request_dispatcher(
+        ResumeMemoryOccupationReqInput(tags=["kv_cache", "cuda_graph"])
+    )
+    assert resident == {"weights", "kv_cache", "cuda_graph"}
+    assert not any(scheduler.offloaded_tags.values())
+
+
 @pytest.fixture
 def sglang_args_modules(monkeypatch):
     """Exercise argument assembly without importing the vendor GPU engine."""
@@ -180,15 +251,29 @@ def test_sglang_server_args_preserve_loading_and_processor_settings(
         else "cuda_graph_max_bs_decode"
     )
     monkeypatch.setattr(
-        sglang_worker, "_SERVER_ARGS_FIELDS", {graph_field, "chunked_prefill_size"}
+        sglang_worker,
+        "_SERVER_ARGS_FIELDS",
+        {
+            graph_field,
+            "chunked_prefill_size",
+            "enable_metrics",
+            "enable_cache_report",
+            "disable_fast_image_processor",
+        },
     )
     worker = sglang_args_worker
+    worker._cfg_rollout.sglang.disable_fast_image_processor = True
+    worker._cfg_rollout.sglang.enable_metrics = True
+    worker._cfg_rollout.sglang.enable_cache_report = True
     worker._cfg.runner.resume_dir = resume_dir
     worker._cfg_rollout.sglang.enable_weights_cpu_backup = backup
     if processor_key is not None:
         worker._cfg_rollout.sglang[processor_key] = enabled
     args = sglang_worker.SGLangWorker._build_server_args(worker)
     assert args["disable_overlap_schedule"] is True
+    assert args["disable_fast_image_processor"] is True
+    assert args["enable_metrics"] is True
+    assert args["enable_cache_report"] is True
     assert args["enable_weights_cpu_backup"] is bool(backup)
     assert args["load_format"] == ("auto" if backup or resume_dir is None else "dummy")
     assert args[graph_field] == 2
@@ -200,7 +285,6 @@ def test_sglang_server_args_preserve_loading_and_processor_settings(
         assert args["image_processor_backend"] == "pil"
     else:
         assert "enable_token_space_processor" not in args
-        assert "disable_fast_image_processor" not in args
         assert "image_processor_backend" not in args
 
 
@@ -273,6 +357,79 @@ def test_sglang_experimental_build_requires_explicit_rollout(
         with pytest.raises(ValueError, match="supported release"):
             server.start()
         assert server._server_proc is None
+
+
+def test_serverless_closed_cohort_drops_native_abort_reply(sglang_args_modules):
+    from rlinf.scheduler.channel.channel import DEFAULT_KEY
+
+    _, module, _ = sglang_args_modules
+
+    async def serve():
+        started = asyncio.Event()
+        aborted = asyncio.Event()
+
+        class ChannelService:
+            def __init__(self):
+                self.queues = {}
+
+            def put(self, item, key=DEFAULT_KEY, **kwargs):
+                queue = self.queues.setdefault(key, asyncio.Queue())
+                return SimpleNamespace(async_wait=lambda: queue.put(item))
+
+            def get(self, key=DEFAULT_KEY, **kwargs):
+                queue = self.queues.setdefault(key, asyncio.Queue())
+                return SimpleNamespace(async_wait=queue.get)
+
+        class Backend:
+            async def async_generate(self, **kwargs):
+                started.set()
+                await aborted.wait()
+                return {"meta_info": {"finish_reason": {"type": "abort"}}}
+
+        worker = SimpleNamespace(
+            _is_model_instance_entry=True,
+            _cfg_rollout={},
+            _rank=0,
+            _placement=SimpleNamespace(rollout_tp_size=1),
+            _sampling_params={},
+            _return_logprobs=True,
+            _weight_version=0,
+            _backend=Backend(),
+            _closed_generation_cohorts=set(),
+            _inflight_generates=set(),
+            _generation_cohorts={},
+            _generation_outputs={},
+            _cohort_fences={},
+            _dispatch_gate=asyncio.Event(),
+            _serverless_stopping=False,
+            log_error=lambda message: pytest.fail(message),
+        )
+        worker.generate_and_send = lambda **kwargs: (
+            module.SGLangWorker.generate_and_send(worker, **kwargs)
+        )
+        worker._dispatch_gate.set()
+        incoming, outgoing = ChannelService(), ChannelService()
+        await incoming.put(
+            {
+                "cohort_id": "closed",
+                "channel_key": "cancelled-episode",
+                "prompt_ids": [1],
+            },
+            async_op=True,
+        ).async_wait()
+        server = asyncio.create_task(
+            module.SGLangWorker.rollout_serverless(worker, incoming, outgoing)
+        )
+        await started.wait()
+        worker._closed_generation_cohorts.add("closed")
+        aborted.set()
+        reply = await outgoing.get(key="cancelled-episode", async_op=True).async_wait()
+        assert reply == {"error": "synchronous_oversample_drop"}
+        await incoming.put(None, async_op=True).async_wait()
+        await server
+        await asyncio.gather(*worker._inflight_generates)
+
+    asyncio.run(asyncio.wait_for(serve(), timeout=10))
 
 
 def test_token_space_processor_resolution_preserves_launch_inputs(monkeypatch):

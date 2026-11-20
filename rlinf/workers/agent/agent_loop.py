@@ -16,6 +16,7 @@ import asyncio
 import copy
 import json
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from uuid import uuid4
@@ -42,7 +43,6 @@ from rlinf.utils.metric_utils import aggregate_agent_metrics
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.workers.agent.partial_rollout import PartialRolloutMixin
 from rlinf.workers.agent.tool_worker import ToolChannelInfo
-from rlinf.workers.rollout.utils import green
 
 
 @dataclass
@@ -111,6 +111,11 @@ class GroupDiscarded(RuntimeError):
         self.reason = reason
 
 
+_ROLLOUT_CANDIDATE: ContextVar[Optional[dict]] = ContextVar(
+    "rollout_candidate", default=None
+)
+
+
 class AgentLoopWorker(Worker):
     """
     Abstract agent loop worker.
@@ -121,6 +126,7 @@ class AgentLoopWorker(Worker):
     # Requests go to any SGLang replica unless rollout.replica_affinity pins
     # this worker's requests to one, so a multi-turn episode reuses its prefix cache.
     rollout_request_key = DEFAULT_KEY
+    _generation_cohort_id: Optional[str] = None
 
     def __init__(
         self,
@@ -159,6 +165,10 @@ class AgentLoopWorker(Worker):
         self._agent_metric_channel = None
         self._producer_error = None
         self._inflight_groups = set()
+        self._candidate_cohort = None
+        self._candidate_started = {}
+        self._candidate_admissions = {}
+        self._generation_cohort_id = None
         # Idle-time accounting for the continuous loop: seconds with no
         # in-flight group, accumulated over the window since the last
         # pop_idle_stats call.
@@ -251,14 +261,29 @@ class AgentLoopWorker(Worker):
         else:
             input_channel = self.solid_generate_input_channels[rollout_name]
             request_key = DEFAULT_KEY
-        await input_channel.put(
-            request,
-            key=request_key,
-            async_op=True,
-        ).async_wait()
-        result = await self.generate_output_channel.get(
-            channel_key, async_op=True
-        ).async_wait()
+        oversampling = self._generation_cohort_id is not None
+        if oversampling:
+            request["cohort_id"] = self._generation_cohort_id
+
+        async def exchange():
+            await input_channel.put(
+                request, key=request_key, async_op=True
+            ).async_wait()
+            return await self.generate_output_channel.get(
+                channel_key, async_op=True
+            ).async_wait()
+
+        if oversampling:
+            pending = asyncio.create_task(exchange())
+            try:
+                result = await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                # The cohort abort supplies a reply even for cancelled requests.
+                # Consume it before releasing this key and its Channel future.
+                await pending
+                raise
+        else:
+            result = await exchange()
         if "error" in result:
             raise RuntimeError(f"rollout generation failed: {result['error']}")
         return result
@@ -306,14 +331,13 @@ class AgentLoopWorker(Worker):
         prompt_texts: Optional[str],
         trace_prints: list[Any],
     ):
-        print_texts = []
+        lines = []
         if prompt_texts is not None:
-            print_texts = [
-                f"{green('Prompt')}         : {prompt_texts!r}",
-            ]
+            lines.append(f"Prompt: {prompt_texts!r}")
         for trace_print in trace_prints:
-            print_texts.append(f"{green('Trace print')}    : {trace_print!r}")
-        print(*print_texts, sep="\n")
+            lines.append(f"Agent output: {trace_print!r}")
+        if lines:
+            self.log_info("\n".join(lines))
 
     def get_tool_response_ids(self, tool_messages: list[dict]):
         """
@@ -795,6 +819,10 @@ class MultiAgentLoopWorker(PartialRolloutMixin, AgentLoopWorker):
         """
         with self.worker_timer():
             rollout_request: RolloutRequest = input_channel.get()
+            if rollout_request.cohort_id is not None:
+                return await self._run_synchronous_candidates(
+                    rollout_request, output_channel
+                )
 
             send_output_tasks: list[asyncio.Task[dict]] = []
             for input_ids, answer in zip(
@@ -813,6 +841,230 @@ class MultiAgentLoopWorker(PartialRolloutMixin, AgentLoopWorker):
             agent_metrics_list = await self._gather_rollout_tasks(send_output_tasks)
             agent_metrics = self.post_process_metric(agent_metrics_list)
             return agent_metrics
+
+    @staticmethod
+    def rollout_candidate() -> Optional[dict]:
+        """Metadata of the candidate owning this query, including nested tasks."""
+        return _ROLLOUT_CANDIDATE.get()
+
+    async def finalize_rollout_candidates(self, records: list[dict]) -> None:
+        """Persist task-owned trace dispositions after all candidate cleanup."""
+        return None
+
+    async def _run_synchronous_candidate(
+        self,
+        state: dict,
+        candidate_id: int,
+        input_ids: list[int],
+        answer: Any,
+        output_channel: Channel,
+    ) -> None:
+        record = state["records"][candidate_id]
+        metadata = {
+            "cohort_id": state["id"],
+            "candidate_id": candidate_id,
+            "weight_version": state["version"],
+        }
+        group_size = self.cfg.algorithm.group_size
+        if group_size > 1:
+            metadata.update(
+                group_id=candidate_id // group_size,
+                group_member=candidate_id % group_size,
+            )
+            record.update(metadata)
+        token = _ROLLOUT_CANDIDATE.set(metadata)
+        try:
+            record["status"] = "running"
+            result, metrics = await self.run_agentloop_rollout_group(
+                input_ids, answer, 1, None
+            )
+            # is_end marks model EOS; length-limited replies still finish an episode.
+            if result.group_size != 1 or result.num_sequence < 1:
+                raise RuntimeError(
+                    f"Candidate {candidate_id} must be one complete episode."
+                )
+            for versions in (result.version_start, result.version_end):
+                if versions is not None and any(
+                    version != state["version"] for version in versions
+                ):
+                    raise RuntimeError(
+                        f"Candidate {candidate_id} mixed fixed-policy weight versions."
+                    )
+            result.group_id = candidate_id
+            result.extra_fields_group = {
+                **(result.extra_fields_group or {}),
+                "sampling_candidate": [
+                    {
+                        "cohort_id": state["id"],
+                        "candidate_id": candidate_id,
+                        "weight_version": state["version"],
+                    }
+                ],
+            }
+            record.update(
+                status="complete",
+                finished_at=time.time(),
+                num_training_rows=result.num_sequence,
+                terminal_reward=(
+                    float(result.rewards[-1]) if result.rewards is not None else None
+                ),
+            )
+            state["metrics"][candidate_id] = metrics
+            state["results"][candidate_id] = result
+            await output_channel.put(
+                {**record, "cohort_id": state["id"]},
+                async_op=True,
+            ).async_wait()
+        except asyncio.CancelledError:
+            record["completed_before_drop"] = record["status"] == "complete"
+            record.update(status="cancelled", finished_at=time.time())
+            raise
+        except Exception as error:
+            record.update(status="error", error=repr(error), finished_at=time.time())
+            await output_channel.put(
+                {**record, "cohort_id": state["id"]}, async_op=True
+            ).async_wait()
+        finally:
+            _ROLLOUT_CANDIDATE.reset(token)
+
+    async def _run_synchronous_candidates(
+        self, request: RolloutRequest, output_channel: Channel
+    ) -> dict:
+        if self._candidate_cohort is not None:
+            raise RuntimeError("A synchronous candidate cohort is already active.")
+        state = {
+            "id": request.cohort_id,
+            "version": request.weight_version,
+            "tasks": {},
+            "metrics": {},
+            "results": {},
+            "records": {},
+            "closed": asyncio.Event(),
+            "cleaned": asyncio.Event(),
+            "selected": set(),
+        }
+        self._candidate_cohort = state
+        self._generation_cohort_id = request.cohort_id
+        self._candidate_started.setdefault(request.cohort_id, asyncio.Event()).set()
+        try:
+            for candidate_id, input_ids, answer in zip(
+                request.group_ids, request.input_ids, request.answers, strict=True
+            ):
+                state["records"][candidate_id] = {
+                    "candidate_id": candidate_id,
+                    "worker_rank": self._rank,
+                    "task": answer,
+                    "weight_version": request.weight_version,
+                    "status": "pending",
+                }
+                state["tasks"][candidate_id] = asyncio.create_task(
+                    self._run_synchronous_candidate(
+                        state, candidate_id, input_ids, answer, output_channel
+                    )
+                )
+            await state["closed"].wait()
+            await state["cleaned"].wait()
+            metrics = [
+                state["metrics"][candidate_id]
+                for candidate_id in state["records"]
+                if candidate_id in state["selected"]
+            ]
+            selected_count = len(metrics)
+            agent_metrics = (
+                self.post_process_metric(metrics)
+                if state["selected"]
+                else MultiAgentLoopWorker.post_process_metric(self, metrics)
+            )
+            sampling_metrics = MultiAgentLoopWorker.post_process_metric(
+                self,
+                [
+                    {
+                        "__sum__/sampling/candidates": len(state["records"]),
+                        "__sum__/sampling/selected": selected_count,
+                        "__sum__/sampling/dropped": len(state["records"])
+                        - selected_count,
+                        "__sum__/sampling/cancelled": sum(
+                            record["status"] == "cancelled"
+                            for record in state["records"].values()
+                        ),
+                    }
+                ],
+            )
+            if agent_metrics is not None:
+                agent_metrics.update(sampling_metrics)
+            return agent_metrics
+        finally:
+            for task in state["tasks"].values():
+                task.cancel()
+            await asyncio.gather(*state["tasks"].values(), return_exceptions=True)
+            state["results"].clear()
+            self._generation_cohort_id = None
+            self._candidate_cohort = None
+
+    async def cancel_rollout_candidates(
+        self, cohort_id: str, selected_ids: list[int]
+    ) -> dict:
+        """Cancel only this finite cohort and wait for its process/session cleanup."""
+        await self._candidate_started.setdefault(cohort_id, asyncio.Event()).wait()
+        state = self._candidate_cohort
+        if state["id"] != cohort_id:
+            raise RuntimeError(
+                f"Cannot cancel cohort {cohort_id}; active cohort is {state['id']}."
+            )
+        state["selected"] = set(selected_ids)
+        state["closed"].set()
+        try:
+            for candidate_id, task in state["tasks"].items():
+                if candidate_id in state["selected"]:
+                    if state["records"][candidate_id]["status"] != "complete":
+                        raise RuntimeError(
+                            f"Selected candidate {candidate_id} is not complete."
+                        )
+                elif not task.done():
+                    task.cancel()
+            results = await asyncio.gather(
+                *state["tasks"].values(), return_exceptions=True
+            )
+            for record, result in zip(state["records"].values(), results, strict=True):
+                if isinstance(result, BaseException) and not isinstance(
+                    result, asyncio.CancelledError
+                ):
+                    raise result
+                if record["status"] == "pending":
+                    record.update(status="cancelled", finished_at=time.time())
+                kept = record["candidate_id"] in state["selected"]
+                record["kept"] = kept
+                record["drop_reason"] = None if kept else "synchronous_oversample_drop"
+                record["cleanup_complete"] = True
+            records = list(state["records"].values())
+            await self.finalize_rollout_candidates(records)
+            self._candidate_admissions[cohort_id] = {
+                candidate_id: state["results"][candidate_id]
+                for candidate_id in state["records"]
+                if candidate_id in state["selected"]
+            }
+            return {"cohort_id": cohort_id, "candidates": records}
+        finally:
+            state["cleaned"].set()
+
+    async def admit_rollout_candidates(
+        self, cohort_id: str, output_channels: Optional[list[Channel]]
+    ) -> dict:
+        """Forward selected payloads locally after cleanup, or release a failed batch."""
+        if output_channels is None:
+            self._candidate_admissions.pop(cohort_id, None)
+            return {"cohort_id": cohort_id, "admitted": 0, "admitted_ids": []}
+        if cohort_id not in self._candidate_admissions:
+            raise RuntimeError(f"Candidate cohort {cohort_id} has not passed cleanup.")
+        results = self._candidate_admissions.pop(cohort_id)
+        for result in results.values():
+            for channel in output_channels:
+                await channel.put(result, async_op=True).async_wait()
+        return {
+            "cohort_id": cohort_id,
+            "admitted": len(results),
+            "admitted_ids": list(results),
+        }
 
     def gen_extra_fields(
         self,

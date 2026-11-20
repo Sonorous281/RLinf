@@ -74,6 +74,14 @@ RLinf的worker抽象、灵活的通信组件、以及对不同类型加速器的
      </div>
 
      <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
+       <a href="rpent_episode_sync.html"><img src="https://github.com/RLinf/misc/raw/main/pic/rpent_framework.png"
+            style="width: 100%; height: 200px; object-fit: contain; border-radius: 8px;" /></a>
+       <p><a href="rpent_episode_sync.html"><b>RPent Episode PPO / GRPO</b></a><br>
+         用远程 LIBERO-PRO 环境和 SAM3 训练工具式 episode planner
+       </p>
+     </div>
+
+     <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
        <img src="https://raw.githubusercontent.com/RLinf/misc/main/pic/waiting_icon.jpg"
             style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);" />
        <p style="margin-top: 8px; font-size: 14px; line-height: 1.4;">
@@ -117,5 +125,6 @@ RLinf的worker抽象、灵活的通信组件、以及对不同类型加速器的
    rStar2 <rstar2>
    RPent <rpent>
    RPent 多模态强化学习 <rpent_libero_rl>
+   跨集群 RPent Episode PPO / GRPO <rpent_episode_sync>
    数学推理 <math_reasoning/index>
    Qwen3 VL GRPO <qwen3_vl_geo3k>

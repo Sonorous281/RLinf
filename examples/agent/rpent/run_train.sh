@@ -6,14 +6,10 @@ export RAY_DEDUP_LOGS=0
 
 CONFIG_PATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REPO_PATH="$(cd "$CONFIG_PATH/../../.." && pwd)"
-if [ -z "${MEGATRON_PATH:-}" ]; then
-    if [ -d "${VIRTUAL_ENV:-/opt/venv/reason}/Megatron-LM" ]; then
-        MEGATRON_PATH="${VIRTUAL_ENV:-/opt/venv/reason}/Megatron-LM"
-    else
-        MEGATRON_PATH=/opt/Megatron-LM
-    fi
+export PYTHONPATH=${REPO_PATH}:${REPO_PATH}/examples${PYTHONPATH:+:$PYTHONPATH}
+if [ -n "${MEGATRON_PATH:-}" ]; then
+    export PYTHONPATH=${MEGATRON_PATH}:${PYTHONPATH}
 fi
-export PYTHONPATH=${REPO_PATH}:${MEGATRON_PATH}:${REPO_PATH}/examples${PYTHONPATH:+:$PYTHONPATH}
 
 if [ -z "${1:-}" ]; then
     CONFIG_NAME="train_qwen3.5_4b_ppo"

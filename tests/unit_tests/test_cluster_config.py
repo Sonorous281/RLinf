@@ -1295,6 +1295,30 @@ def test_cluster_find_free_port_reports_occupied_bounded_range():
             Cluster.find_free_port(max_port_num=1024)
 
 
+@pytest.mark.parametrize("limit", [None, 32000, 65535])
+def test_cluster_listener_ports_avoid_kernel_ephemeral_range(monkeypatch, limit):
+    original_read = Path.read_text
+
+    def read_text(path, *args, **kwargs):
+        if str(path) == "/proc/sys/net/ipv4/ip_local_port_range":
+            return "32768 60999\n"
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    for _ in range(32):
+        port = Cluster.find_free_port(max_port_num=limit)
+        assert 1024 <= port <= (limit or 65535)
+        assert not 32768 <= port <= 60999
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("", port))
+
+
+def test_cluster_reports_no_non_ephemeral_listener_ports(monkeypatch):
+    monkeypatch.setattr(Path, "read_text", lambda *_args, **_kwargs: "1024 65535")
+    with pytest.raises(RuntimeError, match="No listener ports outside"):
+        Cluster.find_free_port()
+
+
 @pytest.mark.skipif(not hasattr(signal, "SIGSEGV"), reason="POSIX SIGSEGV required")
 @pytest.mark.parametrize(
     ("assertion_expr", "expected_rc", "expected_marker"),

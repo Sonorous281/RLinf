@@ -122,6 +122,10 @@ After the single-episode check, allocate the three-node placement and start Ray 
 
 For synchronous PPO, use ``train_qwen3.5_4b_libero_rl_ppo`` and adjust placement and batch size for the allocated resources. SAO also changes the algorithm: it uses DIS loss and SAO GAE, updates the critic, recomputes values, then updates the actor. It is more than asynchronous scheduling of PPO. Check finite losses and gradients, parameter updates, weight synchronization and recovery before scaling. A short smoke run does not establish capacity for the full 262144-token workload.
 
+For grouped GRPO with the original episode workflow, use ``train_qwen3.5_4b_episode_sync_grpo`` and an RPent checkout that provides ``robots.rl.rl_episode``. The recipe trains on 32 groups of 8 episodes and launches 40 candidate groups. All eight members share the task and initial state, but sample independently. The first 32 complete groups enter training; the other groups are cancelled and cleaned up before learning. Groups with identical rewards remain in the batch. This recipe uses no critic and sets the upper clipping bound to 0.28. It applies ``group_level``, ``agent_level`` and ``turn_level`` loss scales to the existing trajectory, agent and valid-token fields.
+
+The GRPO recipe captures the exact serving prompt tokens and multimodal inputs for learner replay. With the minimal H200 environment, RLinf supports the unmodified SGLang 0.5.12.post1 release; no patched serving wheel or preprocessing-cache path is required. Collect fresh rollouts with capture enabled, since legacy image records lack these inputs. The planner keeps the original episode workflow, prompts, tools and action schema. See :doc:`rpent_episode_sync` for installation and the five-step 27B acceptance configuration.
+
 Visualization and Results
 -------------------------
 

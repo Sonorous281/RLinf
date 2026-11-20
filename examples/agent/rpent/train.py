@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Train an RPent planner with synchronous PPO or asynchronous SAO PPO."""
+"""Train an RPent planner with synchronous PPO/GRPO or asynchronous SAO PPO."""
 
 import json
+from pathlib import Path
 
 import hydra
 from omegaconf import OmegaConf
@@ -36,10 +37,28 @@ from rlinf.workers.rollout.utils import get_rollout_backend_worker
 @output_redirector
 def main(cfg) -> None:
     from rlinf.workers.actor.ma_megatron_actor_worker import MAMegatronActor
-    from rlinf.workers.critic.ma_megatron_critic_worker import MAMegatronCritic
 
     cfg = validate_cfg(cfg)
     get_logger().info(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
+
+    agent_loop_cls = RPentAgentLoopWorker
+    if cfg.get("replay") and cfg.runner.resume_dir is None:
+        if not cfg.runner.synchronous or cfg.replay.expected_version != 0:
+            raise ValueError(
+                "Saved-cohort recovery requires a fresh synchronous policy"
+            )
+        from rlinf.agents.rpent.replay import (
+            RPentRecoveryAgentLoopWorker,
+            SavedRPentBatch,
+        )
+
+        saved_batch = SavedRPentBatch(
+            Path(cfg.replay.source_dir),
+            Path(cfg.replay.manifest),
+            cfg.replay.expected_version,
+        )
+        saved_batch.verify_policy(Path(cfg.rollout.model.model_path))
+        agent_loop_cls = RPentRecoveryAgentLoopWorker
 
     cluster = Cluster(cluster_cfg=cfg.cluster)
     placement = ModelParallelComponentPlacement(cfg, cluster)
@@ -59,7 +78,7 @@ def main(cfg) -> None:
             else None,
         )
     )
-    agent_loop = RPentAgentLoopWorker.create_group(cfg, placement).launch(
+    agent_loop = agent_loop_cls.create_group(cfg, placement).launch(
         cluster,
         name=cfg.agentloop.group_name,
         placement_strategy=placement.get_strategy("agentloop"),
@@ -68,12 +87,24 @@ def main(cfg) -> None:
         cluster,
         name=cfg.actor.group_name,
         placement_strategy=placement.get_strategy("actor"),
+        env_vars=OmegaConf.to_container(cfg.actor.get("env_vars", {}), resolve=True)
+        if cfg.actor.get("env_vars")
+        else None,
     )
-    critic = MAMegatronCritic.create_group(cfg, placement).launch(
-        cluster,
-        name=cfg.critic.group_name,
-        placement_strategy=placement.get_strategy("critic"),
-    )
+    critic = None
+    if cfg.critic.use_critic_model:
+        from rlinf.workers.critic.ma_megatron_critic_worker import MAMegatronCritic
+
+        critic = MAMegatronCritic.create_group(cfg, placement).launch(
+            cluster,
+            name=cfg.critic.group_name,
+            placement_strategy=placement.get_strategy("critic"),
+            env_vars=OmegaConf.to_container(
+                cfg.critic.get("env_vars", {}), resolve=True
+            )
+            if cfg.critic.get("env_vars")
+            else None,
+        )
 
     tokenizer = hf_tokenizer(cfg.actor.tokenizer.tokenizer_model)
     train_ds, val_ds = create_reasoning_datasets(cfg, tokenizer)

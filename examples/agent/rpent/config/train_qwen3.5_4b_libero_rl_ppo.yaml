@@ -94,6 +94,7 @@ actor:
   trim_right_padding: true
   model:
     attention_backend: flash
+    load_mtp: false
     # Zero keeps the normal projection; positive values chunk scored positions.
     lm_head_chunk_size: 0
     freeze_vision_model: true

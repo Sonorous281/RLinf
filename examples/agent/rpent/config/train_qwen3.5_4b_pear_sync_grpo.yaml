@@ -1,0 +1,18 @@
+# Same GRPO algorithm and group oversampling; RGB-only absolute-pose control.
+defaults:
+  - train_qwen3.5_4b_episode_sync_grpo
+  - _self_
+
+runner:
+  experiment_name: rpent-pear-qwen3.5-4b-sync-grpo
+
+tools:
+  rpent:
+    workflow: pear
+    world_cord: general
+    action_mode: single
+    sam3_endpoint: null
+
+agentloop:
+  chat_template_kwargs:
+    enable_thinking: true

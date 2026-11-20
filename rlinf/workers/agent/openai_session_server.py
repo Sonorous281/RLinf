@@ -196,9 +196,13 @@ class OpenAISessionServer:
             },
         ]
         response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
-        await response.prepare(request)
-        for chunk in chunks:
-            await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
-        await response.write(b"data: [DONE]\n\n")
-        await response.write_eof()
+        try:
+            await response.prepare(request)
+            for chunk in chunks:
+                await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+            await response.write(b"data: [DONE]\n\n")
+            await response.write_eof()
+        except ConnectionResetError:
+            # An episode deadline may close the client before generation ends.
+            response.force_close()
         return response

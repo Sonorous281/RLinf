@@ -3,6 +3,8 @@ RPent 安装与部署
 
 本页准备 :doc:`rpent_libero_rl` 所需的配套代码、模型资产和服务。每个部署环境只需完成一次；日常训练和评测使用主示例入口。
 
+本页将训练环境与模拟器环境分开安装。使用 H200 ``reason`` 镜像时，按 :doc:`rpent_episode_sync` 在同一环境中安装，并保留镜像原有的 Core 和 Bridge。
+
 安装代码与环境
 --------------
 
@@ -20,8 +22,6 @@ RPent 安装与部署
    git -C "$STACK_ROOT/repos/Megatron-LM" checkout dc0ee41ada177d4c74ba46bb501bba5967264815
    export MEGATRON_PATH="$STACK_ROOT/repos/Megatron-LM"
    cd "$STACK_ROOT/repos/RLinf"
-   git -C "$MEGATRON_PATH" apply \
-     "$STACK_ROOT/repos/RLinf/requirements/agentic/megatron-core-r0.18.0-cpu-offload.patch"
    UV_TORCH_BACKEND=cu128 UNINSTALL_FA4=1 bash requirements/install.sh agentic \
      --venv "$STACK_ROOT/envs/rlinf" --python 3.12.12 --torch 2.11.0 \
      --engine sglang --sglang 0.5.12.post1 --transformers 5.6.1 \
@@ -29,7 +29,7 @@ RPent 安装与部署
 
 安装器复用已有的 ``MEGATRON_PATH``。它在解析依赖时会临时修改依赖元数据，因此请使用空闲 checkout 和新环境。``--no-root`` 要求原生系统依赖已准备好；``UNINSTALL_FA4=1`` 选择经过验证的 FA2 路径。其他平台参数见 ``bash requirements/install.sh --help``。
 
-安装前应用一次补丁。补丁让 Megatron 从 Torch checkpoint 恢复卸载到 CPU 的主权重和 Adam 步数。指定 ``MEGATRON_PATH`` 时，请手动应用补丁。
+Core 的 CPU optimizer 补丁只适用于 HybridDeviceOptimizer 的 checkpoint 路径。设置 ``actor.optim.optimizer_cpu_offload=false`` 时，阶段卸载不需要该补丁。H200 最小部署保留原装 Core 和 Bridge。
 
 从配套 RPent checkout 安装独立的模拟器／SAM3 环境。它的 requirements 从同级目录安装 RLinf，保证两套环境使用相同的源码版本。启动前核对输出的模块路径：
 

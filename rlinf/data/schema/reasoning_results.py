@@ -1473,6 +1473,51 @@ class DynamicRolloutResult:
         return packed_batch
 
     @staticmethod
+    def from_trajectory_group(
+        trajectories: list["DynamicRolloutResult"], group_id: int
+    ) -> "DynamicRolloutResult":
+        """Join complete single-episode results in their group member order."""
+        if not trajectories or any(
+            result.group_size != 1
+            or not result.idx_to_traj
+            or set(result.idx_to_traj) != {0}
+            for result in trajectories
+        ):
+            raise ValueError("A query group requires complete single-episode results.")
+        merged = DynamicRolloutResult.merge_result_list(trajectories)
+        merged.group_size = len(trajectories)
+        merged.group_id = group_id
+        merged.idx_to_traj = [
+            member
+            for member, result in enumerate(trajectories)
+            for _ in result.idx_to_traj
+        ]
+        for name in ("extra_fields_turn", "extra_fields_traj"):
+            first = getattr(trajectories[0], name)
+            if first is not None:
+                setattr(
+                    merged,
+                    name,
+                    {
+                        key: [
+                            value
+                            for result in trajectories
+                            for value in getattr(result, name)[key]
+                        ]
+                        for key in first
+                    },
+                )
+        merged.extra_fields_group = {
+            "sampling_group": [
+                {
+                    "group_id": group_id,
+                    "candidate_ids": [result.group_id for result in trajectories],
+                }
+            ]
+        }
+        return merged
+
+    @staticmethod
     def _merge_version_fields(
         rollout_results: list["DynamicRolloutResult"],
     ) -> tuple[Optional[list[int]], Optional[list[int]]]:

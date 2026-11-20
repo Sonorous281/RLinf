@@ -16,6 +16,7 @@
 
 import asyncio
 import copy
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -591,3 +592,270 @@ def test_multimodal_learner_budgets_without_rpent(settings, token_space, error):
         snapshot = OmegaConf.to_container(cfg)
         validate_multimodal_learner_cfg(cfg)
         assert OmegaConf.to_container(cfg) == snapshot
+
+
+def test_group_candidates_spread_320_members_over_32_workers():
+    from rlinf.data.schema.reasoning_requests import build_rollout_requests_from_batch
+
+    batch = {
+        "prompt": torch.arange(40).reshape(40, 1),
+        "length": torch.ones(40, dtype=torch.long),
+        "answer": [[str(group)] for group in range(40)],
+        "image_data": [None] * 40,
+        "multi_modal_inputs": [None] * 40,
+    }
+    requests = build_rollout_requests_from_batch(
+        batch, group_size=8, split_size=32, split_trajectories=True
+    )
+    assert len(requests) == 32
+    assert all(len(request.input_ids) == 10 and request.n == 1 for request in requests)
+    answers = [answer for request in requests for answer in request.answers]
+    assert answers == [[str(group)] for group in range(40) for _ in range(8)]
+
+
+def test_grouped_episodes_keep_trajectory_rewards_images_and_action_masks():
+    trajectories = []
+    for member, turns in enumerate([1, 3, 2, 4, 1, 2, 3, 1]):
+        trajectories.append(
+            DynamicRolloutResult(
+                num_sequence=turns,
+                group_size=1,
+                idx_to_traj=[0] * turns,
+                input_ids=[[10, 11, 12]] * turns,
+                prompt_lengths=[1] * turns,
+                response_lengths=[2] * turns,
+                response_mask=[[1, 0]] * turns,
+                rollout_logprobs=[[-0.3, -0.4]] * turns,
+                is_end=[True] * turns,
+                rewards=[float(member % 2)] * turns,
+                extra_fields_traj={"episode_id": [str(member)]},
+                multi_modal_inputs=[None] * turns,
+                version_start=[2] * turns,
+                version_end=[2] * turns,
+            )
+        )
+    result = DynamicRolloutResult.from_trajectory_group(trajectories, group_id=6)
+    assert result.group_size == 8
+    assert result.group_id == 6
+    assert result.idx_to_traj == [
+        member
+        for member, trajectory in enumerate(trajectories)
+        for _ in trajectory.idx_to_traj
+    ]
+    assert result.group_metadata().rewards == [0.0, 1.0] * 4
+    assert result.extra_fields_traj["episode_id"] == list(map(str, range(8)))
+    assert result.response_mask == [[1, 0]] * 17
+    assert result.rollout_logprobs == [[-0.3, -0.4]] * 17
+
+
+def test_grpo_episode_loss_scales_preserve_masks_and_weight_unequal_turns():
+    from rlinf.algorithms.registry import get_loss_scales
+
+    mask = torch.tensor([[1, 0, 0], [1, 1, 1], [1, 1, 0]], dtype=torch.bool)
+    batch = {
+        "idx_to_traj": [0, 0, 1],
+        "extra:idx_to_sub_traj": torch.zeros(3, dtype=torch.long),
+        "response_mask": mask,
+        "advantages": mask.float(),
+        "loss_scales": mask.float(),
+    }
+    context = {
+        "folding_scale": [],
+        "actor_global_batch_size": 256,
+        "data_parallel_world_size": 16,
+    }
+    scales = ["group_level", "agent_level", "turn_level"]
+    for scale in get_loss_scales(scales):
+        batch = scale(context, batch)
+    assert context["folding_scale"] == scales
+    torch.testing.assert_close(batch["advantages"], mask.float() * 3 * 16 / 256)
+    torch.testing.assert_close(
+        batch["loss_scales"],
+        torch.tensor([[0.25, 0.0, 0.0], [0.75, 0.75, 0.75], [1.0, 1.0, 0.0]]),
+    )
+    assert torch.isfinite(batch["advantages"] * batch["loss_scales"]).all()
+
+
+def test_grpo_hierarchical_scales_keep_action_masks_and_weight_variable_turns():
+    from rlinf.algorithms.registry import get_loss_scales
+
+    mask = torch.tensor([[True, False, False], [True, True, True], [True, True, False]])
+    batch = {
+        "idx_to_traj": [0, 0, 1],
+        "extra:idx_to_sub_traj": torch.tensor([0, 0, 0]),
+        "advantages": mask.float(),
+        "response_mask": mask,
+        "loss_scales": mask.float(),
+    }
+    names = ["group_level", "agent_level", "turn_level"]
+    context = {
+        "folding_scale": [],
+        "actor_global_batch_size": 32 * 8,
+        "data_parallel_world_size": 16,
+    }
+    for scale in get_loss_scales(names):
+        batch = scale(context, batch)
+    assert context["folding_scale"] == names
+    torch.testing.assert_close(batch["advantages"], mask.float() * 3 * 16 / 256)
+    torch.testing.assert_close(
+        batch["loss_scales"],
+        torch.tensor([[0.25, 0.0, 0.0], [0.75, 0.75, 0.75], [1.0, 1.0, 0.0]]),
+    )
+    assert not batch["loss_scales"][~mask].any()
+
+
+@pytest.mark.parametrize("failure", [None, "candidate", "cleanup"])
+@pytest.mark.parametrize("group_size", [1, 8])
+def test_sync_runner_selects_first_complete_candidates_and_admits_only_after_cleanup(
+    tmp_path, monkeypatch, failure, group_size
+):
+    from omegaconf import OmegaConf
+
+    from rlinf.runners.agent_ppo_runner import AgentPPORunner
+
+    monkeypatch.setattr(Channel, "create", lambda *_args, **_kwargs: _local_channel())
+    order = []
+    selected_ids = []
+    records = [
+        {
+            "candidate_id": i,
+            "status": "complete" if i // group_size in (2, 0, 4) else "cancelled",
+            "cleanup_complete": True,
+        }
+        for i in range(5 * group_size)
+    ]
+    if failure == "candidate":
+        records[group_size]["status"] = "error"
+        records[group_size]["error"] = "transport failed after retry"
+    runner = object.__new__(AgentPPORunner)
+    runner.cfg = OmegaConf.create(
+        {
+            "data": {"rollout_batch_size": 3, "sampling_batch_size": 5},
+            "runner": {
+                "task_type": "reasoning",
+                "synchronous": True,
+                "logger": {"log_path": str(tmp_path)},
+            },
+            "algorithm": {"group_size": group_size},
+            "agentloop": {"is_dynamic_rollout_batch": True},
+            "rollout": {"rollout_backend": "sglang"},
+        }
+    )
+    runner.global_steps = 2
+    runner._sampling_cohort_id = "cpu-cohort"
+    runner.candidate_channel = _local_channel()
+    runner.candidate_result_channel = _local_channel()
+    runner.dataloader_channel = _local_channel()
+    learner = _local_channel()
+    runner.rollout_output_channels = [learner]
+    values = {}
+
+    def handle(value=None):
+        return SimpleNamespace(wait=lambda: value)
+
+    def launch(input_channel, output_channel):
+        order.append("launch")
+        # Fast members of unfinished groups must not be admitted individually.
+        for candidate_id in (
+            group * group_size + member
+            for member in range(group_size)
+            for group in (2, 0, 4)
+        ):
+            result = DynamicRolloutResult(
+                num_sequence=1,
+                group_size=1,
+                group_id=candidate_id,
+                idx_to_traj=[0],
+                prompt_lengths=[1],
+                response_lengths=[1],
+                input_ids=[[1, 2]],
+                is_end=[True],
+                rewards=[1.0 if candidate_id == 0 else 0.0],
+                version_start=[2],
+                version_end=[2],
+            )
+            values[candidate_id] = result
+            output_channel.put(
+                {
+                    "cohort_id": "cpu-cohort",
+                    "candidate_id": candidate_id,
+                    "status": "complete",
+                }
+            )
+        return handle([{}])
+
+    def cancel(cohort_id, selected):
+        assert cohort_id == "cpu-cohort"
+        selected_ids.extend(selected)
+        order.append("cancel_requested")
+
+        def wait():
+            assert order[-1] == "engine_fence"
+            assert learner.empty()
+            if failure == "cleanup":
+                raise RuntimeError("remote lease cleanup failed")
+            order.append("agent_cleanup")
+            return [{"cohort_id": cohort_id, "candidates": records}]
+
+        return SimpleNamespace(wait=wait)
+
+    def finish(cohort_id):
+        assert cohort_id == "cpu-cohort"
+        order.append("engine_fence")
+        return handle([{"cohort_id": cohort_id, "inflight": 0, "queue_fenced": True}])
+
+    def admit(cohort_id, channels):
+        assert cohort_id == "cpu-cohort"
+        if channels is None:
+            return handle([{"admitted": 0, "admitted_ids": []}])
+        assert order[-1] == "engine_fence"
+        order.append("admit")
+        for candidate_id in selected_ids:
+            for channel in channels:
+                channel.put(values[candidate_id])
+        return handle(
+            [{"admitted": len(selected_ids), "admitted_ids": list(selected_ids)}]
+        )
+
+    runner.agent_loop = SimpleNamespace(
+        run_agentloop_rollout=launch,
+        cancel_rollout_candidates=cancel,
+        admit_rollout_candidates=admit,
+    )
+    runner.rollout = SimpleNamespace(finish_generation_cohort=finish)
+    if failure is None:
+        runner._start_rollout()
+        assert selected_ids == [
+            group * group_size + member
+            for group in (2, 0, 4)
+            for member in range(group_size)
+        ]
+        admitted = [learner.get() for _ in range(3)]
+        assert [result.group_size for result in admitted] == [group_size] * 3
+        assert [result.idx_to_traj for result in admitted] == [
+            list(range(group_size))
+        ] * 3
+        assert admitted[0].rewards == [0.0] * group_size
+        assert learner.empty()
+        assert order == [
+            "launch",
+            "cancel_requested",
+            "engine_fence",
+            "agent_cleanup",
+            "engine_fence",
+            "admit",
+        ]
+    else:
+        with pytest.raises(RuntimeError, match="infrastructure|cleanup failed"):
+            runner._start_rollout()
+        assert learner.empty()
+    audit = json.loads((tmp_path / "sampling/cpu-cohort.json").read_text())
+    assert audit["sampling_batch_size"] == 5
+    assert audit["effective_batch_size"] == 3
+    assert audit["status"] == ("passed" if failure is None else "failed")
+    assert audit["selected_ids"] == [
+        group * group_size + member
+        for group in (2, 0, 4)
+        for member in range(group_size)
+    ]
+    assert audit["selected_group_ids"] == [2, 0, 4]

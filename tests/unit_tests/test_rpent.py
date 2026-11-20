@@ -97,6 +97,165 @@ def test_merge_prefix_turns_folds_image_rows_and_keeps_the_last_image_set():
     assert second.prompt_ids == [1, 2, 7] and second.response_images["num_images"] == 1
 
 
+@pytest.mark.parametrize("capture", [False, True])
+def test_saved_group_members_keep_distinct_tokens_and_token_space_contract(
+    tmp_path, capture
+):
+    import hashlib
+
+    from rlinf.agents.rpent.episode import Episode
+    from rlinf.agents.rpent.records import write_training_turn
+    from rlinf.agents.rpent.replay import SavedRPentBatch
+
+    def write(path, value):
+        path.write_text(json.dumps(value))
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    task = {"task_id": 3, "init_state_id": 9}
+    records = []
+    for candidate in (0, 1):
+        directory = tmp_path / f"episode-{candidate}"
+        (directory / "training_audit").mkdir(parents=True)
+        (directory / "training_images").mkdir()
+        image = b"saved-image"
+        digest = hashlib.sha256(image).hexdigest()
+        path = directory / "training_images" / digest
+        path.write_bytes(image)
+        request_hash = write(directory / "request.json", {"task": task})
+        status = {
+            "terminal": True,
+            "success": bool(candidate),
+            "init_state_id": 9,
+            "memory_entries": [],
+            "truncated": False,
+            "termination_reason": "planner_completed",
+        }
+        outcome_hash = write(directory / "outcome.json", status)
+        contract = {
+            "format": "sglang-token-space-v1",
+            "image_refs": [{"path": str(path), "sha256": digest}],
+            "image_grid_thw": [[1, 2, 2]],
+            "num_images": 1,
+            "processor_fingerprint": "saved-processor",
+            "prompt_token_ids": [10, 11],
+            "image_spans": [[1, 2]],
+            "pixel_values_sha256": "saved-pixels",
+            "mrope_sha256": "saved-positions",
+        }
+        if capture:
+            from rlinf.hybrid_engines.sglang.multimodal.replay import store_pixels
+
+            contract = {
+                "format": "rlinf-qwen-image-inputs-v1",
+                "prompt_token_ids": [10, 11],
+                "image_spans": [[1, 2]],
+                "image_grid_thw": torch.tensor([[1, 2, 2]]),
+                "pixel_values": torch.ones(4, 2),
+                "mrope_positions": torch.tensor([[0, 1]] * 3),
+                "mrope_position_delta": torch.tensor([0]),
+            }
+            store_pixels(contract, directory / "training_images")
+            path.unlink()
+        turn = {
+            "episode_id": directory.name,
+            "task": task,
+            "turn_id": 0,
+            "chain_id": 0,
+            "input_ids": [10, 11],
+            "output_ids": [20 + candidate],
+            "response_mask": [1],
+            "behavior_logprobs": [-0.25 - candidate],
+            "token_weight_versions": [0],
+            "weight_version_start": 0,
+            "weight_version_end": 0,
+            "finish_reason": "stop",
+            "tool_names": [],
+            "image_sha256": [digest],
+            "image_grid_thw": [[1, 2, 2]],
+            "multimodal_contract": contract,
+        }
+        write_training_turn(
+            str(tmp_path),
+            Episode(directory.name, task, SimpleNamespace(chain_id=0)),
+            AgentLoopOutput(
+                prompt_ids=turn["input_ids"],
+                response_ids=turn["output_ids"],
+                response_mask=turn["response_mask"],
+                response_images={
+                    **contract,
+                    "image_grid_thw": torch.tensor([[1, 2, 2]]),
+                },
+                extra_fields={"turn_id": 0, "tool_names": []},
+            ),
+            {
+                "logprobs": turn["behavior_logprobs"],
+                "weight_versions": [0],
+                "version_start": 0,
+                "version_end": 0,
+                "prompt_token_ids": turn["input_ids"],
+                "finish_reason": "stop",
+            },
+            [image] if capture else [],
+            0.0,
+            {},
+        )
+        turn_hash = hashlib.sha256(
+            (directory / "training_audit/turn-00000.json").read_bytes()
+        ).hexdigest()
+        records.append(
+            {
+                "candidate_id": candidate,
+                "episode_id": directory.name,
+                "request_sha256": request_hash,
+                "outcome_sha256": outcome_hash,
+                "success": bool(candidate),
+                "turns": [{"file": "turn-00000.json", "sha256": turn_hash}],
+            }
+        )
+    manifest = tmp_path / "manifest.json"
+    write(
+        manifest,
+        {
+            "passed": True,
+            "episodes": 2,
+            "weight_versions": [0],
+            "policy_files": {"config.json": "policy-hash"},
+            "records": records,
+        },
+    )
+    saved = SavedRPentBatch(tmp_path, manifest, 0)
+    assert len(saved) == 2
+    outputs = [
+        saved.load_episode(
+            task,
+            candidate_id=i,
+            merge_prefix=True,
+            max_scored_tokens=8,
+            token_space=True,
+        )
+        for i in (0, 1)
+    ]
+    assert [o.single_turn_outputs[0].response_ids for o in outputs] == [[20], [21]]
+    assert [o.single_turn_outputs[0].reward_score for o in outputs] == [0.0, 1.0]
+    for output in outputs:
+        payload = output.single_turn_outputs[0].response_images
+        if capture:
+            assert payload["mrope_positions"].tolist() == [[0, 1]] * 3
+            assert len(payload["pixel_refs"]) == 1
+        else:
+            assert payload["processor_fingerprint"] == "saved-processor"
+            assert payload["mrope_sha256"] == "saved-positions"
+        assert payload["image_grid_thw"].tolist() == [[1, 2, 2]]
+    with pytest.raises(ValueError, match="different task"):
+        saved.load_episode(
+            {"task_id": 4},
+            candidate_id=0,
+            merge_prefix=True,
+            max_scored_tokens=8,
+            token_space=True,
+        )
+
+
 # Stands in for RPent's ``robots.libero_rl.rl_episode``: it plans against the
 # worker's policy endpoint and writes the outcome, as the real process does.
 FAKE_EPISODE = """
@@ -438,6 +597,90 @@ def compose(overrides=(), config_name="train_qwen3.5_4b_libero_rl_ppo"):
         if node is not None and OmegaConf.is_missing(node, key):
             OmegaConf.update(cfg, name, value)
     return cfg
+
+
+@pytest.mark.parametrize(
+    "recipe,requires_sync",
+    [
+        ("eval_qwen3.5_4b_episode_sync", False),
+        ("eval_qwen3.5_4b_episode_token_space", False),
+        ("train_qwen3.5_4b_episode_sync_grpo", True),
+    ],
+)
+@pytest.mark.parametrize("version", [None, 0])
+def test_episode_recipes_distinguish_static_weights_from_actor_sync(
+    make_agent, recipe, requires_sync, version
+):
+    cfg = compose(config_name=recipe)
+    worker = make_agent(FakeRPent(turns=1))
+    worker.cfg.runner.synchronous = cfg.runner.synchronous
+    worker.cfg.tools.rpent.update(
+        {
+            key: cfg.tools.rpent[key]
+            for key in (
+                "workflow",
+                "world_cord",
+                "image_size",
+                "action_mode",
+                "max_actions_per_call",
+                "perception_mode",
+                "reasoning_history",
+                "image_history",
+            )
+        }
+    )
+    worker.cfg.tools.rpent.entrypoint = "robots.libero_rl.rl_episode"
+    worker.cfg.algorithm.sampling_params.update(cfg.algorithm.sampling_params)
+    generate = worker.generate
+
+    async def versioned(*args, **kwargs):
+        result = await generate(*args, **kwargs)
+        if version is not None:
+            result.update(version_start=version, version_end=version)
+        return result
+
+    worker.generate = versioned
+    if requires_sync and version is None:
+        with pytest.raises(ValueError, match="installed weight version"):
+            run_query(worker)
+        return
+    result = run_query(worker)
+    assert result.extra_fields["turns"] == 1
+    (turn,) = result.single_turn_outputs
+    assert turn.version_start == turn.version_end == version
+    assert len(turn.response_ids) == len(turn.response_logprobs)
+    if requires_sync:
+        assert set(turn.response_weight_versions) == {version}
+
+
+@pytest.mark.parametrize(
+    "evaluation,turns,valid",
+    [
+        (True, 1, True),
+        (True, 0, False),
+        (True, True, False),
+        (False, 25, True),
+        (False, 24, False),
+    ],
+)
+def test_request_budget_preserves_evaluation_and_training_limits(
+    evaluation, turns, valid
+):
+    from rlinf.agents.rpent.config_validation import validate_rpent_cfg
+
+    cfg = compose(
+        config_name=(
+            "eval_qwen3.5_4b_libero_rl"
+            if evaluation
+            else "train_qwen3.5_4b_libero_rl_ppo"
+        )
+    )
+    cfg.agentloop.max_turns = turns
+    if valid:
+        validate_rpent_cfg(cfg)
+    else:
+        with pytest.raises(ValueError, match="max_turns must be an integer"):
+            validate_rpent_cfg(cfg)
 
 
 @pytest.mark.parametrize(
@@ -1065,3 +1308,252 @@ def test_release_capture_checks_sampled_history_and_request_id():
     pixels.zero_()
     with pytest.raises(ValueError, match="pixels"):
         sample([10, 11, 12, 23, 24], history)
+
+
+def test_tokenspace_grouped_grpo_keeps_native_loss_scales_without_a_critic():
+    from rlinf.agents.rpent.config_validation import validate_rpent_cfg
+
+    cfg = compose(
+        overrides=[
+            "rollout.sglang.token_space_preprocess_cache_dir=/test/cache",
+            "tools.rpent.repo_path=/test/rpent",
+            "tools.rpent.remote_toolkit_endpoint=http://127.0.0.1:28490",
+        ],
+        config_name="train_qwen3.5_4b_episode_sync_grpo",
+    )
+    validate_rpent_cfg(cfg)
+    assert cfg.algorithm.clip_ratio_high == 0.28
+    assert list(cfg.algorithm.loss_scales) == [
+        "group_level",
+        "agent_level",
+        "turn_level",
+    ]
+    assert cfg.algorithm.group_size == 8
+    assert cfg.data.rollout_batch_size == 32
+    assert cfg.data.sampling_batch_size == 40
+    assert not cfg.critic.use_critic_model
+    assert cfg.actor.megatron.mbridge
+    assert cfg.tools.rpent.entrypoint == "robots.rl.rl_episode"
+
+
+@pytest.fixture
+def episode_launcher(tmp_path, monkeypatch):
+    from rlinf.agents.rpent.launcher import RPentEpisodeLauncher
+
+    (tmp_path / "episode_fixture.py").write_text(
+        "import argparse,json,os,time\n"
+        "from pathlib import Path\n"
+        "p=argparse.ArgumentParser()\n"
+        "p.add_argument('--request',type=Path)\n"
+        "p.add_argument('--output-dir',type=Path)\n"
+        "a,extra=p.parse_known_args()\n"
+        "r=json.loads(a.request.read_text())\n"
+        "(a.output_dir/'pid').write_text(str(os.getpid()))\n"
+        "(a.output_dir/'states.json').write_text('{}')\n"
+        "time.sleep(r['task'].get('sleep',0))\n"
+        "(a.output_dir/'outcome.json').write_text(json.dumps({\n"
+        " 'success':False,'owner':os.environ.get('RPENT_REMOTE_OWNER_ID'),\n"
+        " 'egl':os.environ.get('MUJOCO_EGL_DEVICE_ID'),'args':extra}))\n"
+    )
+    monkeypatch.setenv("MUJOCO_EGL_DEVICE_ID", "inherited-device")
+    cfg = OmegaConf.create(
+        {
+            "rollout": {"model": {"model_path": "unused"}},
+            "agentloop": {"prompt": "simple"},
+            "tools": {
+                "rpent": {
+                    "python": sys.executable,
+                    "repo_path": str(tmp_path),
+                    "workflow": "episode",
+                    "entrypoint": "episode_fixture",
+                    "remote_toolkit_endpoint": "http://unused",
+                    "image_size": 1024,
+                    "action_mode": "batch",
+                    "max_actions_per_call": 3,
+                    "perception_mode": "single",
+                    "reasoning_history": -1,
+                    "image_history": -1,
+                    "max_episode_steps": 10000,
+                    "max_env_initializations_per_worker": 1,
+                    "output_dir": str(tmp_path / "episodes"),
+                    "keep_episodes": "none",
+                    "process_timeout_s": 20,
+                }
+            },
+        }
+    )
+    return RPentEpisodeLauncher(cfg)
+
+
+def test_episode_launcher_keeps_candidates_and_preserves_workflow(episode_launcher):
+    from rlinf.agents.rpent.episode import Episode
+
+    launcher = episode_launcher
+    candidate = {"cohort_id": "grouped", "candidate_id": 9}
+    episode = Episode("candidate", {}, None)
+    result = asyncio.run(launcher.run(episode, {}, 3, candidate=candidate))
+    output = Path(launcher.cfg.tools.rpent.output_dir) / "candidate"
+    assert result["owner"] == "candidate" and result["egl"] is None
+    assert "--record-api-trace" not in result["args"]
+    assert result["args"][result["args"].index("--max-actions-per-call") + 1] == "3"
+    assert result["args"][result["args"].index("--cuda-device") + 1] == "3"
+    assert json.loads((output / "sampling-candidate.json").read_text()) == {
+        **candidate,
+        "episode_id": "candidate",
+    }
+    assert json.loads((output / "sampling-process-cleanup.json").read_text()) == {
+        "process_exited": True,
+        "returncode": 0,
+    }
+    asyncio.run(launcher.run(Episode("ordinary", {}, None), {}, 3))
+    assert not (output.parent / "ordinary").exists()
+
+
+def test_episode_launcher_cancellation_reaps_child_and_releases_permit(
+    episode_launcher,
+):
+    from rlinf.agents.rpent.episode import Episode
+
+    launcher = episode_launcher
+    candidate = {"cohort_id": "cancelled", "candidate_id": 0}
+    output = Path(launcher.cfg.tools.rpent.output_dir) / "cancelled"
+
+    async def run():
+        task = asyncio.create_task(
+            launcher.run(
+                Episode("cancelled", {"sleep": 60}, None), {}, 0, candidate=candidate
+            )
+        )
+
+        async def started():
+            while not (output / "pid").exists():
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(started(), timeout=10)
+        pid = int((output / "pid").read_text())
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+        await asyncio.wait_for(
+            launcher.run(Episode("after-cancel", {}, None), {}, 0), timeout=10
+        )
+
+    asyncio.run(run())
+    assert json.loads((output / "sampling-process-cleanup.json").read_text())[
+        "process_exited"
+    ]
+
+
+def test_pear_recipe_preserves_grpo_and_exposes_explicit_frame():
+    from rlinf.agents.rpent.config_validation import _validate_planner
+
+    cfg = compose(config_name="train_qwen3.5_4b_pear_sync_grpo")
+    _validate_planner(cfg, cfg.tools.rpent)
+    assert cfg.tools.rpent.world_cord == "general"
+    assert cfg.tools.rpent.action_mode == "single"
+    assert cfg.tools.rpent.sam3_endpoint is None
+    assert (
+        cfg.data.rollout_batch_size,
+        cfg.data.sampling_batch_size,
+        cfg.algorithm.group_size,
+    ) == (32, 40, 8)
+    assert cfg.algorithm.clip_ratio_high == 0.28
+    assert list(cfg.algorithm.loss_scales) == [
+        "group_level",
+        "agent_level",
+        "turn_level",
+    ]
+    assert not cfg.critic.use_critic_model
+    cfg.agentloop.chat_template_kwargs.enable_thinking = False
+    planner = RPentAgentLoopWorker._planner_options(
+        SimpleNamespace(cfg=cfg), "http://policy"
+    )
+    assert planner["thinking"] is False and planner["reasoning_effort"] == "none"
+    assert "no_images" not in planner
+    cfg.tools.rpent.action_mode = "batch"
+    with pytest.raises(ValueError, match="action_mode=single"):
+        _validate_planner(cfg, cfg.tools.rpent)
+
+
+def test_pear_launcher_preserves_candidate_cleanup_and_needs_no_sam(episode_launcher):
+    from rlinf.agents.rpent.episode import Episode
+
+    launcher = episode_launcher
+    launcher.cfg.tools.rpent.workflow = "pear"
+    launcher.cfg.tools.rpent.world_cord = "general"
+    launcher.cfg.tools.rpent.action_mode = "single"
+    launcher.cfg.tools.rpent.sam3_endpoint = "http://must-not-be-used"
+    result = asyncio.run(
+        launcher.run(
+            Episode("pear", {}, None),
+            {"thinking": False},
+            0,
+            candidate={"cohort_id": "groups", "candidate_id": 1},
+        )
+    )
+    command = result["args"]
+    assert command[command.index("--workflow") + 1] == "pear"
+    assert command[command.index("--world-cord") + 1] == "general"
+    assert "--sam3-endpoint" not in command
+    output = Path(launcher.cfg.tools.rpent.output_dir) / "pear"
+    assert (
+        json.loads((output / "request.json").read_text())["planner"]["thinking"]
+        is False
+    )
+    assert json.loads((output / "sampling-process-cleanup.json").read_text())[
+        "process_exited"
+    ]
+
+
+@pytest.mark.parametrize("version", [7, None])
+def test_pear_keeps_synchronous_version_checks_and_training_turns(make_agent, version):
+    fake = FakeRPent(turns=1)
+    worker = make_agent(fake)
+    worker.cfg.tools.rpent.update(
+        {
+            "workflow": "pear",
+            "entrypoint": "robots.libero_rl.rl_episode",
+            "world_cord": "general",
+            "image_size": 1024,
+            "action_mode": "single",
+            "max_actions_per_call": 3,
+            "perception_mode": "single",
+            "reasoning_history": -1,
+            "image_history": -1,
+        }
+    )
+    worker.cfg.runner.synchronous = True
+    worker.cfg.algorithm.sampling_params.update(
+        {
+            "temperature": 1,
+            "top_p": 1,
+            "top_k": -1,
+            "min_p": 0,
+            "presence_penalty": 0,
+            "repetition_penalty": 1,
+        }
+    )
+    generate = worker.generate
+
+    async def versioned(*args, **kwargs):
+        result = await generate(*args, **kwargs)
+        if version is not None:
+            result.update(version_start=version, version_end=version)
+        return result
+
+    worker.generate = versioned
+    if version is None:
+        with pytest.raises(ValueError, match="installed weight version"):
+            run_query(worker)
+        return
+    result = run_query(worker)
+    assert result.extra_fields["turns"] == 1
+    assert set(result.single_turn_outputs[0].response_weight_versions) == {7}
+    audits = list(
+        Path(worker.cfg.tools.rpent.output_dir).glob("*/training_audit/*.json")
+    )
+    assert len(audits) == 1
+    audit = json.loads(audits[0].read_text())
+    assert audit["weight_version_start"] == audit["weight_version_end"] == 7

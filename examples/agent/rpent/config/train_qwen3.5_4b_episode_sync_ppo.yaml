@@ -1,0 +1,94 @@
+# Full-episode PPO; provide paths and the loopback backend in a local profile.
+defaults:
+  - train_qwen3.5_4b_libero_rl_ppo
+  - _self_
+
+cluster:
+  num_nodes: 2
+  component_placement:
+    actor: 0-15
+    critic: 0-15
+    rollout: 0-15
+    reward: 0-15
+    agentloop: 0-15
+
+runner:
+  experiment_name: rpent-episode-qwen3.5-4b-sync-ppo
+  max_steps: 3
+  save_interval: 1
+  val_check_interval: -1
+  seq_length: 262144
+
+algorithm:
+  n_minibatches: 1
+  sampling_params:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    min_p: 0.0
+    presence_penalty: 0.0
+    repetition_penalty: 1.0
+    max_new_tokens: 32768
+
+data:
+  rollout_batch_size: 256
+
+agentloop:
+  max_turns: 80
+  episode_timeout_s: 7200
+  minimum_output_tokens: 32768
+  chat_template_kwargs:
+    enable_thinking: true
+  history_compaction:
+    max_messages: 80
+    keep_messages: 10
+    context_window: 262144
+    max_fraction: 0.7
+
+tools:
+  rpent:
+    workflow: episode
+    world_cord: base
+    entrypoint: robots.rl.rl_episode
+    repo_path: ???
+    remote_toolkit_endpoint: ???
+    action_mode: batch
+    max_actions_per_call: 3
+    perception_mode: single
+    image_size: 1024
+    reasoning_history: -1
+    image_history: -1
+    libero_type: pro
+    libero_config_path: null
+    sam3_endpoint: null
+    episodes_per_worker: 16
+    max_env_initializations_per_worker: 4
+    store_images_on_disk: true
+    record_api_trace: false
+    keep_episodes: all
+    process_timeout_s: 14400
+
+rollout:
+  env_vars:
+    NCCL_MAX_CTAS: "8"
+  tensor_parallel_size: 1
+  replica_affinity: true
+  sglang:
+    backend_type: server
+
+actor:
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+    NCCL_MAX_CTAS: "8"
+  lr_sched:
+    lr_warmup_fraction: 0.0
+    lr_warmup_iters: 0
+
+critic:
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+    NCCL_MAX_CTAS: "8"
+  update_epochs: 1
+  lr_sched:
+    lr_warmup_fraction: 0.0
+    lr_warmup_iters: 0

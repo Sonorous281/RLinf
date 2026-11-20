@@ -154,6 +154,18 @@ class ReasoningRunner:
 
         self.metric_logger = MetricLogger(cfg)
 
+    def _sampling_batch_size(self) -> int:
+        """Number of dataset entries consumed per rollout cohort."""
+        from rlinf.config import sampling_batch_size
+
+        size = sampling_batch_size(self.cfg)
+        if size != self.cfg.data.rollout_batch_size:
+            raise ValueError(
+                "This runner does not select synchronous candidates; "
+                "use AgentPPORunner for data.sampling_batch_size oversampling."
+            )
+        return size
+
     def _build_dataloader(self, train_dataset, val_dataset, collate_fn=None):
         """
         Creates the train and validation dataloaders.
@@ -178,7 +190,7 @@ class ReasoningRunner:
 
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
-            batch_size=self.cfg.data.rollout_batch_size
+            batch_size=self._sampling_batch_size()
             * self.cfg.algorithm.get("max_num_gen_batches", 1),
             num_workers=num_workers,
             drop_last=True,
@@ -470,15 +482,17 @@ class ReasoningRunner:
         # self.rollout here is always 'sync' mode (cpu/None weight_reload is only
         # used by separate judge/eval rollouts), so this is unconditional.
         if do_offload:
-            self.actor.sync_model_to_rollout()
+            actor_sync_handle = self.actor.sync_model_to_rollout()
         else:
-            self.actor.sync_model_to_rollout(do_offload=False)
+            actor_sync_handle = self.actor.sync_model_to_rollout(do_offload=False)
         # Only the SGLang backend tracks published weight versions; other
         # backends keep their argument-less signature.
         if weight_version is None:
             self.rollout.sync_model_from_actor().wait()
         else:
             self.rollout.sync_model_from_actor(version=weight_version).wait()
+        # The receiver acknowledgement can precede the sender's final offload.
+        actor_sync_handle.wait()
         self.actor.del_reshard_state_dict().wait()
         # KV cache + cudagraph were deferred (only weights resumed) to avoid OOM;
         # mirrors the offload condition — pure disaggregated never offloads them.
