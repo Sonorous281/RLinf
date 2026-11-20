@@ -41,8 +41,10 @@ from rlinf.config import shared_multi_modal_processor_enabled
 from rlinf.data.schema.reasoning_requests import get_seq_length
 from rlinf.data.schema.reasoning_results import DynamicRolloutResult
 from rlinf.hybrid_engines.megatron.utils import (
+    align_next_token_scores,
     output_layer_positions,
     preprocess_packed_seqs,
+    supports_fp32_output,
 )
 from rlinf.scheduler import Channel
 from rlinf.utils.data_iter_utils import (
@@ -253,8 +255,7 @@ class MAMegatronActor(MegatronActor):
             logits_processor_args = {"label": label, "label_mask": label_mask}
 
             forward_options = {}
-            if chunked_logprobs:
-                # Keep the vocabulary tensor in BF16; scale only FP32 chunks.
+            if chunked_logprobs and supports_fp32_output(model):
                 forward_options["fp32_output"] = False
 
             positions = (
@@ -293,18 +294,12 @@ class MAMegatronActor(MegatronActor):
 
                 # in last stage need to get the log_probs from the output
                 if unwrap_model(model).post_process:
-                    output = output["log_probs"]
-                    output = output.clone()
-                    output[:, 1:] = output[:, :-1].clone()
-                    output[:, 0] = 0.0  # first token has no previous token
+                    output = align_next_token_scores(output["log_probs"])
 
                 return output, id_func
 
             def loss_func(output):
-                curr_logprobs_ori = output["log_probs"]
-                curr_logprobs = curr_logprobs_ori.clone()
-                curr_logprobs[:, 1:] = curr_logprobs_ori[:, :-1].clone()
-                curr_logprobs[:, 0] = 0.0  # first token has no previous token
+                curr_logprobs = align_next_token_scores(output["log_probs"])
 
                 advantages = batch["advantages"]
                 advantages *= batch["loss_scales"]
@@ -348,7 +343,7 @@ class MAMegatronActor(MegatronActor):
 
                 entropy_loss = torch.zeros(1, device=loss.device)
                 if self.calculate_entropy:
-                    entropy = output["entropy"]
+                    entropy = align_next_token_scores(output["entropy"])
                     entropy_loss = self.loss_agg_func(entropy, mask=mask)
                     if self.calculate_entropy_loss:
                         loss = loss - self.cfg.algorithm.entropy_bonus * entropy_loss

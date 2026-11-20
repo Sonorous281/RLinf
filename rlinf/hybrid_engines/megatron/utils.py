@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from contextlib import contextmanager
 from typing import Optional
 
@@ -23,6 +24,20 @@ try:
 
 except (ImportError, ModuleNotFoundError) as e:
     raise ImportError("Megatron core was not found.") from e
+
+
+def align_next_token_scores(scores: torch.Tensor) -> torch.Tensor:
+    """Move each prediction to the token it scores, after unpacking trajectory rows."""
+    return torch.nn.functional.pad(scores[..., :-1], (1, 0))
+
+
+def supports_fp32_output(model: torch.nn.Module) -> bool:
+    """Core 0.13 forwards unknown kwargs to GPT; newer precision wrappers consume this one."""
+    while hasattr(model, "module"):
+        if "fp32_output" in inspect.signature(type(model).forward).parameters:
+            return True
+        model = model.module
+    return False
 
 
 def _resolve_output_layer(module: torch.nn.Module) -> torch.nn.Module:

@@ -667,7 +667,15 @@ Megatron 智能体训练使用动态批次时，将 ``actor.logprob_chunk_size``
 
 Qwen3.5 MBridge Actor 还可以在词表投影时节省显存。将 ``actor.model.lm_head_chunk_size`` 设为每块的 token 数（如 256），Actor 会分块投影解码器的隐状态，反向传播时再逐块重算。此模式要求使用动态批次、PP1 和 CP1。Qwen3.5 训练时默认关闭多 token 预测。熵可以作为指标记录，熵奖励系数须为零。分块大小默认为 0，沿用模型原有的输出层。
 
-长提示词的打包批次还可以设置 ``actor.response_only_logits: true``，只对预测回复 token 的位置做投影。此选项要求 CP1，默认关闭。启用分块词表投影时，如果关闭熵计算，输出层会自动选择回复位置；记录熵则需要对所有位置做投影。
+长提示词的打包批次还可以设置 ``actor.response_only_logits: true``，只对预测回复 token 的位置做投影。此选项要求 CP1，默认关闭。分块词表投影在关闭熵计算时自动选择回复位置，在记录熵时计算所有位置。
+
+在 RLinf 训练环境中，从仓库根目录运行以下命令，即可用一张 CUDA GPU 对比词表投影的显存开销：
+
+.. code-block:: bash
+
+   PYTHONPATH=. python tests/unit_tests/bench_lm_head.py --tokens 4096 --chunk-size 256
+
+脚本先分别预热两种投影，再输出 BF16 前向和反向传播期间的峰值显存（GiB）。两组使用相同的合成输入，全部 4,096 个 token 都参与打分。这里仅测输出层，下表的完整 Actor 更新还包含解码器和训练状态。
 
 下表是 Qwen3.5-4B BF16 Actor 在 80 GiB A100 上完成一次更新时的单卡峰值显存，取各卡 PyTorch 已分配显存的最高值。各组均使用 PyTorch 2.11.0+cu128 和 Megatron Core 0.18.0，只对回复 token 打分。两组文本样本均使用单卡，开启分块时每块 32 个 token。长样本来自一条含 6 张图的 RPent 轨迹，使用两张卡、TP2 和序列并行，开启分块时每块 256 个 token。启用 ``actor.model.gradient_accumulation_fusion`` 后，Apex CUDA 算子将梯度累加到 Megatron 已分配的 FP32 缓冲区。
 
