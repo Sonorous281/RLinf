@@ -94,7 +94,7 @@
    * - ``image_spans``
      - 每张真实图片的半开区间 [start, end)，不含两端的视觉分隔符。
    * - ``image_grid_thw``
-     - 形状为 [图片数, 3] 的整数张量，按图片顺序记录时间、高、宽三个维度。
+     - 每张图片对应一行，三列依次记录时间、高度和宽度方向的网格数。
    * - ``mrope_positions``
      - 形状为 [3, prompt 长度] 的整数张量，覆盖整个 prompt。
    * - ``mrope_position_delta``

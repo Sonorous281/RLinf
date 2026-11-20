@@ -263,6 +263,8 @@ actor
   actor:
     training_backend: megatron
     mcore_gpt: True
+    logprob_chunk_size: 0
+    response_only_logits: False
     spec_name: decoder_gpt
 
     offload_optimizer: True
@@ -275,6 +277,7 @@ actor
 
     model:
       precision: fp16
+      lm_head_chunk_size: 0
       add_bias_linear: False
 
       tensor_model_parallel_size: 1
@@ -409,6 +412,10 @@ actor
      - Enable data-parallel load balancing.
    * - ``actor.calculate_flops``
      - Compute and log FLOPs for profiling.
+   * - ``actor.logprob_chunk_size``
+     - Positions per vocabulary softmax chunk (nonnegative integer). With response-only projection and entropy disabled, zero uses chunks of 256 positions. See :doc:`actor_logprob_memory` for the other options and benchmark.
+   * - ``actor.response_only_logits``
+     - Project only positions that predict response tokens. Requires context parallel size 1.
    * - ``actor.seed``
      - Global seed for reproducibility.
 
@@ -420,6 +427,8 @@ actor
 
    * - Parameter
      - Description
+   * - ``actor.model.lm_head_chunk_size``
+     - Positions per output projection chunk (nonnegative integer). Applies to Qwen3.5 with MBridge.
    * - ``actor.model.precision``
      - Numerical precision for training (e.g., ``fp16``).
    * - ``actor.model.add_bias_linear``
@@ -664,95 +673,3 @@ reward
    * - ``reward.reward_scale``
      - A correct answer receives ``reward_scale``; an incorrect one receives
        ``-reward_scale``.
-
-Reduce Logprob Memory
----------------------
-
-For Megatron agent training with dynamic batches, set ``actor.logprob_chunk_size``
-to a positive value to compute vocabulary softmax in token chunks. The backward
-pass recomputes each chunk instead of retaining the full FP32 softmax output.
-Disable entropy calculation when setting a positive chunk size.
-At the default value of 0, dense projection uses one softmax pass unless
-response-only scoring is enabled with entropy off. That mode uses 256-token chunks.
-
-Add these settings to your agent training config:
-
-.. code-block:: yaml
-
-   actor:
-     logprob_chunk_size: 256
-   algorithm:
-     calculate_entropy: false
-     entropy_bonus: 0.0
-
-A chunk size of 256 limits each softmax chunk to 256 sequence positions.
-The model still produces the full vocabulary logits; this setting does not
-chunk the vocabulary projection. Smaller chunks trade more computation for
-smaller temporary tensors. Measure peak GPU memory and step time on your workload
-before choosing a chunk size.
-
-To train the Actor from a public Qwen3.5 checkpoint, use a version that includes
-the checkpoint loading changes from
-`PR #1862 <https://github.com/RLinf/RLinf/pull/1862>`_. The standalone projection
-benchmark below runs without a checkpoint.
-
-To reduce memory in the projection itself on a Qwen3.5 MBridge Actor, set
-``actor.model.lm_head_chunk_size`` to a positive token count, such as 256.
-The Actor projects one chunk of decoder states at a time and recomputes that
-chunk during backpropagation. This mode requires dynamic batches, PP1, CP1
-and ``actor.model.load_mtp: false``. Keep ``algorithm.entropy_bonus`` at zero. You can still log entropy. A chunk size of 0 keeps the model's default output layer.
-
-For packed batches with long prompts, ``actor.response_only_logits: true``
-projects only positions that predict response tokens. This option requires context parallel size 1 and defaults to false.
-A chunked LM head already selects response positions when entropy is disabled.
-The chunked LM head scores every position when logging entropy.
-
-To compare projection memory on one CUDA GPU, run this command from the
-repository root in your RLinf training environment:
-
-.. code-block:: bash
-
-   PYTHONPATH=. python tests/unit_tests/bench_lm_head.py --tokens 4096 --chunk-size 256
-
-The script warms up each mode once, then reports peak allocated GPU memory in
-GiB for the BF16 forward and backward passes. Both modes score all 4,096 tokens
-in the same synthetic input. The benchmark covers the output layer alone.
-The Actor measurements below include the decoder and training state.
-
-Each value is the highest peak memory allocation that PyTorch recorded on
-any GPU during one Qwen3.5-4B BF16 Actor update. The runs used 80 GiB A100s,
-PyTorch 2.11.0+cu128 and Megatron Core 0.18.0, and scored only response tokens.
-The two text samples ran on one GPU with 32-token projection chunks when enabled.
-The six-image RPent sample ran on two GPUs with TP2, sequence parallelism and
-256-token chunks when enabled. Fusion uses
-``actor.model.gradient_accumulation_fusion`` and the Apex CUDA extension to
-accumulate gradients into Megatron's existing FP32 buffer.
-
-.. list-table:: LM head projection and peak memory per GPU (GiB)
-   :header-rows: 1
-
-   * - Total / scored tokens
-     - Dense
-     - Dense + fusion
-     - Chunked
-     - Chunked + fusion
-   * - 512 / 256
-     - 43.57
-     - 44.66
-     - 44.93
-     - 43.73
-   * - 2,048 / 1,024
-     - 51.42
-     - 52.86
-     - 52.19
-     - 51.03
-   * - 23,095 / 12,303
-     - 33.33
-     - 34.06
-     - 24.60
-     - 24.74
-
-With fusion disabled, chunking used 1.36 GiB more at 512 tokens and 0.77 GiB
-more at 2,048 tokens. On the long sample it saved 8.73 GiB per GPU.
-Measure the peak on a representative batch before enabling chunking for short
-sequences.

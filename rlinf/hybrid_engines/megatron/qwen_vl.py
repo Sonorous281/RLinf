@@ -14,12 +14,63 @@
 
 """Bridge Qwen-VL output adapter for response-token scoring."""
 
+import math
 from functools import partial
 
 import torch
 import torch.distributed as dist
+from omegaconf import DictConfig, OmegaConf
 
 from .lm_head import chunked_vocab_parallel_log_probs
+
+
+def validate_qwen_vl_chunked_cfg(cfg: DictConfig) -> None:
+    """Validate the experimental Qwen3.5 Actor mode before model initialization."""
+    size = cfg.actor.model.get("lm_head_chunk_size", 0)
+    if type(size) is not int or size < 0:
+        raise ValueError(
+            f"actor.model.lm_head_chunk_size must be a nonnegative integer, got {size!r}"
+        )
+    if size == 0:
+        return
+    if cfg.actor.get("training_backend") != "megatron" or not OmegaConf.select(
+        cfg, "agentloop.is_dynamic_rollout_batch", default=False
+    ):
+        raise ValueError(
+            "Chunked LM-head scoring requires a dynamic-batch Megatron Actor"
+        )
+    if (
+        not cfg.actor.megatron.get("mbridge", False)
+        or cfg.actor.model.model_type != "qwen3_5"
+    ):
+        raise ValueError("Qwen-VL chunked scoring requires MBridge Qwen3.5")
+    if (
+        cfg.actor.model.pipeline_model_parallel_size != 1
+        or cfg.actor.model.get("context_parallel_size", 1) != 1
+    ):
+        raise ValueError("Qwen-VL chunked scoring currently requires PP1 and CP1")
+    if cfg.algorithm.get("entropy_bonus", 0) != 0:
+        raise ValueError(
+            "Qwen-VL chunked scoring supports entropy metrics only; entropy_bonus must be zero"
+        )
+    if cfg.actor.model.get("load_mtp", True):
+        raise ValueError("Qwen-VL chunked scoring requires actor.model.load_mtp=False")
+    for option in (
+        "fp8",
+        "mtp_num_layers",
+        "defer_embedding_wgrad_compute",
+        "use_mup",
+        "enable_autocast",
+    ):
+        if cfg.actor.model.get(option, None):
+            raise ValueError(
+                f"Qwen-VL chunked scoring does not support actor.model.{option}"
+            )
+    temperature = cfg.algorithm.sampling_params.temperature
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError(
+            "Qwen-VL chunked scoring requires a finite positive temperature"
+        )
 
 
 def forward_qwen_vl_with_chunked_log_probs(

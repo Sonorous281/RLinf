@@ -2087,20 +2087,29 @@ def _validate_steam_ensemble_cfg(actor_cfg: DictConfig) -> None:
 
 
 def validate_reasoning_cfg(cfg: DictConfig) -> DictConfig:
-    logprob_chunk_size = cfg.actor.get("logprob_chunk_size", 0)
-    if type(logprob_chunk_size) is not int or logprob_chunk_size < 0:
+    chunk_size = cfg.actor.get("logprob_chunk_size", 0)
+    response_only = cfg.actor.get("response_only_logits", False)
+    if type(chunk_size) is not int or chunk_size < 0:
         raise ValueError("actor.logprob_chunk_size must be a nonnegative integer")
-    if logprob_chunk_size and (
+    if not isinstance(response_only, bool):
+        raise ValueError("actor.response_only_logits must be a boolean")
+    if (chunk_size or response_only) and (
         cfg.actor.training_backend != "megatron"
         or not OmegaConf.select(
             cfg, "agentloop.is_dynamic_rollout_batch", default=False
         )
-        or cfg.algorithm.get("calculate_entropy", False)
+    ):
+        raise ValueError(
+            "Actor logprob chunking and response-only scoring require a dynamic Megatron agent batch"
+        )
+    if response_only and cfg.actor.model.get("context_parallel_size", 1) != 1:
+        raise ValueError("actor.response_only_logits requires context_parallel_size=1")
+    if chunk_size and (
+        cfg.algorithm.get("calculate_entropy", False)
         or cfg.algorithm.get("entropy_bonus", 0) != 0
     ):
         raise ValueError(
-            "actor.logprob_chunk_size requires a dynamic Megatron agent batch "
-            "with entropy calculation disabled"
+            "actor.logprob_chunk_size requires entropy calculation and entropy bonus to be disabled"
         )
     assert cfg.algorithm.recompute_logprobs or cfg.rollout.return_logprobs, (
         "One of `algorithm.recompute_logprobs` or `rollout.return_logprobs` must be True to compute `prev_logprobs`."
@@ -2563,56 +2572,6 @@ def adv_requires_group_baseline(
     return False
 
 
-def validate_qwen_vl_chunked_cfg(cfg) -> int:
-    """Validate the experimental Qwen3.5 Actor mode before model initialization."""
-    size = cfg.actor.model.get("lm_head_chunk_size", 0)
-    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
-        raise ValueError(
-            f"actor.model.lm_head_chunk_size must be a nonnegative integer, got {size!r}"
-        )
-    if size == 0:
-        return 0
-    if cfg.actor.get("training_backend") != "megatron" or not OmegaConf.select(
-        cfg, "agentloop.is_dynamic_rollout_batch", default=False
-    ):
-        raise ValueError(
-            "Chunked LM-head scoring requires a dynamic-batch Megatron Actor"
-        )
-    if (
-        not cfg.actor.megatron.get("mbridge", False)
-        or cfg.actor.model.model_type != "qwen3_5"
-    ):
-        raise ValueError("Qwen-VL chunked scoring requires MBridge Qwen3.5")
-    if (
-        cfg.actor.model.pipeline_model_parallel_size != 1
-        or cfg.actor.model.get("context_parallel_size", 1) != 1
-    ):
-        raise ValueError("Qwen-VL chunked scoring currently requires PP1 and CP1")
-    if cfg.algorithm.calculate_entropy and cfg.algorithm.entropy_bonus != 0:
-        raise ValueError(
-            "Qwen-VL chunked scoring supports entropy metrics only; entropy_bonus must be zero"
-        )
-    if cfg.actor.model.get("load_mtp", True):
-        raise ValueError("Qwen-VL chunked scoring requires actor.model.load_mtp=False")
-    for option in (
-        "fp8",
-        "mtp_num_layers",
-        "defer_embedding_wgrad_compute",
-        "use_mup",
-        "enable_autocast",
-    ):
-        if cfg.actor.model.get(option, None):
-            raise ValueError(
-                f"Qwen-VL chunked scoring does not support actor.model.{option}"
-            )
-    temperature = cfg.algorithm.sampling_params.temperature
-    if not math.isfinite(temperature) or temperature <= 0:
-        raise ValueError(
-            "Qwen-VL chunked scoring requires a finite positive temperature"
-        )
-    return size
-
-
 def validate_multimodal_learner_cfg(cfg: DictConfig) -> None:
     """Validate per-rank image cache and prefetch budgets for agent learners."""
     for role in ("actor", "critic"):
@@ -2765,7 +2724,12 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
             cfg.critic = validate_fsdp_cfg(cfg.critic)
 
     if cfg.runner.task_type == "reasoning":
-        validate_qwen_vl_chunked_cfg(cfg)
+        if "lm_head_chunk_size" in cfg.actor.model:
+            from rlinf.hybrid_engines.megatron.qwen_vl import (
+                validate_qwen_vl_chunked_cfg,
+            )
+
+            validate_qwen_vl_chunked_cfg(cfg)
         validate_multimodal_learner_cfg(cfg)
         cfg = validate_searchr1_cfg(cfg)
 

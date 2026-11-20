@@ -254,6 +254,8 @@ actor
   actor:
     training_backend: megatron
     mcore_gpt: True
+    logprob_chunk_size: 0
+    response_only_logits: False
     spec_name: decoder_gpt
 
     offload_optimizer: True
@@ -266,6 +268,7 @@ actor
 
     model:
       precision: fp16
+      lm_head_chunk_size: 0
       add_bias_linear: False
 
       tensor_model_parallel_size: 1
@@ -400,6 +403,10 @@ actor
      - 启用数据并行负载均衡。
    * - ``actor.calculate_flops``
      - 计算并记录 FLOPs 以供性能分析。
+   * - ``actor.logprob_chunk_size``
+     - 每次计算词表 softmax 的位置数，取非负整数。设为 0 时，如果开启 ``response_only_logits`` 并关闭熵计算，默认每块 256 个位置。选项对比和实测数据见 :doc:`actor_logprob_memory`。
+   * - ``actor.response_only_logits``
+     - 只在预测回复 token 的位置计算输出层投影。要求上下文并行度为 1。
    * - ``actor.seed``
      - 用于可复现性的全局随机种子。
 
@@ -411,6 +418,8 @@ actor
 
    * - 参数
      - 说明
+   * - ``actor.model.lm_head_chunk_size``
+     - 输出层每次投影的位置数，取非负整数。适用于使用 MBridge 的 Qwen3.5。
    * - ``actor.model.precision``
      - 训练的数值精度（例如 ``fp16``）。
    * - ``actor.model.add_bias_linear``
@@ -647,62 +656,3 @@ reward
      - 训练使用的奖励类型（例如 ``math``）。
    * - ``reward.reward_scale``
      - 答案正确时获得 ``reward_scale``；错误时获得 ``-reward_scale``。
-
-降低 Logprob 计算的显存开销
-----------------------------------------
-
-Megatron 智能体训练使用动态批次时，将 ``actor.logprob_chunk_size`` 设为正数，可按 token 分块计算词表 softmax。反向传播时重新计算各块，无需保留完整的 FP32 softmax 结果。块大小设为正数时，需要关闭熵计算。保留默认值 0 时，常规投影一次算完 softmax。如果只对回复打分且关闭熵计算，默认按 256 个 token 分块计算 softmax。
-
-在智能体训练配置中添加：
-
-.. code-block:: yaml
-
-   actor:
-     logprob_chunk_size: 256
-   algorithm:
-     calculate_entropy: false
-     entropy_bonus: 0.0
-
-块大小为 256 时，每次 softmax 处理最多 256 个序列位置。模型仍会生成完整词表 logits，这个设置不会对词表投影分块。减小块大小可以降低临时张量的显存占用，但会增加计算开销。在实际任务上测量峰值显存和单步耗时，再选择块大小。
-
-用公开的 Qwen3.5 权重训练 Actor，先确认所用版本包含\ `PR #1862 <https://github.com/RLinf/RLinf/pull/1862>`_\ 的权重加载改动。下方的词表投影显存测试无需模型权重。
-
-Qwen3.5 MBridge Actor 还可以在词表投影时节省显存。将 ``actor.model.lm_head_chunk_size`` 设为每块的 token 数（如 256），Actor 会分块投影解码器的隐状态，反向传播时再逐块重算。此模式要求使用动态批次、PP1、CP1，并设置 ``actor.model.load_mtp: false``\。熵可以作为指标记录，熵奖励系数须为零。分块大小默认为 0，沿用模型原有的输出层。
-
-长提示词的打包批次还可以设置 ``actor.response_only_logits: true``，只对预测回复 token 的位置做投影。此选项要求 CP1，默认关闭。分块词表投影在关闭熵计算时自动选择回复位置，在记录熵时计算所有位置。
-
-在 RLinf 训练环境中，从仓库根目录运行以下命令，即可用一张 CUDA GPU 对比词表投影的显存开销：
-
-.. code-block:: bash
-
-   PYTHONPATH=. python tests/unit_tests/bench_lm_head.py --tokens 4096 --chunk-size 256
-
-脚本先分别预热两种投影，再输出 BF16 前向和反向传播期间的峰值显存（GiB）。两组使用相同的合成输入，全部 4,096 个 token 都参与打分。这里仅测输出层，下表的完整 Actor 更新还包含解码器和训练状态。
-
-下表是 Qwen3.5-4B BF16 Actor 在 80 GiB A100 上完成一次更新时的单卡峰值显存，取各卡 PyTorch 已分配显存的最高值。各组均使用 PyTorch 2.11.0+cu128 和 Megatron Core 0.18.0，只对回复 token 打分。两组文本样本均使用单卡，开启分块时每块 32 个 token。长样本来自一条含 6 张图的 RPent 轨迹，使用两张卡、TP2 和序列并行，开启分块时每块 256 个 token。启用 ``actor.model.gradient_accumulation_fusion`` 后，Apex CUDA 算子将梯度累加到 Megatron 已分配的 FP32 缓冲区。
-
-.. list-table:: 不同词表投影方式的单卡峰值显存（GiB）
-   :header-rows: 1
-
-   * - 总 token 数 / 打分 token 数
-     - 常规投影
-     - 常规投影＋融合
-     - 分块投影
-     - 分块投影＋融合
-   * - 512 / 256
-     - 43.57
-     - 44.66
-     - 44.93
-     - 43.73
-   * - 2,048 / 1,024
-     - 51.42
-     - 52.86
-     - 52.19
-     - 51.03
-   * - 23,095 / 12,303
-     - 33.33
-     - 34.06
-     - 24.60
-     - 24.74
-
-关闭融合时，分块使 512 和 2,048 个 token 的文本样本分别多用 1.36 和 0.77 GiB 显存，长样本的单卡峰值则下降了 8.73 GiB。短序列建议先用实际训练批次测量，再决定是否开启。

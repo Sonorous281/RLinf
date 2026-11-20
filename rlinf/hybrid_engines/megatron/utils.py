@@ -98,7 +98,7 @@ def align_next_token_scores(scores: torch.Tensor) -> torch.Tensor:
 
 
 def supports_fp32_output(model: torch.nn.Module) -> bool:
-    """Core 0.13 forwards unknown kwargs to GPT; newer precision wrappers consume this one."""
+    """Return whether a precision wrapper accepts fp32_output before dispatch to GPT."""
     while hasattr(model, "module"):
         if "fp32_output" in inspect.signature(type(model).forward).parameters:
             return True
