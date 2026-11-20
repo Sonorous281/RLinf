@@ -690,6 +690,9 @@ This setting applies after the vocabulary projection. Smaller chunks use less
 temporary memory and can increase step time. Measure both on your workload
 before choosing a chunk size.
 
+This branch supports loading public Qwen3.5 checkpoints for Actor training.
+The standalone projection benchmark below runs without a checkpoint.
+
 To reduce memory in the projection itself on a Qwen3.5 MBridge Actor, set
 ``actor.model.lm_head_chunk_size`` to a positive token count, such as 256.
 The Actor projects one chunk of decoder states at a time and recomputes that

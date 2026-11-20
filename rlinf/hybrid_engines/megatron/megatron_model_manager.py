@@ -805,6 +805,8 @@ class MegatronModelManager:
         """
         pre_process = unwrap_model(model).pre_process
         post_process = unwrap_model(model).post_process
+        # Earlier pipeline stages return hidden states for the next stage.
+        scale_logits = post_process and temperature != 1.0
         if scoring_forward is not None and (
             value_model or logits_processor is None or not pack_seqs
         ):
@@ -887,7 +889,8 @@ class MegatronModelManager:
                     )
                 else:
                     output_orig = model(**model_inputs)
-                    output_orig /= temperature
+                    if scale_logits:
+                        output_orig /= temperature
             if post_process and logits_processor is not None:
                 if scoring_forward is not None:
                     output_dict = output_orig
@@ -929,7 +932,8 @@ class MegatronModelManager:
                 position_ids=new_position_ids,
                 **model_forward_kwargs,
             )
-            output_orig /= temperature
+            if scale_logits:
+                output_orig /= temperature
             if post_process and logits_processor is not None:
                 args = {
                     k: tensor_rm_left_padding(v, attention_mask, sequence_parallel)

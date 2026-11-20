@@ -18,55 +18,159 @@ import pytest
 import torch
 
 
-def test_response_only_logits_match_full_logits_at_scored_positions():
-    pytest.importorskip("megatron.training")
-    from rlinf.hybrid_engines.megatron.utils import (
-        align_next_token_scores,
-        output_layer_positions,
-    )
-    from rlinf.workers.actor.ma_megatron_actor_worker import _at_positions
+class _DecoderStage(torch.nn.Module):
+    pre_process = post_process = True
 
-    torch.manual_seed(0)
-    module = torch.nn.Module()
-    module.output_layer = torch.nn.Linear(4, 7)
-    hidden = torch.randn(6, 1, 4)  # [tokens, batch, hidden]
-    positions = torch.tensor([0, 2, 4])
-    full = module.output_layer(hidden)
-    with output_layer_positions(module, positions):
-        partial = module.output_layer(hidden)
-    torch.testing.assert_close(partial, full.index_select(0, positions))
-    torch.testing.assert_close(module.output_layer(hidden), full)
+    def __init__(self):
+        super().__init__()
+        self.output_layer = torch.nn.Linear(3, 3, bias=False)
+        with torch.no_grad():
+            self.output_layer.weight.copy_(torch.diag(torch.tensor([1.0, 2.0, 3.0])))
 
-    def logprobs(logits, label, label_mask):
-        values = logits.log_softmax(-1).gather(-1, label.unsqueeze(-1)).squeeze(-1)
-        return {
-            "log_probs": values.masked_fill(~label_mask, 0.0),
-            "entropy": -(logits.softmax(-1) * logits.log_softmax(-1)).sum(-1),
-        }
-
-    label = torch.randint(0, 7, (1, 6))
-    response_mask = torch.tensor([[False, True, False, True, False, True]])
-    label_mask = torch.nn.functional.pad(response_mask[:, 1:], (0, 1))
-    dense = logprobs(full.transpose(0, 1), label, label_mask)
-    sparse = _at_positions(logprobs, positions)(
-        partial.transpose(0, 1), label, label_mask
-    )
-    # A response token consumes the distribution at the preceding position.
-    expected = dense["entropy"][:, positions].mean()
-    for scores in (dense, sparse):
-        entropy = align_next_token_scores(scores["entropy"])[response_mask].mean()
-        log_probs = align_next_token_scores(scores["log_probs"])[response_mask].mean()
-        loss = -log_probs - 0.1 * entropy
-        reference = -dense["log_probs"][:, positions].mean() - 0.1 * expected
-        torch.testing.assert_close(entropy, expected)
-        torch.testing.assert_close(loss, reference)
-        torch.testing.assert_close(
-            torch.autograd.grad(loss, module.output_layer.weight, retain_graph=True)[0],
-            torch.autograd.grad(
-                reference, module.output_layer.weight, retain_graph=True
-            )[0],
+    def forward(self, input_ids, attention_mask, position_ids, packed_seq_params):
+        hidden = torch.nn.functional.one_hot(input_ids.T, 3).to(
+            self.output_layer.weight
         )
-    assert sparse["log_probs"][~label_mask].count_nonzero() == 0
+        if not self.post_process:
+            return hidden
+        return self.output_layer(hidden).transpose(0, 1).contiguous()
+
+
+@pytest.fixture
+def scoring_actor(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    pytest.importorskip("megatron.training")
+    import torch.distributed as dist
+    from megatron.core import parallel_state
+    from omegaconf import OmegaConf
+
+    from rlinf.utils.utils import masked_mean
+    from rlinf.workers.actor.ma_megatron_actor_worker import MAMegatronActor
+
+    actor = MAMegatronActor.__new__(MAMegatronActor)
+    actor.cfg = OmegaConf.create(
+        {
+            "runner": {"task_type": "reasoning"},
+            "actor": {"model": {"encoder_seq_length": 4}},
+            "algorithm": {
+                "sampling_params": {"temperature": 0.5},
+                "loss_type": "actor",
+                "entropy_bonus": 0.1,
+                "use_valid_token_scale": False,
+                "early_stop_imp_ratio": None,
+            },
+        }
+    )
+    actor.transformer_config = SimpleNamespace(sequence_parallel=False)
+    actor.tokenizer = SimpleNamespace(eos_token_id=0)
+    actor.lm_head_chunk_size = 0
+    actor.scoring_forward = None
+    actor.clip_ratio_c, actor.clip_ratio_low, actor.clip_ratio_high = 3.0, 0.2, 0.2
+    actor.kl_beta = 0.0
+    actor.loss_agg_func = masked_mean
+    actor.torch_device_type = "cpu"
+    monkeypatch.setattr(actor, "_forward_multimodal_inputs", lambda batch: {})
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+    ids = torch.tensor([[0, 1, 2, 1]])
+    batch = {
+        "input_ids": ids,
+        "response_mask": torch.tensor([[False, True, False, True]]),
+        "advantages": torch.ones_like(ids, dtype=torch.float),
+        "loss_scales": torch.ones_like(ids, dtype=torch.float),
+        "rollout_logprobs": torch.zeros_like(ids, dtype=torch.float),
+    }
+    batch.update(
+        attention_mask=torch.ones_like(ids, dtype=torch.bool),
+        position_ids=torch.arange(4)[None],
+    )
+    dist.init_process_group(
+        "gloo", init_method=(tmp_path / "pg").as_uri(), rank=0, world_size=1
+    )
+    try:
+        for name in (
+            "_TENSOR_MODEL_PARALLEL_GROUP",
+            "_DATA_PARALLEL_GROUP",
+            "_CONTEXT_PARALLEL_GROUP",
+        ):
+            monkeypatch.setattr(parallel_state, name, dist.group.WORLD)
+        yield actor, batch
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("response_only", [False, True])
+def test_actor_entropy_bonus_uses_response_predictors(scoring_actor, response_only):
+    actor, batch = scoring_actor
+    actor.response_only_logits = response_only
+    actor.calculate_entropy = actor.calculate_entropy_loss = actor.return_loss = True
+    model = _DecoderStage()
+    # Responses at 1 and 3 are predicted from tokens 0 and 2.
+    logits = (
+        model.output_layer.weight.T[[0, 2]]
+        / actor.cfg.algorithm.sampling_params.temperature
+    )
+    logp = logits.log_softmax(-1)
+    selected = logp[:, 1]
+    old = selected.detach()
+    batch["rollout_logprobs"][0][[1, 3]] = old
+    scores, loss_fn = actor.get_forward_step_func()(iter([batch]), model)
+    loss, metrics = loss_fn(scores)
+    expected_entropy = -(logp.exp() * logp).sum(-1).mean()
+    expected_loss = (
+        -(selected - old).exp().mean()
+        - actor.cfg.algorithm.entropy_bonus * expected_entropy
+    )
+    torch.testing.assert_close(
+        metrics["actor/entropy_loss"].squeeze(), expected_entropy
+    )
+    torch.testing.assert_close(loss, expected_loss)
+    weight = model.output_layer.weight
+    torch.testing.assert_close(
+        torch.autograd.grad(loss, weight)[0],
+        torch.autograd.grad(expected_loss, weight)[0],
+    )
+
+
+def test_actor_passes_hidden_states_between_stages_unscaled(scoring_actor):
+    actor, batch = scoring_actor
+    actor.response_only_logits = actor.calculate_entropy = actor.return_loss = False
+    model = _DecoderStage()
+    model.post_process = False
+    hidden, _ = actor.get_forward_step_func()(iter([batch]), model)
+    expected = torch.nn.functional.one_hot(torch.tensor([0, 1, 2, 1]), 3).float()
+    torch.testing.assert_close(hidden[:, 0], expected)
+
+
+def test_actor_uses_wrapper_precision_argument_when_supported(scoring_actor):
+    actor, batch = scoring_actor
+    actor.response_only_logits = True
+    actor.calculate_entropy = actor.return_loss = False
+
+    class LegacyWrapper(torch.nn.Module):
+        pre_process = post_process = True
+
+        def __init__(self):
+            super().__init__()
+            self.module = _DecoderStage().bfloat16()
+
+        @property
+        def output_layer(self):
+            return self.module.output_layer
+
+        def forward(self, **kwargs):
+            return self.module(**kwargs)
+
+    class PrecisionWrapper(LegacyWrapper):
+        def forward(self, fp32_output=True, **kwargs):
+            assert fp32_output is False
+            return super().forward(**kwargs)
+
+    for wrapper in (LegacyWrapper, PrecisionWrapper):
+        scores, collect = actor.get_forward_step_func()(iter([batch]), wrapper())
+        row = collect(scores)[0]
+        expected = (torch.diag(torch.tensor([1.0, 2.0, 3.0])) * 2).log_softmax(-1)
+        torch.testing.assert_close(row[[1, 3]], expected[[0, 2], 1])
 
 
 def _assert_chunked_sao_gradients(rank, dtype, temperature):
@@ -583,29 +687,3 @@ def test_chunked_actor_scores_variable_length_rows(monkeypatch):
     }
     output, collect = actor.get_forward_step_func()(iter([batch]), model)
     assert collect(output).tolist() == [[0, 2, 0], [0, 0, 0], [0, 6, 0]]
-
-
-def test_fp32_output_only_reaches_wrappers_that_consume_it():
-    pytest.importorskip("megatron.core")
-    from rlinf.hybrid_engines.megatron.utils import supports_fp32_output
-
-    class Wrapper(torch.nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
-
-        def forward(self, *args, **kwargs):
-            return self.module(*args, **kwargs)
-
-    class PrecisionWrapper(Wrapper):
-        def forward(self, *args, fp32_output=True, **kwargs):
-            result = super().forward(*args, **kwargs)
-            return result.float() if fp32_output else result
-
-    inputs = torch.ones(1, dtype=torch.bfloat16)
-    for wrapper in (Wrapper, PrecisionWrapper):
-        model = Wrapper(wrapper(torch.nn.Identity()))
-        supported = supports_fp32_output(model)
-        assert supported == (wrapper is PrecisionWrapper)
-        kwargs = {"fp32_output": False} if supported else {}
-        assert model(inputs, **kwargs).dtype == inputs.dtype
