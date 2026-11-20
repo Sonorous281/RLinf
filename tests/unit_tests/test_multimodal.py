@@ -97,7 +97,7 @@ def test_image_prefetch_propagates_failure_and_joins_threads(failure):
         prefetch_bytes=1 if failure == "budget" else 4096,
     )
     error = {
-        "prepare": "requires a captured image row",
+        "prepare": "generate fresh rollouts",
         "budget": "exceeding",
         "consumer": "model forward",
     }[failure]
