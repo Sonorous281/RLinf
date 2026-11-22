@@ -9,11 +9,14 @@ cluster:
 runner:
   synchronous: false
   async_mode: true
+  seq_length: 16384
   experiment_name: rpent-sao
 
 algorithm:
   adv_type: sao_gae
   group_size: 1
+  sampling_params:
+    max_new_tokens: 2048
   loss_type: dis
   critic_loss_type: mse
   clip_ratio_low: 0.3
