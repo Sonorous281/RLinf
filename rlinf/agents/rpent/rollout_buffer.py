@@ -246,7 +246,8 @@ class RPentRolloutBufferWorker(RolloutBufferWorker):
             raise ValueError(
                 "Checkpoint group size and task must match the resumed run"
             )
-        if len(state["group_tasks"]) > self.buffer.max_buffered_groups:
+        completed = sum(len(task["buffer"]) for task in state["tasks"].values())
+        if completed + len(state["pending_requests"]) > self.buffer.max_buffered_groups:
             raise ValueError(
                 "Restored groups exceed rollout_buffer.max_buffered_groups"
             )

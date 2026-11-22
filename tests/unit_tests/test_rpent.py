@@ -143,6 +143,9 @@ def test_checkpoint_replays_only_inflight_and_retains_unissued_requests(tmp_path
     assert restored._queued_requests == source._queued_requests
     assert restored.buffer.next_group_id == 5
     restored.buffer.dataloader.load_state_dict.assert_called_once_with({"cursor": 4})
+    restored.buffer.max_buffered_groups = 1
+    with pytest.raises(ValueError, match="max_buffered_groups"):
+        asyncio.run(restored.load_checkpoint(str(tmp_path), 2))
 
 
 def test_folded_turns_exclude_tool_tokens_and_split_on_image_rewrite():
