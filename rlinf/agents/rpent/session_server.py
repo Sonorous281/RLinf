@@ -35,6 +35,13 @@ class RPentSessionServerWorker(SessionServerWorker):
             for key, value in body.items()
             if key not in ("temperature", "top_k", "top_p")
         }
+        if (
+            self._cfg.tools.rpent.workflow == "episode"
+            and body.get("tool_choice") == "required"
+        ):
+            # The batch-action planner validates tool use after unconstrained sampling.
+            # A decode grammar would change the behavior policy used for GRPO.
+            body["tool_choice"] = "auto"
         return await super()._chat_completions(sid, body)
 
     @cached_property
