@@ -57,15 +57,13 @@ class RPentEvalRunner(ReasoningEvalRunner):
                 "RPent evaluation needs rollout.sglang.backend_type=server"
             )
         episodes = []
-        try:
-            for batch in self.val_dataloader:
-                self._put_batch(batch, len(self.agent_loop._workers))
-                for results in self.agent_loop.evaluate_batch(
-                    self.dataloader_channel, urls
-                ).wait():
-                    episodes.extend(results)
-        finally:
-            self._stop_rollouts()
+        for batch in self.val_dataloader:
+            self._put_batch(batch, len(self.agent_loop._workers))
+            for results in self.agent_loop.evaluate_batch(
+                self.dataloader_channel, urls
+            ).wait():
+                episodes.extend(results)
+        self._stop_rollouts()
         summary = summarize_episodes(episodes)
         output_dir = os.path.join(
             self.cfg.runner.output_dir, self.cfg.runner.experiment_name
