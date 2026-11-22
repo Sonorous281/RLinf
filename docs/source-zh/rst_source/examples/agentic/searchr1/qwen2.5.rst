@@ -73,10 +73,11 @@ GRPO 配置重算 logprobs，PPO 配置直接使用 rollout logprobs。``rollout
    # GRPO
    bash examples/agent/searchr1/run_train.sh train_qwen2.5
 
+   # GRPO（仅投影回复位置，分块计算 softmax）
+   bash examples/agent/searchr1/run_train.sh train_qwen2.5_chunked
+
    # PPO
    bash examples/agent/searchr1/run_train.sh train_qwen2.5_ppo
-
-要降低 Megatron GRPO 计算 logprob 的显存占用，运行 ``bash examples/agent/searchr1/run_train.sh train_qwen2.5_chunked``。参数和测量方法见 :doc:`../../../guides/actor_logprob_memory`。
 
 MA-FSDP 训练
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
