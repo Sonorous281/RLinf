@@ -180,3 +180,31 @@ def test_folded_turns_exclude_tool_tokens_and_split_on_image_rewrite():
     restored = DynamicRolloutResult.split_results(merged, [2, 2])[1]
     assert restored.response_mask == folded.response_mask
     assert restored.extra_fields_turn == folded.extra_fields_turn
+
+
+@pytest.mark.parametrize(
+    "workflow,expected", [("episode", "auto"), ("libero_rl", "required")]
+)
+def test_batch_action_planner_keeps_grammar_out_of_training(
+    workflow, expected, monkeypatch
+):
+    pytest.importorskip("sglang")
+    from rlinf.agents.rpent.session_server import (
+        RPentSessionServerWorker,
+        SessionServerWorker,
+    )
+
+    chat = AsyncMock()
+    monkeypatch.setattr(SessionServerWorker, "_chat_completions", chat)
+    worker = object.__new__(RPentSessionServerWorker)
+    worker._cfg = OmegaConf.create({"tools": {"rpent": {"workflow": workflow}}})
+    body = {
+        "tool_choice": "required",
+        "temperature": 0.2,
+        "tools": [{"type": "function"}],
+    }
+    asyncio.run(worker._chat_completions("episode-1", body))
+    chat.assert_awaited_once_with(
+        "episode-1", {"tool_choice": expected, "tools": body["tools"]}
+    )
+    assert body["tool_choice"] == "required"
