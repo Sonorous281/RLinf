@@ -12,11 +12,11 @@
    * - :doc:`智能体指南 <../agentic>`
      - 智能体任务的操作流程。
 
-   * - :doc:`共享图像预处理 <qwen35-multimodal>`
-     - 在 rollout 与训练中复用 Qwen3.5 图像预处理。
+   * - :doc:`Qwen3.5 图像回放 <qwen35-multimodal>`
+     - 在 Megatron 中复用 SGLang 的图像输入，验证一次参数更新。
 
 .. toctree::
    :hidden:
 
    智能体指南 <../agentic>
-   共享图像预处理 <qwen35-multimodal>
+   Qwen3.5 图像回放 <qwen35-multimodal>

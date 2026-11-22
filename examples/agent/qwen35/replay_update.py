@@ -19,6 +19,7 @@ import math
 from pathlib import Path
 
 import torch
+from hydra import compose, initialize_config_dir
 from megatron.core import parallel_state
 from megatron.core.distributed import finalize_model_grads
 from omegaconf import OmegaConf
@@ -117,10 +118,13 @@ if __name__ == "__main__":
     parser.add_argument("--role", choices=["dense", "chunked", "critic"], required=True)
     args = parser.parse_args()
     here = Path(__file__).resolve().parent
-    cfg = OmegaConf.merge(
-        OmegaConf.load(here.parent / "searchr1/config/train_qwen2.5_ppo.yaml"),
-        OmegaConf.load(here / "replay_update.yaml"),
-    )
+    searchr1_configs = here.parent / "searchr1" / "config"
+    with initialize_config_dir(version_base=None, config_dir=str(here / "config")):
+        cfg = compose(
+            config_name="replay_update",
+            overrides=[f'hydra.searchpath=["file://{searchr1_configs}"]'],
+        )
+    OmegaConf.set_struct(cfg, False)
     cfg.rollout.model.model_path = str(args.model.resolve())
     cards = torch.cuda.device_count()
     if cards not in (2, 8):
@@ -129,8 +133,6 @@ if __name__ == "__main__":
     cfg.cluster.component_placement = {
         "actor,critic,rollout,reward": ",".join(map(str, devices))
     }
-    cfg.data.rollout_batch_size = 4
-    cfg.actor.global_batch_size = 8
     cfg.actor.model.lm_head_chunk_size = 256 if args.role == "chunked" else 0
     cfg.critic = OmegaConf.merge(
         cfg.actor,

@@ -1,3 +1,7 @@
+defaults:
+  - train_qwen2.5_ppo
+  - _self_
+
 runner:
   seq_length: 512
   max_tokens_per_mbs: 1024
@@ -7,6 +11,7 @@ algorithm:
 reward:
   reward_type: null  # This check supplies fixed training targets.
 data:
+  rollout_batch_size: 4
   max_prompt_length: 480
 rollout:
   model:
@@ -14,6 +19,7 @@ rollout:
   sglang:
     enable_shared_multi_modal_processor: true
 actor:
+  global_batch_size: 8
   expect_multi_modal_inputs: true
   enable_dp_load_balance: true
   offload_weight: false

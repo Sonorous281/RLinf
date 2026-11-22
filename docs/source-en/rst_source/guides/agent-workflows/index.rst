@@ -13,11 +13,11 @@ embodied RL jobs.
    * - :doc:`Agentic Guides <../agentic>`
      - Operational workflows for agentic tasks.
 
-   * - :doc:`Shared Image Preprocessing <qwen35-multimodal>`
-     - Reuse Qwen3.5 image preprocessing across rollout and training.
+   * - :doc:`Qwen3.5 Image Replay <qwen35-multimodal>`
+     - Replay the image inputs from SGLang in Megatron and verify a training update.
 
 .. toctree::
    :hidden:
 
    Agentic Guides <../agentic>
-   Shared Image Preprocessing <qwen35-multimodal>
+   Qwen3.5 Image Replay <qwen35-multimodal>

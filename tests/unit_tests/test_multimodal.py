@@ -224,10 +224,7 @@ def test_image_replay_rejects_unsupported_learner(backend, cp):
 
 
 def test_release_capture_replays_positions_and_verifies_shared_pixels(tmp_path):
-    from rlinf.hybrid_engines.sglang.multimodal.replay import (
-        REPLAY_FORMAT,
-        store_pixels,
-    )
+    from rlinf.utils.image_replay import REPLAY_FORMAT, store_pixels
     from rlinf.utils.multimodal import materialize_multimodal_inputs
 
     pixels = torch.arange(8, dtype=torch.float32).reshape(4, 2)
