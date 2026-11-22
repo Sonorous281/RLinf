@@ -401,7 +401,7 @@ class TestPerTaskState:
         assert buffer._buffered_groups() == 1
 
     def test_release_takes_the_oldest_groups_across_tasks(self):
-        """A release still hands the actor the oldest buffered groups."""
+        """A release still returns the oldest buffered groups to the actor."""
         buffer = _BufferFixture.make(rollout_batch_size=2)
         group_ids = {}
         for sample, task_name in [(0, "searchr1"), (1, "code"), (2, "searchr1")]:
@@ -413,7 +413,7 @@ class TestPerTaskState:
                 ).group_metadata(),
             )
         released = buffer.release_groups()
-        assert [result.group_id for result in released] == [
+        assert [result.group_id for _, result in released] == [
             group_ids[0],
             group_ids[1],
         ]
@@ -468,7 +468,7 @@ class TestRelease:
         for group_id in group_ids:
             buffer.record_result(_result(group_id), _result(group_id).group_metadata())
         released = buffer.release_groups()
-        assert [result.group_id for result in released] == sorted(group_ids)
+        assert [result.group_id for _, result in released] == sorted(group_ids)
 
     def test_release_removes_the_groups_from_the_buffer(self):
         """Released groups leave the buffer and the issue-version dict."""
@@ -1055,7 +1055,7 @@ class TestWorkerResident:
                 await asyncio.sleep(0.05)
                 assert dataloader_channel._queue.empty()
 
-                # A release hands one training batch over: two groups
+                # A release returns one training batch to the actor: two groups
                 # leave, and exactly two are issued to top the total back
                 # up to the cap.
                 await worker.release_batch(version=0)
@@ -1120,7 +1120,7 @@ class TestDiscard:
         assert first not in _task_state(buffer, None)["buffer"]
         buffer.record_result(_result(second), _result(second).group_metadata())
         released = buffer.release_groups()
-        assert [result.group_id for result in released] == [second]
+        assert [result.group_id for _, result in released] == [second]
 
     def test_discarded_group_record_takes_the_receive_path(self):
         """A DiscardedGroup from the agent loop wakes admission."""
@@ -1505,7 +1505,7 @@ def test_real_length_groups_keep_versions_through_buffer_release():
     buffer.drop_group(stale[0], "staleness", 100, True, task_name="searchr1")
     released = buffer.release_groups()
     assert len(released) == 2
-    for actual, expected in zip(released, results[1:], strict=True):
+    for (_, actual), expected in zip(released, results[1:], strict=True):
         assert actual is expected
         assert actual.task_name == "searchr1"
         assert actual.group_metadata().earliest_version == actual.version_start[0]

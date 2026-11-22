@@ -11,6 +11,8 @@
      - 内容
    * - :doc:`智能体指南 <../agentic>`
      - 智能体任务的操作流程。
+   * - :doc:`Session Server <../session_server>`
+     - 在 rollout 节点上收集、整理 agent 轨迹；控制面与数据面分离，请求经 SGLang router 路由，agent 也可以使用 OpenAI chat completions 接口。
 
    * - :doc:`Qwen3.5 图像回放 <qwen35-multimodal>`
      - 在 Megatron 中复用 SGLang 的图像输入，验证一次参数更新。
@@ -20,3 +22,4 @@
 
    智能体指南 <../agentic>
    Qwen3.5 图像回放 <qwen35-multimodal>
+   Session Server <../session_server>
