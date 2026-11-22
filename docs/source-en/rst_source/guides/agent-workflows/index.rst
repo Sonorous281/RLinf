@@ -13,7 +13,11 @@ embodied RL jobs.
    * - :doc:`Agentic Guides <../agentic>`
      - Operational workflows for agentic tasks.
 
+   * - :doc:`Qwen3.5 Image Replay <qwen35-multimodal>`
+     - Replay the image inputs from SGLang in Megatron and verify a training update.
+
 .. toctree::
    :hidden:
 
    Agentic Guides <../agentic>
+   Qwen3.5 Image Replay <qwen35-multimodal>
