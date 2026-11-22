@@ -38,7 +38,7 @@ from rlinf.workers.rollout.utils import get_rollout_backend_worker
 @hydra.main(version_base="1.1")
 @output_redirector
 def main(cfg) -> None:
-    from rlinf.agents.rpent.async_runner import RPentRunner
+    from rlinf.agents.rpent.train_runner import RPentRunner
     from rlinf.workers.actor.ma_megatron_actor_worker import MAMegatronActor
     from rlinf.workers.critic.ma_megatron_critic_worker import MAMegatronCritic
 
