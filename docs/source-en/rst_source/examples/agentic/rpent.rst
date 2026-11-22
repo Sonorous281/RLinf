@@ -104,4 +104,6 @@ Reference run
 
 A historical H100 run started from Qwen3.5-4B-SFT595 and used all 50 initial states for each of 30 LIBERO-Pro tasks. It admitted 32 of 40 groups per update and completed 96 of 150 planned updates. The first 10 updates recorded 688 successes in 2,560 admitted episodes (26.88%). The last 10 recorded 1,940 in 2,560 (75.78%). These are training rollouts. The H100 run used a 262,144-token context and up to 16,384 output tokens per turn. The four-GPU GRPO recipe uses 65,536 and 8,192, respectively.
 
+A separate four-A100 GRPO smoke test used SFT595 on a fixed LIBERO-Pro task with thinking disabled, at most 16 turns and 2,048 output tokens per turn. It admitted four complete groups of eight and cancelled the fifth group. All 32 admitted rewards were zero and the actor gradient norm was zero. After saving the checkpoint, the SGLang Server reported policy version 1 and served the next planner requests.
+
 The four-A100 SAO acceptance run used four environments, four episodes per batch, up to four planner turns per episode and 512 tokens per response. It completed two updates and a third after restarting from the full checkpoint. Each checkpoint occupied about 128 GiB. Peak host proportional set size during recovery was 403 GiB. None of the 24 terminal episodes in this short run solved its task.
