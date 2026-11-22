@@ -30,18 +30,35 @@ RPent 把相机图像发给 Qwen3.5 规划器，再把模型选择的工具调�
    curl -fsSL https://raw.githubusercontent.com/Sonorous281/RLinf/e563431a3dd234643086a4baadcdb075772672ce/requirements/agentic/megatron-core-r0.18.0-cpu-offload.patch -o /tmp/rlinf-core-offload.patch
    git -C .venv/Megatron-LM apply /tmp/rlinf-core-offload.patch
 
-按照要运行的配置安装模拟器。GRPO 使用 SFT595 训练时的动作接口，一次调用最多依次执行三个动作。运行 GRPO 或评估该模型时，使用以下版本。
+先选择模拟器版本。运行 GRPO 或评估 SFT595 时，一次工具调用最多依次执行三个末端动作。
 
 .. code-block:: bash
 
-   git clone https://github.com/RLinf/RPent.git ../RPent
-   git -C ../RPent fetch origin 762a57c2b78278aff8d5c2c8f752ee42501bd5dc
-   git -C ../RPent checkout --detach FETCH_HEAD
-   export RLINF_ROOT="$PWD"
-   (cd ../RPent && uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python --prerelease=allow --torch-backend cu128 -r requirements/episode-ppo-env.txt)
-   export RPENT_PYTHON="$(cd ../RPent && pwd)/.venv/bin/python"
+   repo=RLinf/RPent revision=762a57c2b78278aff8d5c2c8f752ee42501bd5dc recipe=episode-ppo-env
 
-SAO 使用 ``Sonorous281/RPent`` 的 ``053fe8bd4bb2dbbd6a0652331261ef9949c68e2f`` 提交，按该版本的 ``requirements/libero-rl.txt`` 单独安装环境。这个版本分别提供移动末端和开合夹爪的工具。将 ``RPENT_PYTHON`` 指向对应的解释器。
+运行 SAO 时选用下面的版本。它用两个工具分别控制末端移动和夹爪。该版本的依赖文件会从名为 ``RLinf`` 的同级目录安装 RLinf。
+
+.. code-block:: bash
+
+   repo=Sonorous281/RPent revision=053fe8bd4bb2dbbd6a0652331261ef9949c68e2f recipe=libero-rl
+
+选好版本后，在 RLinf 仓库根目录执行以下命令，给模拟器创建单独的环境。
+
+.. code-block:: bash
+
+   export RLINF_ROOT="$PWD"
+   rpdir="../RPent-$recipe"
+   git clone --no-checkout "https://github.com/$repo.git" "$rpdir"
+   git -C "$rpdir" fetch --depth 1 origin "$revision" && git -C "$rpdir" checkout --detach FETCH_HEAD
+   (cd "$rpdir" && uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python --prerelease=allow --torch-backend cu128 -r "requirements/$recipe.txt")
+   export RPENT_PYTHON="$(cd "$rpdir" && pwd)/.venv/bin/python"
+
+如果 GRPO 在第一次 reset 时找不到 ``libero_floor_base_style.xml``，说明当前模拟器安装包缺少场景资源。MuJoCo 会在已导入的 LIBERO-Pro 包内查找这份 XML。将完整源码以可编辑模式安装到模拟器环境后，再启动训练。
+
+.. code-block:: bash
+
+   git clone --branch rpent https://github.com/RLinf/LIBERO-PRO.git ../LIBERO-PRO && git -C ../LIBERO-PRO checkout --detach d1e11fb181b8544487d27742c0caa3a4d46452ad
+   uv pip install --python "$RPENT_PYTHON" --no-deps -e ../LIBERO-PRO
 
 按 `RPent 资源准备说明 <https://github.com/Sonorous281/RPent/blob/053fe8bd4bb2dbbd6a0652331261ef9949c68e2f/docs/source-zh/rst_source/simulators/libero_rl_setup.rst>`__ 准备模拟器 XML、初始状态和 SAM3 权重。在训练终端设置下列路径，在另一个使用相同环境变量的终端运行最后一条命令，启动 SAM3。
 
@@ -78,11 +95,13 @@ SAO 使用 ``Sonorous281/RPent`` 的 ``053fe8bd4bb2dbbd6a0652331261ef9949c68e2f`
    "$RPENT_PYTHON" examples/agent/rpent/prepare_tasks.py --libero-type pro --seeds 32-39 --split eval --output-dir data/rpent
    bash examples/agent/rpent/run_eval.sh eval_qwen3.5_4b
 
-在 ``RPENT_RUN_DIR`` 下查看 ``rpent-eval/eval_results.json``，其中有完成的轨迹数、总成功率及各任务集的成功率。每条轨迹的 ``request.json`` 记录任务和初始状态，``planner.json`` 记录交互，``outcome.json`` 记录环境判定。用于训练的样本包含提示词和输出的 token ID、采样时的 logprob、策略版本以及图像引用。损失只计算模型输出的 token，工具返回的观测进入下一轮提示词。
+在 ``RPENT_RUN_DIR`` 下查看 ``rpent-eval/eval_results.json``，其中有完成的轨迹数、总成功率及各任务集的成功率。每条轨迹的 ``request.json`` 记录任务和初始状态，``planner.json`` 记录交互，``outcome.json`` 记录环境判定。训练样本的 ``input_ids`` 包含渲染后的提示词和模型输出。``response_mask`` 标出参与损失计算的动作 token，``rollout_logprobs`` 保存采样时的 logprob，``rollout_weight_versions`` 记录生成每个动作 token 的策略版本，``multi_modal_inputs`` 引用对应图像。工具返回的观测进入下一轮提示词。
 
 例如，在一次标准 LIBERO 采样中，任务为 ``libero_10`` 的第 0 个任务，初态为 2。规划器先调用 ``view_env`` 获取 1024 × 1024 的相机画面，再调用 ``segment``，得到分数为 0.891 的分割掩码。经过 25 轮交互、262 个环境步后，这条轨迹达到请求次数上限。环境记录为 ``terminal=true``、``success=false``，因此训练奖励为 0。分割分数只用于感知。
 
 参考结果
 --------
 
-历史 H100 实验从 Qwen3.5-4B-SFT595 开始训练，使用 LIBERO-Pro 的 30 个任务，每个任务有 50 个初始状态。每次更新从 40 组中取最先完成的 32 组，共完成计划中 150 次更新的 96 次。前 10 次更新在 2560 条准入轨迹中成功 688 次（26.88%），末 10 次成功 1940 次（75.78%）。这里统计的是训练中被选中的轨迹。四卡示例的批量和上下文长度均小于历史实验。
+历史 H100 实验从 Qwen3.5-4B-SFT595 开始训练，使用 LIBERO-Pro 的 30 个任务，每个任务有 50 个初始状态。每次更新从 40 组中取最先完成的 32 组，共完成计划中 150 次更新的 96 次。前 10 次更新在 2560 条准入轨迹中成功 688 次（26.88%），末 10 次成功 1940 次（75.78%）。这里统计的是训练中被选中的轨迹。H100 实验的上下文上限为 262,144 个 token，每轮最多输出 16,384 个。四卡 GRPO 示例分别使用 65,536 和 8,192。
+
+在四张 A100 上验证 SAO 时，使用 4 个环境、每批 4 条轨迹，每条最多 4 轮、每次最多生成 512 个 token。连续完成两次更新后，在新进程中恢复并完成第三次更新。每份完整检查点约 128 GiB，恢复期间整组进程的主存 PSS 峰值约 403 GiB。本次短跑的 24 条已结束轨迹均未完成任务；这个结果用于核对训练和恢复流程。
