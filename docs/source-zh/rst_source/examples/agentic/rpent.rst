@@ -16,7 +16,7 @@ RPent 把相机图像发给 Qwen3.5 规划器，再把模型选择的工具调�
 
 ``RPENT_MODEL`` 指向 Hugging Face 格式的本地权重目录。验证训练流程可以使用公开的 `Qwen3.5-4B <https://huggingface.co/Qwen/Qwen3.5-4B>`__。要复现历史 GRPO 的初始策略，需要相同的 RPent SFT595 权重。单机验证使用四张 80 GB A100。
 
-RPent 的模拟器进程单独加载 tokenizer 来计算上下文长度。如果导出后的检查点使用了模拟器环境无法识别的 tokenizer 类，可在训练或评估命令末尾加上 ``tools.rpent.tokenizer_path=/path/to/compatible-tokenizer``。该目录应使用相同的词表、分词规则和特殊 token，并能在模拟器环境中加载。模型权重仍从 ``RPENT_MODEL`` 读取。
+RPent 的模拟器进程用 tokenizer 和图像处理器计算上下文长度。如果导出后的检查点使用了模拟器环境无法识别的 tokenizer 类，可在训练或评估命令末尾加上 ``tools.rpent.tokenizer_path=/path/to/compatible-tokenizer``。可以使用训练起点的完整模型目录，里面需要有对应的 tokenizer、对话模板和图像处理配置。先确认两套环境对同一段带图对话算出的 token 数一致。模型权重仍从 ``RPENT_MODEL`` 读取。
 
 在当前 RLinf 仓库安装训练环境并激活。
 
