@@ -2267,7 +2267,8 @@ def test_sao_gae_adapts_lambda_separately_for_different_action_lengths():
         advantages[1][1:4], torch.tensor([(1 - 1 / 4.5) ** 2, 1 - 1 / 4.5, 1.0])
     )
     torch.testing.assert_close(
-        torch.stack(returns), torch.tensor([[0, 1, 0, 0], [0, 1, 1, 1]], dtype=torch.float32)
+        torch.stack(returns),
+        torch.tensor([[0, 1, 0, 0], [0, 1, 1, 1]], dtype=torch.float32),
     )
 
 

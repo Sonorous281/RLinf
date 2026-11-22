@@ -95,7 +95,11 @@ class MAMegatronCritic(DynamicMegatronBatchMixin, MegatronCritic):
                     {"values": value_rows}, width, 0, input_ids.device
                 )["values"]
                 batch = DynamicRolloutResult.materialize_actor_batch(
-                    {key: batch[key] for key in ("values", "returns", "response_mask") if key in batch},
+                    {
+                        key: batch[key]
+                        for key in ("values", "returns", "response_mask")
+                        if key in batch
+                    },
                     width,
                     0,
                     input_ids.device,
@@ -183,15 +187,18 @@ class MAMegatronCritic(DynamicMegatronBatchMixin, MegatronCritic):
         batch, results = self.get_step_batch(input_channel)
         infer_after_update = self.role_cfg.compute_advantages_after_update
         if not infer_after_update:
-            assert "values" in batch, "Multi-agent critic training requires fixed old values."
+            assert "values" in batch, (
+                "Multi-agent critic training requires fixed old values."
+            )
         batch = self.compute_advantages_and_returns(batch)
         if output_channel is not None:
             offset = 0
             for result in results:
                 end = offset + result.num_sequence
                 result.advantages = (
-                    None if infer_after_update else
-                    [row.clone() for row in batch["advantages"][offset:end]]
+                    None
+                    if infer_after_update
+                    else [row.clone() for row in batch["advantages"][offset:end]]
                 )
                 result.values = result.returns = None
                 offset = end
