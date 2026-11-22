@@ -72,6 +72,7 @@ async def generate_with_capture(
                 "image_spans": capture["image_spans"],
                 "prefix_length": prefix,
                 "ticket": ticket,
+                "token_budget": capture.get("token_budget"),
             },
         }
         result = await generate(

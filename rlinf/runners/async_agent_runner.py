@@ -68,6 +68,8 @@ class AsyncAgentRunner(AgentPPORunner):
     payload channels instead of inline results.
     """
 
+    supports_actor_recompute = False
+
     def __init__(
         self,
         cfg: DictConfig,
@@ -94,10 +96,10 @@ class AsyncAgentRunner(AgentPPORunner):
             "step by the synchronous runner and are not supported here; "
             "group filtering runs in the RolloutBufferWorker instead."
         )
-        assert not cfg.algorithm.recompute_logprobs, (
-            "AsyncAgentRunner: recompute_logprobs requires the actor to "
-            "double as the inference engine, which is not supported here."
-        )
+        if cfg.algorithm.recompute_logprobs and not self.supports_actor_recompute:
+            raise ValueError(
+                "This runner does not recompute behavior logprobs on the actor."
+            )
         super().__init__(
             cfg,
             placement,
@@ -221,7 +223,6 @@ class AsyncAgentRunner(AgentPPORunner):
         """
         if self._session_servers is None:
             return None, None, None
-        self._session_router.init_router().wait()
         instance_urls = [
             url for url in self.rollout.get_server_url().wait() if url is not None
         ]
@@ -229,9 +230,17 @@ class AsyncAgentRunner(AgentPPORunner):
             "no rollout instance advertised a server URL: the session server "
             "requires rollout.sglang.backend_type 'server'."
         )
-        for url in instance_urls:
-            self._session_router.register_server(url).wait()
-        router_url = self._session_router.get_router_url().wait()[0]
+        if self._session_router is None:
+            if len(instance_urls) != 1:
+                raise ValueError(
+                    "A direct session endpoint requires one rollout instance"
+                )
+            router_url = instance_urls[0]
+        else:
+            self._session_router.init_router().wait()
+            for url in instance_urls:
+                self._session_router.register_server(url).wait()
+            router_url = self._session_router.get_router_url().wait()[0]
         session_urls = []
         for server, payload_channels in zip(
             self._session_servers, self._session_payload_channels
@@ -281,11 +290,22 @@ class AsyncAgentRunner(AgentPPORunner):
             time.sleep(0.1)
         return actor_handle.wait()
 
+    def _prepare_update(self, release_handle):
+        """Finish required rollout work before reusing learner devices."""
+        if self.is_collocated:
+            self._wait_actor(release_handle, self._training_handles)
+            with self.timer("rollout/pause"):
+                self.rollout.pause_generation(self.pause_mode).wait()
+            with self.timer("rollout/offload"):
+                self.rollout.offload_engine().wait()
+
     def _run_training(self, rollout_handle: Handle, payload_channels=None):
         if self.critic is not None:
             return super()._run_training(rollout_handle, version=self.global_steps)
         actor_handle = self.actor.run_training(
-            input_channel=self.rollout_channel, version=self.global_steps, payload_channels=payload_channels
+            input_channel=self.rollout_channel,
+            version=self.global_steps,
+            payload_channels=payload_channels,
         )
         rollout_metrics, training_metrics = self._wait_actor(
             actor_handle, self._training_handles
@@ -421,7 +441,11 @@ class AsyncAgentRunner(AgentPPORunner):
                 rollout_channel=self.rollout_channel,
                 payload_channels=payload_channels,
             )
-            self._training_handles = [agent_handle, buffer_handle, *self._session_serve_handles]
+            self._training_handles = [
+                agent_handle,
+                buffer_handle,
+                *self._session_serve_handles,
+            ]
             if rollout_handle is not None:
                 self._training_handles.append(rollout_handle)
             while self.global_steps < self.max_steps:
@@ -429,12 +453,7 @@ class AsyncAgentRunner(AgentPPORunner):
                     release_handle = self.rollout_buffer.release_batch(
                         version=self.global_steps, wait_for_dispatch=self.is_collocated
                     )
-                    if self.is_collocated:
-                        self._wait_actor(release_handle, self._training_handles)
-                        with self.timer("rollout/pause"):
-                            self.rollout.pause_generation(self.pause_mode).wait()
-                        with self.timer("rollout/offload"):
-                            self.rollout.offload_engine().wait()
+                    self._prepare_update(release_handle)
                     (
                         actor_rollout_metrics,
                         actor_training_metrics,
@@ -674,5 +693,6 @@ class AsyncAgentRunner(AgentPPORunner):
                 server.stop().wait()
             for serve_handle in self._session_serve_handles:
                 serve_handle.wait()
-            self._session_router.stop().wait()
+            if self._session_router is not None:
+                self._session_router.stop().wait()
         super()._stop_rollouts()

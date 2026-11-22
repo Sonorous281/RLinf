@@ -28,6 +28,7 @@ class AgentPPORunner(AgentRunner):
             self.critic is not None
             and self.cfg.runner.resume_dir is None
             and self.cfg.critic.megatron.use_hf_ckpt
+            and not self.cfg.critic.megatron.get("mbridge", False)
         ):
             from rlinf.utils.ckpt_convertor.megatron_convertor.convert_hf_to_mg import (
                 convert_hf_to_mg,

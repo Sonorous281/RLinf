@@ -137,6 +137,10 @@ def _init_libero() -> None:
     _repoint_libero_config(_libero_core)
 
 
+# External environment servers initialize simulator modules before creating envs.
+initialize_libero = _init_libero
+
+
 class LiberoEnv(gym.Env):
     """Batched LIBERO simulation with task scheduling and episode-local history."""
 

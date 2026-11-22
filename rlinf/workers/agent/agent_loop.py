@@ -237,7 +237,9 @@ class AgentLoopWorker(Worker):
         """
         if rollout_name is None and self.session_server_client is not None:
             if image_spans is not None or image_data:
-                raise ValueError("Session image turns must use the chat completions entry.")
+                raise ValueError(
+                    "Session image turns must use the chat completions entry."
+                )
             binding = self._session_binding.get()
             assert binding is not None, "No session bound to the generation task."
             return await self._generate_on_session(binding, prompt_ids, sampling_params)
@@ -833,6 +835,12 @@ class MultiAgentLoopWorker(AgentLoopWorker):
             await asyncio.gather(*rollout_tasks, return_exceptions=True)
             await self.session_server_client.abort(group_id, exc.reason)
             return {}
+        except BaseException:
+            for task in rollout_tasks:
+                task.cancel()
+            await asyncio.gather(*rollout_tasks, return_exceptions=True)
+            # The caller handles group cancellation; never admit a partial group.
+            raise
         outputs = [output for _, output, _, _ in trajectories]
         agent_side = [output is not None for output in outputs]
         assert all(agent_side) or not any(agent_side), (

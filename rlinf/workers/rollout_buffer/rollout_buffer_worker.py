@@ -648,12 +648,17 @@ class RolloutBufferWorker(Worker):
                     already_buffered=False,
                 )
                 continue
+            result, metadata = await self._prepare_result(result, metadata)
             self.buffer.record_result(result, metadata)
             if (
                 self.buffer.pending_release_version is not None
                 and self.buffer.can_release()
             ):
                 await self._dispatch_release(rollout_channel)
+
+    async def _prepare_result(self, result, metadata):
+        """Allow checkpointable buffers to resolve a session payload before release."""
+        return result, metadata
 
     async def _dispatch_release(self, rollout_channel: Channel):
         version = self.buffer.pending_release_version

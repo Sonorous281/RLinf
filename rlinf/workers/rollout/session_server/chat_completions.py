@@ -35,7 +35,7 @@ from rlinf.agents.tokenization.agentic_tokenizer import AgenticTokenizer
 class ChatCheckpoint(NamedTuple):
     """The state a turn started from, for a retried request to render from.
 
-    Restoring a rollback means restoring all four at once, and the rollback
+    A rollback restores these fields together, and the rollback
     that uses it consumes it: a conversation's checkpoint is None once one
     rollback has run.
     """
@@ -44,6 +44,7 @@ class ChatCheckpoint(NamedTuple):
     last_input: Optional[list[int]]
     last_output: Optional[list[int]]
     tools: Optional[list]
+    image_history: Optional[dict] = None
 
 
 @dataclass

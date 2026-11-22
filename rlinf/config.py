@@ -2341,6 +2341,11 @@ def validate_searchr1_cfg(cfg: DictConfig) -> DictConfig:
     )
     if (
         OmegaConf.select(cfg, "agentloop.is_dynamic_rollout_batch", default=False)
+        and not (
+            expected_adv_type == "gae_dynamic"
+            and cfg.runner.get("async_mode", False)
+            and cfg.algorithm.adv_type == "sao_gae"
+        )
         and cfg.algorithm.adv_type != expected_adv_type
     ):
         raise ValueError(
@@ -2505,6 +2510,14 @@ def validate_searchr1_cfg(cfg: DictConfig) -> DictConfig:
                 "placement unless actor.training_backend is megatron."
             )
     if cfg.runner.get("async_mode", False):
+        if (
+            component_placement.is_collocated
+            and OmegaConf.select(cfg, "algorithm.adv_type") != "sao_gae"
+        ):
+            raise ValueError(
+                "SearchR1 async training requires disaggregated placement for this algorithm; "
+                f"the current placement mode is {component_placement.placement_mode.name}."
+            )
         if not (
             component_placement.is_disaggregated or component_placement.is_collocated
         ):
@@ -2790,12 +2803,13 @@ def validate_session_server_cfg(cfg: DictConfig) -> DictConfig:
     reward_type = (
         reward_cfg.get("reward_type", None) if reward_cfg is not None else None
     )
-    if reward_type != "searchr1":
+    is_rpent = OmegaConf.select(cfg, "tools.rpent") is not None
+    if reward_type != "searchr1" and not is_rpent:
         raise ValueError(
             f"session_server.enable requires reward.reward_type 'searchr1', "
             f"found {reward_type!r}."
         )
-    if not cfg.runner.get("async_mode", False):
+    if not is_rpent and not cfg.runner.get("async_mode", False):
         raise ValueError(
             "session_server.enable requires runner.async_mode: only the "
             "async runner drives the session servers (the synchronous and "
@@ -2939,8 +2953,13 @@ def validate_session_server_cfg(cfg: DictConfig) -> DictConfig:
             f"must both be >= 1, found {cfg.session_server.num_servers} and "
             f"{cfg.session_server.payload_shards}."
         )
-    component_placement = ModelParallelComponentPlacement(cfg, Cluster())
-    if component_placement.rollout_num_model_instances == 1:
+    if is_rpent:
+        from rlinf.agents.rpent.placement import RPentComponentPlacement
+
+        component_placement = RPentComponentPlacement(cfg, Cluster())
+    else:
+        component_placement = ModelParallelComponentPlacement(cfg, Cluster())
+    if not is_rpent and component_placement.rollout_num_model_instances == 1:
         logging.warning(
             "session_server.enable with a single rollout instance: the "
             "router adds a forwarding hop but no routing; it stays "
@@ -3220,7 +3239,12 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
 
             validate_qwen_vl_chunked_cfg(cfg)
         validate_multimodal_learner_cfg(cfg)
-        cfg = validate_searchr1_cfg(cfg)
+        if OmegaConf.select(cfg, "tools.rpent") is not None:
+            from rlinf.agents.rpent.config_validation import validate_rpent_cfg
+
+            validate_rpent_cfg(cfg)
+        else:
+            cfg = validate_searchr1_cfg(cfg)
 
     cfg = validate_session_server_cfg(cfg)
     return cfg

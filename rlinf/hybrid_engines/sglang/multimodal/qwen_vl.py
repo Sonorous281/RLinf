@@ -86,6 +86,15 @@ class TokenizedQwenVLProcessor(QwenVLImageProcessor):
             **kwargs,
         )
         output = self._place_images(input_text, spans, capture["prefix_length"], native)
+        if capture.get("token_budget") is not None:
+            context_length, reserve = capture["token_budget"]
+            remaining = context_length - len(output.input_ids)
+            limit = min(params["max_new_tokens"], remaining)
+            if limit < reserve:
+                raise ValueError(
+                    f"Expanded image prompt leaves {limit} output tokens, expected at least {reserve}"
+                )
+            params["max_new_tokens"] = limit
         await asyncio.to_thread(save_capture, path, output)
         return output
 

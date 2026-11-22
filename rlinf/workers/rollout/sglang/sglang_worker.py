@@ -631,7 +631,12 @@ class SGLangWorker(Worker):
         """
         if not self._is_model_instance_entry:
             return
-        await self._backend.sync_weights(pause_mode=self._pause_mode)
+        if self._cfg_rollout.get("record_token_weight_versions", False):
+            await self._backend.sync_weights(
+                pause_mode=self._pause_mode, token_weight_version=version
+            )
+        else:
+            await self._backend.sync_weights(pause_mode=self._pause_mode)
         if version is not None:
             self._weight_version = version
             if self._session_server_enabled:
