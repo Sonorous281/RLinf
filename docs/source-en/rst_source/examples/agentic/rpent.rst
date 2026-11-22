@@ -16,6 +16,8 @@ Install the learner and simulator
 
 Set ``RPENT_MODEL`` to a local Hugging Face checkpoint. The public `Qwen3.5-4B <https://huggingface.co/Qwen/Qwen3.5-4B>`__ weights can run the integration. Reproducing the historical GRPO initialization requires the RPent SFT595 checkpoint. The single-node validation uses four A100 80 GB GPUs.
 
+The RPent simulator loads a tokenizer to count context tokens. If its Transformers version cannot load the tokenizer class in an exported checkpoint, append ``tools.rpent.tokenizer_path=/path/to/compatible-tokenizer`` to the training or evaluation command. Use the same vocabulary, tokenization rules and special tokens in a format the simulator can load. Model weights still come from ``RPENT_MODEL``.
+
 From the RLinf checkout, install the learner and activate its environment.
 
 .. code-block:: bash

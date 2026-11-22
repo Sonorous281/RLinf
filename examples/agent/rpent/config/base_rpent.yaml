@@ -2,6 +2,7 @@
 tools:
   rpent:
     python: ${oc.env:RPENT_PYTHON}
+    tokenizer_path: ${rollout.model.model_path}
     sam3_endpoint: ${oc.env:RPENT_SAM3_URL,http://127.0.0.1:8101}
     libero_type: pro
     max_episode_steps: 1200

@@ -185,7 +185,7 @@ class RPentEpisodeLauncher:
             "--cuda-device",
             str(gpu),
             "--tokenizer-path",
-            self.cfg.rollout.model.model_path,
+            rpent.get("tokenizer_path", self.cfg.rollout.model.model_path),
         ]
         if workflow == "libero" and rpent.get("frozen_memory_dir") is not None:
             command += ["--frozen-memory-dir", rpent.frozen_memory_dir]
