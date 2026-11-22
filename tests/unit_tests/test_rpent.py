@@ -31,6 +31,7 @@ from rlinf.agents.rpent.rollout_buffer import (
 )
 from rlinf.agents.rpent.rpent_agent_loop import RPentAgentLoopWorker
 from rlinf.data.schema.reasoning_results import DynamicRolloutResult, GroupMetadata
+from rlinf.scheduler import Worker
 
 
 @pytest.mark.parametrize(
@@ -106,15 +107,47 @@ def test_cohort_admits_complete_groups_in_arrival_order(wrong_version):
         assert selected["rewards"] == [[0, 1], [0, 1]]
 
 
+def test_cohort_sampler_consumes_all_candidates_before_starting_another_epoch(
+    monkeypatch,
+):
+    monkeypatch.setattr(Worker, "__init__", lambda self: None)
+    cfg = OmegaConf.create(
+        {
+            "runner": {"synchronous": True},
+            "data": {
+                "rollout_batch_size": 4,
+                "sampling_batch_size": 5,
+                "shuffle": False,
+                "num_workers": 0,
+            },
+            "algorithm": {},
+            "rollout_buffer": {
+                "max_inflight_groups": 4,
+                "max_buffered_groups": 8,
+                "max_dropped_groups_per_step": 16,
+            },
+        }
+    )
+    worker = RPentCohortBuffer(cfg, range(10))
+    assert list(worker.buffer.dataloader.batch_sampler) == [
+        list(range(5)),
+        list(range(5, 10)),
+    ]
+    assert worker.buffer.rollout_batch_size == 4
+
+
 def test_checkpoint_replays_only_inflight_and_retains_unissued_requests(tmp_path):
     def make_worker():
         worker = object.__new__(RPentRolloutBufferWorker)
         worker.cfg = OmegaConf.create(
-            {"algorithm": {"group_size": 1}, "data": {"shuffle": False}}
+            {
+                "algorithm": {"group_size": 1},
+                "data": {"shuffle": False, "rollout_batch_size": 4},
+            }
         )
         worker.task_name = "rpent"
         worker._fetch_lock = asyncio.Lock()
-        loader = Mock()
+        loader = Mock(batch_size=4)
         loader.state_dict.return_value = {"cursor": 4}
         worker.buffer = SimpleNamespace(
             dataloader=loader,

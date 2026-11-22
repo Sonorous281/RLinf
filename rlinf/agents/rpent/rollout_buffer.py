@@ -117,7 +117,8 @@ class RPentRolloutBufferWorker(RolloutBufferWorker):
     """
 
     def __init__(self, cfg, train_dataset):
-        super().__init__(cfg, train_dataset)
+        width = cfg.data.sampling_batch_size if cfg.runner.synchronous else None
+        super().__init__(cfg, train_dataset, data_batch_size=width)
         self._fetch_lock = asyncio.Lock()
         self._queued_requests = deque()
         self._issued_requests = {}
@@ -213,6 +214,7 @@ class RPentRolloutBufferWorker(RolloutBufferWorker):
                 "group_size": self.cfg.algorithm.group_size,
                 "task_name": self.task_name,
                 "dataloader": self.buffer.dataloader.state_dict(),
+                "dataloader_batch_size": self.buffer.dataloader.batch_size,
                 "tasks": self.buffer.tasks,
                 "group_tasks": self.buffer.group_tasks,
                 "next_group_id": self.buffer.next_group_id,
@@ -256,6 +258,16 @@ class RPentRolloutBufferWorker(RolloutBufferWorker):
                 "Restored pending episodes exceed rollout_buffer.max_inflight_groups"
             )
         loader = self.buffer.dataloader
+        legacy_width = self.cfg.data.rollout_batch_size * self.cfg.algorithm.get(
+            "max_num_gen_batches", 1
+        )
+        saved_width = state.get("dataloader_batch_size", legacy_width)
+        if saved_width != loader.batch_size:
+            # A saved sampler cursor counts batches of its original width.
+            self.buffer._build_dataloader(
+                self.cfg, loader.dataset, data_batch_size=saved_width
+            )
+            loader = self.buffer.dataloader
         if self.cfg.data.shuffle:
             # Torch's sampler stores no generator state in StatefulDataLoader.
             # Recreate completed shuffles before restoring the within-epoch cursor.

@@ -23,6 +23,14 @@ from rlinf.runners.async_agent_runner import AsyncAgentRunner
 class RPentRunner(AsyncAgentRunner):
     supports_actor_recompute = True
 
+    def _build_dataloader(self, train_dataset, val_dataset, collate_fn=None):
+        width = (
+            self.cfg.data.sampling_batch_size if self.cfg.runner.synchronous else None
+        )
+        super()._build_dataloader(
+            train_dataset, val_dataset, collate_fn, data_batch_size=width
+        )
+
     def _prepare_update(self, release_handle):
         if self.cfg.runner.synchronous:
             cohort = self._wait_actor(release_handle, self._training_handles)[0]
