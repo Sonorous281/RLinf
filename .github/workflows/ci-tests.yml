@@ -136,6 +136,7 @@ jobs:
               - *shared
               - 'rlinf/agents/**'
               - 'rlinf/workers/actor/ma_megatron_actor_worker.py'
+              - 'rlinf/workers/actor/nested_prefix.py'
               - 'rlinf/workers/actor/megatron_actor_worker.py'
               - 'rlinf/workers/actor/fsdp_actor_worker.py'
               - 'rlinf/workers/actor/ma_fsdp_actor_worker.py'
@@ -193,6 +194,7 @@ jobs:
             unit_test_filter: &unit
               - *shared
               - 'rlinf/workers/actor/ma_megatron_actor_worker.py'
+              - 'rlinf/workers/actor/nested_prefix.py'
               - 'rlinf/robotics/**'
               - 'rlinf/models/embodiment/openpi/**'
               # Unit tests import env modules directly (robot task envs, the

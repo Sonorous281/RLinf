@@ -83,6 +83,8 @@ RPent 的模拟器进程用 tokenizer 和图像处理器计算上下文长度。
    "$RPENT_PYTHON" examples/agent/rpent/prepare_tasks.py --libero-type pro --seeds 0-31 --output-dir data/rpent
    bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_grpo
 
+如果规划历史较长，可以在 GRPO 训练 YAML 中设置 ``actor.reuse_nested_prefixes: true``。同一条轨迹里，如果前一行的所有 token 都出现在后一行开头，而且这段的图像和位置编码一致，actor 可以用一次模型计算完成两行的训练。每行仍保留自己的动作掩码、损失权重和重要性比值检查。沿用示例的稠密 Qwen3.5 模型、分块输出投影和单行微批，并保持 dropout、CUDA Graph 和数据并行通信重叠关闭。
+
 使用 SAO 时，以 ``--libero-type standard`` 生成任务清单，然后运行：
 
 .. code-block:: bash

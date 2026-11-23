@@ -665,6 +665,74 @@ def test_actor_entropy_bonus_uses_response_predictors(scoring_actor, response_on
     )
 
 
+def test_nested_actor_preserves_logprobs_and_gated_updates(scoring_actor):
+    actor, _ = scoring_actor
+    actor.cfg.actor.model.encoder_seq_length = 8
+    actor.response_only_logits = True
+    actor.cfg.algorithm.early_stop_imp_ratio = 5.0
+    actor.cfg.algorithm.importance_sampling_fix = True
+    actor.cfg.algorithm.importance_sampling_clip = 2.0
+    actor.cfg.algorithm.use_valid_token_scale = True
+    actor.global_valid_token = 6
+    actor.num_microbatches = 3
+    actor.calculate_entropy = actor.calculate_entropy_loss = True
+    warnings = []
+    actor.log_warning = warnings.append
+    ids = torch.tensor([0, 1, 2, 1, 1, 0, 2, 1])
+    masks = [
+        torch.tensor(row, dtype=torch.bool)
+        for row in ([0, 1, 0], [0, 0, 1, 0, 1], [0, 0, 0, 1, 0, 1, 0, 1])
+    ]
+    rows = [
+        {"input_ids": [ids[: len(mask)]], "response_mask": [mask]} for mask in masks
+    ]
+
+    def replay(compact):
+        model = _DecoderStage()
+        calls = []
+        model.register_forward_hook(lambda *args: calls.append(1))
+        batch = [dict(row) for row in rows]
+        if compact:
+            for remaining, row in zip((3, 2, 1), batch):
+                row["nested_prefix_run"] = torch.tensor([remaining])
+        actor.return_loss = False
+        forward = actor.get_forward_step_func()
+        iterator = iter(batch)
+        old = []
+        with torch.no_grad():
+            for _ in batch:
+                output, collect = forward(iterator, model)
+                old.append(collect(output)[0])
+        assert len(calls) == (1 if compact else 3)
+
+        for slot, row in enumerate(batch):
+            previous = old[slot] - (3.0 if slot == 2 else 0)
+            row["recomputed_logprobs"] = [previous]
+            row["rollout_logprobs"] = [previous + 0.25]
+            row["advantages"] = [torch.full_like(previous, slot - 0.75)]
+            row["loss_scales"] = [torch.full_like(previous, 1 / (slot + 1))]
+
+        actor.return_loss = True
+        forward = actor.get_forward_step_func()
+        iterator = iter(batch)
+        metrics = []
+        for _ in batch:
+            output, loss_fn = forward(iterator, model)
+            loss, values = loss_fn(output)
+            (loss / len(batch)).backward()
+            metrics.append({k: v.detach() for k, v in values.items()})
+        assert metrics[-1]["actor/final_loss"].item() == 0
+        assert len(calls) == (2 if compact else 6)
+        grad = model.output_layer.weight.grad.clone()
+        assert grad.norm() > 0
+        torch.optim.Adam(model.parameters(), lr=1e-3).step()
+        return old, metrics, grad, model.output_layer.weight.detach()
+
+    expected, actual = replay(False), replay(True)
+    assert len(warnings) == 2
+    torch.testing.assert_close(actual, expected)
+
+
 def test_actor_passes_hidden_states_between_stages_unscaled(scoring_actor):
     actor, batch = scoring_actor
     actor.calculate_entropy = actor.return_loss = False

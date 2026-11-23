@@ -15,6 +15,7 @@
 from contextlib import nullcontext
 from dataclasses import replace
 from functools import partial
+from itertools import chain
 from typing import Optional
 
 import torch
@@ -77,6 +78,10 @@ from rlinf.utils.utils import (
 from rlinf.workers.actor.megatron_actor_worker import (
     MegatronActor,
 )
+from rlinf.workers.actor.nested_prefix import (
+    nested_prefix_ends,
+    score_nested_microbatches,
+)
 from rlinf.workers.megatron_worker import DynamicMegatronBatchMixin
 from rlinf.workers.rollout.session_server.assembly import (
     assemble_group_payload,
@@ -125,6 +130,25 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
         loss_scales = self.cfg.algorithm.get("loss_scales", [])
         self.loss_scale_fns = get_loss_scales(loss_scales)
         self.pack_traj = self.cfg.actor.get("pack_traj", True)
+        self.reuse_nested_prefixes = cfg.actor.get("reuse_nested_prefixes", False)
+        if self.reuse_nested_prefixes and (
+            self.scoring_forward is None
+            or self.enable_dynamic_batch_size
+            or cfg.actor.micro_batch_size != 1
+            or self.logprob_forward_micro_batch_size != 1
+            or self.transformer_config.num_moe_experts
+            or self.transformer_config.expert_model_parallel_size != 1
+            or self.transformer_config.cuda_graph_impl != "none"
+            or self.transformer_config.hidden_dropout
+            or self.transformer_config.attention_dropout
+            or cfg.actor.optim.get("overlap_param_gather", False)
+            or cfg.actor.optim.get("overlap_grad_reduce", False)
+        ):
+            raise ValueError(
+                "Nested prefix reuse requires dense chunked Qwen-VL scoring with EP1, "
+                "fixed training and logprob microbatch size 1, zero dropout, "
+                "disabled CUDA graphs and disabled DP communication overlap"
+            )
 
     def _receive_rollout_result(
         self, channel: Channel
@@ -260,60 +284,92 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
             for key, value in output.items()
         }
 
+    def run_forward_backward(self, batch: DynamicActorBatch, forward_only=True):
+        if self.reuse_nested_prefixes:
+            # The final DP assignment, shuffle and optimizer-step boundaries are known here.
+            ends = nested_prefix_ends(batch)
+            physical_rows = [i for i, end in enumerate(ends) if i == end]
+            if self.is_data_io_rank:
+                rows = batch["input_ids"]
+                self.log_info(
+                    f"Nested prefix {'inference' if forward_only else 'training'}: "
+                    f"{len(rows)} logical rows / {len(physical_rows)} physical rows, "
+                    f"{sum(map(len, rows))} logical input tokens / "
+                    f"{sum(len(rows[i]) for i in physical_rows)} physical input tokens"
+                )
+            if len(physical_rows) != len(ends):
+                runs = torch.tensor([end - i + 1 for i, end in enumerate(ends)])
+                batch = {**batch, "nested_prefix_run": runs}
+        return super().run_forward_backward(batch, forward_only)
+
+    def _forward_ragged_scores(self, batch, model):
+        rows = [
+            row.to(self.torch_platform.current_device()) for row in batch["input_ids"]
+        ]
+        lengths = [len(row) for row in rows]
+        input_ids, packed_params = preprocess_ragged_seqs(rows)
+        position_ids, _ = preprocess_ragged_seqs(
+            [torch.arange(n, device=input_ids.device) for n in lengths]
+        )
+        labels = [torch.cat((row[1:], row.new_zeros(1))) for row in rows]
+        label, _ = preprocess_ragged_seqs(labels)
+        if self.response_only_logits or self.scoring_forward is not None:
+            # Shift in each trajectory before the packing step inserts TP padding.
+            masks = [
+                torch.cat((mask[1:], mask.new_zeros(1))).to(input_ids.device)
+                for mask in batch["response_mask"]
+            ]
+        else:
+            masks = [torch.arange(n, device=input_ids.device) < n - 1 for n in lengths]
+        label_mask, _ = preprocess_ragged_seqs(masks)
+        module = unwrap_model(model)
+        with self.ragged_model_inputs(
+            batch, module, input_ids, position_ids, packed_params
+        ) as model_inputs:
+            output = self._score_packed_tokens(
+                model, module, model_inputs, label, label_mask
+            )
+
+        if module.post_process:
+            return {
+                key: postprocess_ragged_seqs(value, packed_params, lengths)
+                for key, value in output.items()
+            }
+        return output
+
     def get_forward_step_func(self):
         """Acquire the forward step function for the model."""
+        logical_rows = None
 
         def forward_output_and_loss_func(dataloader_iter, model):
-            batch = next(dataloader_iter)
+            nonlocal logical_rows
+            if logical_rows is None:
+                batch = next(dataloader_iter)
+                if "nested_prefix_run" in batch:
+                    logical_rows = score_nested_microbatches(
+                        chain([batch], dataloader_iter),
+                        partial(self._forward_ragged_scores, model=model),
+                    )
+                else:
+                    output = self._forward_ragged_scores(batch, model)
+            if logical_rows is not None:
+                batch, output = next(logical_rows)
 
-            rows = [
-                row.to(self.torch_platform.current_device())
-                for row in batch["input_ids"]
-            ]
-            lengths = [len(row) for row in rows]
-            input_ids, packed_params = preprocess_ragged_seqs(rows)
-            position_ids, _ = preprocess_ragged_seqs(
-                [torch.arange(n, device=input_ids.device) for n in lengths]
-            )
-            labels = [torch.cat((row[1:], row.new_zeros(1))) for row in rows]
-            label, _ = preprocess_ragged_seqs(labels)
-            if self.response_only_logits or self.scoring_forward is not None:
-                # Shift in each trajectory before the packing step inserts TP padding.
-                masks = [
-                    torch.cat((mask[1:], mask.new_zeros(1))).to(input_ids.device)
-                    for mask in batch["response_mask"]
-                ]
-            else:
-                masks = [
-                    torch.arange(n, device=input_ids.device) < n - 1 for n in lengths
-                ]
-            label_mask, _ = preprocess_ragged_seqs(masks)
-            module = unwrap_model(model)
-            with self.ragged_model_inputs(
-                batch, module, input_ids, position_ids, packed_params
-            ) as model_inputs:
-                output = self._score_packed_tokens(
-                    model, module, model_inputs, label, label_mask
-                )
-
-            if module.post_process:
-                output_rows = {
-                    key: postprocess_ragged_seqs(value, packed_params, lengths)
-                    for key, value in output.items()
-                }
+            if unwrap_model(model).post_process:
+                device = output["log_probs"][0].device
                 if not self.return_loss:
                     logprob_rows = [
                         align_next_token_scores(row).detach().cpu()
-                        for row in output_rows["log_probs"]
+                        for row in output["log_probs"]
                     ]
                     # Megatron inspects the tensor device before collecting non-loss data.
                     return (
-                        output["log_probs"],
+                        output["log_probs"][0],
                         lambda output, non_loss_data=True: logprob_rows,
                     )
                 width = self.cfg.actor.model.encoder_seq_length
                 output = DynamicRolloutResult.materialize_actor_batch(
-                    output_rows, width, 0, input_ids.device
+                    output, width, 0, device
                 )
                 batch = DynamicRolloutResult.materialize_actor_batch(
                     {
@@ -330,7 +386,7 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
                     },
                     width,
                     self.tokenizer.eos_token_id,
-                    input_ids.device,
+                    device,
                 )
 
             if not self.return_loss:
@@ -556,7 +612,9 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
                 batch["loss_scales"] = [mask.float() for mask in batch["response_mask"]]
         self._restore_source_normalization(batch, scale_context)
         for key in list(batch.keys()):
-            if key == "idx_to_traj" or key.startswith("extra:"):
+            if (
+                key == "idx_to_traj" and not self.reuse_nested_prefixes
+            ) or key.startswith("extra:"):
                 batch.pop(key, None)
 
         # Must be called after batch is retrieved, which is when rollout has stopped
