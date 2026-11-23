@@ -190,7 +190,7 @@ def chunked_vocab_parallel_log_probs(
     hidden: torch.Tensor,
     weight: torch.Tensor,
     labels: torch.Tensor,
-    label_mask: torch.Tensor,
+    label_mask: torch.Tensor | None,
     *,
     chunk_size: int,
     temperature: float = 1.0,
@@ -206,7 +206,7 @@ def chunked_vocab_parallel_log_probs(
             The caller owns TP input-gradient reduction (or SP reduce-scatter).
         weight: Contiguous vocabulary shard, ordered by rank in ``tp_group``.
         labels: Global vocabulary IDs for the next tokens.
-        label_mask: Positions whose log probabilities are consumed by the loss.
+        label_mask: Positions consumed by the loss, or None for preselected inputs.
         chunk_size: Maximum number of positions in each vocabulary projection.
         temperature: Positive sampling temperature, applied before softmax.
         bias: Optional vocabulary-sharded output bias.
@@ -226,32 +226,43 @@ def chunked_vocab_parallel_log_probs(
         raise ValueError(f"chunk_size must be a positive integer, got {chunk_size!r}")
     if not math.isfinite(temperature) or temperature <= 0:
         raise ValueError(f"temperature must be finite and positive, got {temperature}")
-    if hidden.shape[:-1] != labels.shape or labels.shape != label_mask.shape:
+    if hidden.shape[:-1] != labels.shape or (
+        label_mask is not None and labels.shape != label_mask.shape
+    ):
         raise ValueError("Hidden leading dimensions, labels and label_mask must match")
     if hidden.dtype != weight.dtype:
         raise ValueError(
             f"Hidden and weight dtypes must match, got {hidden.dtype}, {weight.dtype}"
         )
-    flat_mask = label_mask.reshape(-1).bool()
-    positions = (
-        torch.arange(labels.numel(), device=labels.device)
-        if calculate_entropy
-        else flat_mask.nonzero(as_tuple=True)[0]
-    )
     flat_hidden = hidden.reshape(-1, hidden.shape[-1])
+    targets = labels.reshape(-1)
+    if label_mask is not None:
+        flat_mask = label_mask.reshape(-1).bool()
+        positions = (
+            torch.arange(labels.numel(), device=labels.device)
+            if calculate_entropy
+            else flat_mask.nonzero(as_tuple=True)[0]
+        )
+        flat_hidden = flat_hidden[positions]
+        targets = targets.masked_fill(~flat_mask, 0)[positions]
     selected, entropy = _ChunkedLogProbs.apply(
-        flat_hidden[positions],
+        flat_hidden,
         weight,
         bias,
-        labels.reshape(-1).masked_fill(~flat_mask, 0)[positions],
+        targets,
         chunk_size,
         temperature,
         tp_group,
         calculate_entropy,
         gradient_accumulation_fusion,
     )
-    log_probs = selected.new_zeros(labels.numel()).scatter(0, positions, selected)
-    result = {"log_probs": log_probs.masked_fill(~flat_mask, 0).view_as(labels)}
+    if label_mask is not None:
+        selected = (
+            selected.new_zeros(labels.numel())
+            .scatter(0, positions, selected)
+            .masked_fill(~flat_mask, 0)
+        )
+    result = {"log_probs": selected.view_as(labels)}
     if entropy is not None:
         result["entropy"] = entropy.view_as(labels)
     return result

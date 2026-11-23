@@ -83,7 +83,9 @@ Generate training rows from the goal, object and spatial suites. Each JSONL row 
    "$RPENT_PYTHON" examples/agent/rpent/prepare_tasks.py --libero-type pro --seeds 0-31 --output-dir data/rpent
    bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_grpo
 
-For long planner histories, set ``actor.reuse_nested_prefixes: true`` in the GRPO training YAML. When one training row in an episode is the complete prefix of the next, the actor can run the model once for both rows. Their image inputs and positions must also match over the shorter row. Each row keeps its action mask, loss weight and importance-ratio check. Use the recipe’s dense Qwen3.5 model, chunked output projection and single-row microbatches. Keep dropout, CUDA graphs and overlapping DP communication disabled.
+To reuse long planner histories, set ``reuse_nested_prefixes: true`` under ``actor`` in the GRPO training YAML. This option is off by default. Two consecutive rows from the same episode can share a decoder pass if the shorter row is an exact prefix of the longer one, including its tokens, images and positions.
+
+The actor computes the old log probabilities for both rows in one pass. During an update, it applies the output projection in each row's original microbatch, preserving its action mask, loss weight and importance-ratio check. Use the recipe's dense Qwen3.5 model, chunked output projection and single-row microbatches. Keep dropout, CUDA graphs and overlapping DP communication disabled.
 
 For SAO, generate the task file with ``--libero-type standard`` and run:
 

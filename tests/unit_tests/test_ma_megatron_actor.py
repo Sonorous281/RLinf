@@ -573,6 +573,39 @@ class _DecoderStage(torch.nn.Module):
         return self.output_layer(hidden).transpose(0, 1).contiguous()
 
 
+class _ChunkedDecoderStage(_DecoderStage):
+    def __init__(self):
+        from types import SimpleNamespace
+
+        super().__init__()
+        self.embedding = torch.nn.Embedding.from_pretrained(torch.eye(3), freeze=False)
+        self.output_layer.gradient_accumulation_fusion = False
+        self.language_model = SimpleNamespace(
+            post_process=True,
+            mtp_process=False,
+            pg_collection=SimpleNamespace(tp=None),
+            config=SimpleNamespace(
+                mtp_num_layers=0,
+                use_mup=False,
+                defer_embedding_wgrad_compute=False,
+                fp8=False,
+            ),
+            _postprocess=self.postprocess_hidden,
+        )
+
+    def postprocess_hidden(self, hidden, *, output_processor):
+        return output_processor(
+            hidden_states=hidden,
+            output_layer=self.output_layer,
+            output_weight=None,
+            labels=None,
+            inference_context=None,
+        )
+
+    def forward(self, input_ids, attention_mask, position_ids, packed_seq_params):
+        return self.language_model._postprocess(self.embedding(input_ids.T))
+
+
 @pytest.fixture
 def scoring_actor(tmp_path, monkeypatch):
     from types import SimpleNamespace
@@ -666,7 +699,17 @@ def test_actor_entropy_bonus_uses_response_predictors(scoring_actor, response_on
 
 
 def test_nested_actor_preserves_logprobs_and_gated_updates(scoring_actor):
+    from functools import partial
+
+    from rlinf.hybrid_engines.megatron.qwen_vl import (
+        forward_qwen_vl_with_chunked_log_probs,
+    )
+
     actor, _ = scoring_actor
+    actor.scoring_forward = partial(
+        forward_qwen_vl_with_chunked_log_probs, chunk_size=2, calculate_entropy=True
+    )
+    actor.cfg.algorithm.entropy_bonus = 0.0
     actor.cfg.actor.model.encoder_seq_length = 8
     actor.response_only_logits = True
     actor.cfg.algorithm.early_stop_imp_ratio = 5.0
@@ -675,20 +718,22 @@ def test_nested_actor_preserves_logprobs_and_gated_updates(scoring_actor):
     actor.cfg.algorithm.use_valid_token_scale = True
     actor.global_valid_token = 6
     actor.num_microbatches = 3
-    actor.calculate_entropy = actor.calculate_entropy_loss = True
+    actor.calculate_entropy = True
+    actor.calculate_entropy_loss = False
     warnings = []
     actor.log_warning = warnings.append
     ids = torch.tensor([0, 1, 2, 1, 1, 0, 2, 1])
+    # The first two rows score the same action under different loss weights.
     masks = [
         torch.tensor(row, dtype=torch.bool)
-        for row in ([0, 1, 0], [0, 0, 1, 0, 1], [0, 0, 0, 1, 0, 1, 0, 1])
+        for row in ([0, 1, 0], [0, 1, 0, 0, 1], [0, 0, 0, 1, 0, 1, 0, 1])
     ]
     rows = [
         {"input_ids": [ids[: len(mask)]], "response_mask": [mask]} for mask in masks
     ]
 
     def replay(compact):
-        model = _DecoderStage()
+        model = _ChunkedDecoderStage()
         calls = []
         model.register_forward_hook(lambda *args: calls.append(1))
         batch = [dict(row) for row in rows]
@@ -723,10 +768,10 @@ def test_nested_actor_preserves_logprobs_and_gated_updates(scoring_actor):
             metrics.append({k: v.detach() for k, v in values.items()})
         assert metrics[-1]["actor/final_loss"].item() == 0
         assert len(calls) == (2 if compact else 6)
-        grad = model.output_layer.weight.grad.clone()
-        assert grad.norm() > 0
+        grads = [param.grad.clone() for param in model.parameters()]
+        assert all(grad.norm() > 0 for grad in grads)
         torch.optim.Adam(model.parameters(), lr=1e-3).step()
-        return old, metrics, grad, model.output_layer.weight.detach()
+        return old, metrics, grads, [param.detach() for param in model.parameters()]
 
     expected, actual = replay(False), replay(True)
     assert len(warnings) == 2

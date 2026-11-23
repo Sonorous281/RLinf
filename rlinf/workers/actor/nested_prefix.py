@@ -75,64 +75,101 @@ def nested_prefix_ends(batch: DynamicActorBatch) -> list[int]:
 
 
 class NestedPrefixScores:
-    """Accumulate per-slot score gradients and backpropagate the model once.
-
-    Megatron completes one logical loss/backward before requesting its next slot
-    (PP1, fixed MBS1). Earlier slots can therefore accumulate into detached leaves.
-    At the final slot the model sees the sum of all scaled and gated gradients.
-    """
+    """Project the scores from a shared inference pass onto each logical row."""
 
     def __init__(self, scores: dict[str, torch.Tensor]):
         self.scores = scores
-        self.leaves = {
-            key: value.detach().requires_grad_(value.requires_grad)
-            for key, value in scores.items()
-        }
 
     def logical_scores(
         self, response_mask: torch.Tensor, *, last: bool
     ) -> dict[str, torch.Tensor]:
-        """Project the original row's response mask onto next-token prediction sites."""
-        if last:
-            for key, leaf in self.leaves.items():
-                if leaf.grad is not None:
-                    self.scores[key].register_hook(
-                        lambda grad, previous=leaf.grad: grad + previous
-                    )
-        source = self.scores if last else self.leaves
         prediction_mask = torch.nn.functional.pad(response_mask[1:], (0, 1))
-        prediction_mask = prediction_mask.to(source["log_probs"].device)
+        prediction_mask = prediction_mask.to(self.scores["log_probs"].device)
         return {
             key: value[: len(response_mask)].masked_fill(~prediction_mask, 0)
-            for key, value in source.items()
+            for key, value in self.scores.items()
         }
 
 
-def _score_run(first, batches, count, forward):
+class _SelectPrefixHidden(torch.autograd.Function):
+    """Keep sparse head gradients until the final slot can backpropagate the body."""
+
+    @staticmethod
+    def forward(ctx, hidden, indices, pending, last):
+        ctx.save_for_backward(indices)
+        ctx.hidden_shape = hidden.shape
+        ctx.pending = pending
+        ctx.last = last
+        return hidden.index_select(0, indices)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (indices,) = ctx.saved_tensors
+        if not ctx.last:
+            ctx.pending.append((indices, grad.detach()))
+            return None, None, None, None
+
+        total = grad.new_zeros(ctx.hidden_shape)
+        for earlier_indices, earlier_grad in ctx.pending:
+            total.index_add_(0, earlier_indices, earlier_grad)
+        ctx.pending.clear()
+        total.index_add_(0, indices, grad)
+        return total, None, None, None
+
+
+class NestedPrefixHead:
+    """Project each logical slot using its original weights and scored positions."""
+
+    def __init__(self, hidden, labels, score):
+        # Fixed MBS1. SP/TP synchronization wraps the physical hidden tensor once.
+        self.hidden = hidden[0]
+        self.labels = labels[0]
+        self.score = score
+        self.pending = []
+
+    def logical_scores(self, response_mask, *, last):
+        indices = response_mask[1:].nonzero(as_tuple=True)[0].to(self.hidden.device)
+        hidden = self.hidden
+        if not last:
+            # Earlier backward calls must not enter or free the physical model graph.
+            hidden = hidden.detach().requires_grad_(hidden.requires_grad)
+        selected = _SelectPrefixHidden.apply(hidden, indices, self.pending, last)
+        targets = self.labels.index_select(0, indices)
+        scores = self.score(selected, labels=targets, label_mask=None)
+        return {
+            key: values.new_zeros(len(response_mask)).index_copy(0, indices, values)
+            for key, values in scores.items()
+        }
+
+
+def _score_run(first, batches, count, forward, forward_head):
     rows = [first]
     for _ in range(count - 1):
         # Only the longest row needs its prefetched pixels.
         rows[-1].pop("_prepared_multimodal_inputs", None)
         rows.append(next(batches))
     longest = rows[-1]
-    mask = longest["response_mask"][0].clone()
-    for row in rows[:-1]:
-        other = row["response_mask"][0]
-        mask[: len(other)] |= other
-    physical = forward({**longest, "response_mask": [mask]})
-    shared = NestedPrefixScores({key: value[0] for key, value in physical.items()})
+    if forward_head is not None:
+        shared = forward_head(longest)
+    else:
+        mask = longest["response_mask"][0].clone()
+        for row in rows[:-1]:
+            other = row["response_mask"][0]
+            mask[: len(other)] |= other
+        physical = forward({**longest, "response_mask": [mask]})
+        shared = NestedPrefixScores({key: value[0] for key, value in physical.items()})
     for i, row in enumerate(rows):
         logical = shared.logical_scores(row["response_mask"][0], last=i == count - 1)
         yield row, {key: [value] for key, value in logical.items()}
 
 
 def score_nested_microbatches(
-    batches: Iterator[dict], forward: Callable
+    batches: Iterator[dict], forward: Callable, forward_head: Callable | None = None
 ) -> Iterator[tuple[dict, dict]]:
     """Yield one logical score row per Megatron slot, in original collective order."""
     for batch in batches:
         count = int(batch["nested_prefix_run"].item())
         if count > 1:
-            yield from _score_run(batch, batches, count, forward)
+            yield from _score_run(batch, batches, count, forward, forward_head)
         else:
             yield batch, forward(batch)

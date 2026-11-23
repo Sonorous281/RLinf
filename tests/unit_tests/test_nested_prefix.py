@@ -18,7 +18,10 @@ import pytest
 import torch
 
 from rlinf.utils.image_replay import REPLAY_FORMAT
-from rlinf.workers.actor.nested_prefix import NestedPrefixScores, nested_prefix_ends
+from rlinf.workers.actor.nested_prefix import (
+    NestedPrefixHead,
+    nested_prefix_ends,
+)
 
 
 def _image_row(prompt, spans):
@@ -69,43 +72,88 @@ def test_nested_prefix_requires_the_same_model_inputs(change):
     assert nested_prefix_ends(batch) == ([2, 2, 2] if change == "none" else [0, 2, 2])
 
 
-@pytest.mark.parametrize("skipped_slot", [None, 0, 2])
-def test_shared_forward_preserves_masked_slot_gradients(skipped_slot):
-    # Two logical rows score the same token with different weights. The last
-    # slot can be gated out even when earlier slots must update the model.
+@pytest.mark.parametrize("fusion,tied", [(False, False), (False, True), (True, True)])
+@pytest.mark.parametrize("last", ["normal", "gated", "empty"])
+def test_logical_heads_preserve_sparse_gradients(fusion, tied, last):
+    from rlinf.hybrid_engines.megatron.lm_head import chunked_vocab_parallel_log_probs
+
+    rng = torch.Generator().manual_seed(802)
+    initial = torch.randn(11, 5, generator=rng)
+    transform = torch.randn(5, 5, generator=rng)
+    ids = torch.tensor([3, 1, 8, 7, 0, 4, 6, 2])
+    labels = torch.cat((ids[1:], ids.new_zeros(1)))
     masks = [
         torch.tensor(row, dtype=torch.bool)
         for row in ([0, 0, 1, 1], [0, 0, 1, 0, 0, 1], [0, 0, 0, 0, 1, 0, 0, 1])
     ]
-    token_ids = torch.tensor([0, 1, 1, 2, 0, 1, 2, 1])
-    initial = torch.linspace(-0.65, 0.77, 9, dtype=torch.float64).reshape(3, 3)
+    if last == "empty":
+        masks[-1].zero_()
 
-    def score(weight, size):
-        logits = weight[token_ids[:size]].cumsum(dim=0)
-        log_probs = logits.log_softmax(-1)
-        return {
-            "log_probs": log_probs[:, 0],
-            "entropy": -(log_probs.exp() * log_probs).sum(dim=-1),
-        }
+    def run(shared):
+        embedding = initial.clone().requires_grad_()
+        weight = embedding if tied else initial.flip(0).requires_grad_()
+        bias = torch.zeros(len(initial), requires_grad=True)
+        body = transform.clone().requires_grad_()
+        if fusion:
+            weight.main_grad = torch.zeros_like(weight)
+            weight.grad_added_to_main_grad = False
+        body_backwards = []
+        calls = []
 
-    def backward(shared):
-        weight = initial.clone().requires_grad_()
-        chain = NestedPrefixScores(score(weight, len(token_ids))) if shared else None
-        values = []
+        def decoder(length):
+            hidden = (embedding[ids[:length]].cumsum(0) @ body).unsqueeze(0)
+            hidden.register_hook(lambda grad: body_backwards.append(length))
+            return hidden
+
+        def project(hidden, *, labels, label_mask):
+            calls.append(labels.numel())
+            return chunked_vocab_parallel_log_probs(
+                hidden,
+                weight,
+                labels,
+                label_mask,
+                chunk_size=2,
+                temperature=0.9,
+                bias=bias,
+                calculate_entropy=True,
+                gradient_accumulation_fusion=fusion,
+            )
+
+        chain = (
+            NestedPrefixHead(decoder(len(ids)), labels[None], project)
+            if shared
+            else None
+        )
+        results = []
         for slot, mask in enumerate(masks):
-            prediction_indices = mask.nonzero().flatten() - 1
+            next_mask = torch.nn.functional.pad(mask[1:], (0, 1))
             if chain is None:
-                scores = score(weight, len(mask))
+                scores = project(
+                    decoder(len(mask))[0],
+                    labels=labels[: len(mask)],
+                    label_mask=next_mask,
+                )
             else:
                 scores = chain.logical_scores(mask, last=slot == len(masks) - 1)
-            loss = (
-                scores["log_probs"][prediction_indices] * (slot - 0.5)
-                - scores["entropy"][prediction_indices] * 0.03
-            ).mean()
-            values.append(loss.detach())
-            (loss * (0 if slot == skipped_slot else 1)).backward()
-        return torch.stack(values), weight.grad
+            results.append({k: v[next_mask].detach() for k, v in scores.items()})
+            # The final backward must deliver prior gradients even with zero loss or zero targets.
+            loss = scores["log_probs"].sum() * (
+                0 if last == "gated" and slot == 2 else slot - 0.7
+            )
+            loss.backward()
+            if shared and slot < 2:
+                assert not body_backwards and body.grad is None
+        if shared:
+            assert body_backwards == [len(ids)]
+            assert calls == [mask.sum().item() for mask in masks]
+            assert not chain.pending
+        weight_grad = weight.grad + weight.main_grad if fusion else weight.grad
+        return (
+            results,
+            body.grad,
+            weight_grad,
+            bias.grad,
+            None if tied else embedding.grad,
+        )
 
-    expected, actual = backward(False), backward(True)
-    assert expected[1].norm() > 0
-    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(run(True), run(False), atol=2e-5, rtol=2e-5)

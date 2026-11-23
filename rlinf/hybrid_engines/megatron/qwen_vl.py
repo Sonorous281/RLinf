@@ -82,8 +82,9 @@ def forward_qwen_vl_with_chunked_log_probs(
     chunk_size: int,
     temperature: float,
     calculate_entropy: bool = False,
+    prepare_head=None,
     **model_inputs,
-) -> dict[str, torch.Tensor]:
+):
     """Score Qwen-VL decoder output while preserving its multimodal forward.
 
     This adapter binds Core 0.18's output processor to Bridge 0.5 Qwen3VLGPTModel.
@@ -119,6 +120,7 @@ def forward_qwen_vl_with_chunked_log_probs(
             temperature=temperature,
             calculate_entropy=calculate_entropy,
             tp_group=language_model.pg_collection.tp,
+            prepare_head=prepare_head,
         ),
     )
     try:
@@ -143,6 +145,7 @@ def _qwen_vl_output_processor(
     temperature,
     calculate_entropy,
     tp_group,
+    prepare_head=None,
     **kwargs,
 ):
     if labels is not None or inference_context is not None:
@@ -163,11 +166,9 @@ def _qwen_vl_output_processor(
             hidden = tensor_parallel.copy_to_tensor_model_parallel_region(
                 hidden, group=tp_group
             )
-    return chunked_vocab_parallel_log_probs(
-        hidden.transpose(0, 1),
-        weight,
-        label,
-        label_mask,
+    score = partial(
+        chunked_vocab_parallel_log_probs,
+        weight=weight,
         chunk_size=chunk_size,
         temperature=temperature,
         bias=output_layer.bias,
@@ -175,3 +176,7 @@ def _qwen_vl_output_processor(
         calculate_entropy=calculate_entropy,
         gradient_accumulation_fusion=output_layer.gradient_accumulation_fusion,
     )
+    hidden = hidden.transpose(0, 1)
+    if prepare_head is not None:
+        return prepare_head(hidden, label, score)
+    return score(hidden, labels=label, label_mask=label_mask)

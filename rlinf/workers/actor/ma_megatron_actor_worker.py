@@ -79,6 +79,7 @@ from rlinf.workers.actor.megatron_actor_worker import (
     MegatronActor,
 )
 from rlinf.workers.actor.nested_prefix import (
+    NestedPrefixHead,
     nested_prefix_ends,
     score_nested_microbatches,
 )
@@ -216,7 +217,9 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
             self.torch_platform.current_device(),
         )
 
-    def _score_packed_tokens(self, model, module, model_inputs, label, label_mask):
+    def _score_packed_tokens(
+        self, model, module, model_inputs, label, label_mask, prepare_head=None
+    ):
         """Project packed tokens and return scores in their original positions."""
         temperature = self.cfg.algorithm.sampling_params.temperature
         if self.scoring_forward is not None:
@@ -227,6 +230,7 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
                 temperature=temperature,
                 label=label,
                 label_mask=label_mask,
+                **({"prepare_head": prepare_head} if prepare_head else {}),
             )
         positions = None
         projection = nullcontext()
@@ -302,7 +306,7 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
                 batch = {**batch, "nested_prefix_run": runs}
         return super().run_forward_backward(batch, forward_only)
 
-    def _forward_ragged_scores(self, batch, model):
+    def _forward_ragged_scores(self, batch, model, prepare_head=None):
         rows = [
             row.to(self.torch_platform.current_device()) for row in batch["input_ids"]
         ]
@@ -327,10 +331,10 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
             batch, module, input_ids, position_ids, packed_params
         ) as model_inputs:
             output = self._score_packed_tokens(
-                model, module, model_inputs, label, label_mask
+                model, module, model_inputs, label, label_mask, prepare_head
             )
 
-        if module.post_process:
+        if module.post_process and prepare_head is None:
             return {
                 key: postprocess_ragged_seqs(value, packed_params, lengths)
                 for key, value in output.items()
@@ -346,9 +350,13 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
             if logical_rows is None:
                 batch = next(dataloader_iter)
                 if "nested_prefix_run" in batch:
+                    forward = partial(self._forward_ragged_scores, model=model)
                     logical_rows = score_nested_microbatches(
                         chain([batch], dataloader_iter),
-                        partial(self._forward_ragged_scores, model=model),
+                        forward,
+                        partial(forward, prepare_head=NestedPrefixHead)
+                        if self.return_loss
+                        else None,
                     )
                 else:
                     output = self._forward_ragged_scores(batch, model)
