@@ -1,0 +1,26 @@
+# Whole groups are selected after all eight episodes finish.
+defaults:
+  - train_qwen3.5_4b_episode_sync_oversample320
+  - preprocessing@_global_: token_space
+  - _self_
+
+runner:
+  experiment_name: rpent-episode-qwen3.5-4b-sync-grpo
+
+algorithm:
+  clip_ratio_high: 0.28
+  loss_scales: ["group_level", "agent_level", "turn_level"]
+  group_size: 8
+  adv_type: grpo_dynamic
+  advantage_mode: trajectory
+  # GRPO already normalizes within each group; skip a second batch whitening.
+  normalize_advantages: false
+  down_sampling:
+    do_down_sampling: false
+
+data:
+  rollout_batch_size: 32
+  sampling_batch_size: 40
+
+critic:
+  use_critic_model: false

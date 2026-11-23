@@ -339,6 +339,7 @@ class MegatronModelManager:
                 "sequence_parallel",
                 "tensor_model_parallel_size",
                 "pipeline_model_parallel_size",
+                "virtual_pipeline_model_parallel_size",
                 "expert_model_parallel_size",
                 "context_parallel_size",
                 "attention_backend",
@@ -363,10 +364,18 @@ class MegatronModelManager:
         if hasattr(provider, "vision_config"):
             provider.vision_config._attn_implementation = resolve_attn_implementation()
         if _model_type == "qwen3_5":
-            # RL scores next tokens only; exported policies carry no MTP weights.
-            provider.mtp_num_layers = None
+            text_config = provider.hf_text_config
+            if self._cfg.model.get("load_mtp", True):
+                mtp_layers = text_config.mtp_num_hidden_layers
+                assert (
+                    mtp_layers == 1 and not text_config.mtp_use_dedicated_embeddings
+                ), "Qwen3.5 weight sync requires one MTP layer with shared embeddings."
+                provider.mtp_num_layers = mtp_layers
+            else:
+                provider.mtp_num_layers = 0
+                # Bridge exports the HF config alongside the loaded parameters.
+                text_config.mtp_num_hidden_layers = 0
         if self.is_dedicated_critic_model:
-            # Runs after the bridge hook that loads the language model weights.
             provider.register_pre_wrap_hook(self._attach_value_head)
 
         # the Mbridge run the qwen3-vl-moe model will freeze the language model and vision model by default.

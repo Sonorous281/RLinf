@@ -5728,7 +5728,7 @@ def test_robotwin_env_passes_its_camera_near_to_robotwin(
     for name in ("envs", "robotwin", "robotwin.envs"):
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
     monkeypatch.setitem(
-        sys.modules, "envs.camera", types.SimpleNamespace(Camera=camera_cls)
+        sys.modules, "robotwin.envs.camera", types.SimpleNamespace(Camera=camera_cls)
     )
     monkeypatch.setitem(
         sys.modules,

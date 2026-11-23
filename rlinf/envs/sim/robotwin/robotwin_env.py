@@ -149,7 +149,7 @@ class RoboTwinEnv(gym.Env):
         mp.set_start_method("spawn", force=True)
         os.environ["ASSETS_PATH"] = self.cfg.assets_path
 
-        from envs.camera import Camera
+        from robotwin.envs.camera import Camera
         from robotwin.envs.vector_env import VectorEnv
 
         install_camera_near_plane(Camera)

@@ -181,6 +181,7 @@ def prepare_agent_ppo_targets(
     logprob_channel: Channel | None = None,
     adv_type: str = "actor_gae",
     gae_lambda_alpha: float = 1.5,
+    expected_weight_version: int | None = None,
 ) -> None:
     """Read a complete batch, compute global GAE, and send fixed training targets.
 
@@ -190,6 +191,21 @@ def prepare_agent_ppo_targets(
     Rows with a ``response_mask`` contribute only their generated tokens.
     """
     results = [input_channel.get() for _ in range(batch_size)]
+    if expected_weight_version is not None and any(
+        result.version_start is not None for result in results
+    ):
+        for result in results:
+            if (
+                result.version_start is None
+                or result.version_end is None
+                or any(
+                    version != expected_weight_version
+                    for version in result.version_start + result.version_end
+                )
+            ):
+                raise ValueError(
+                    f"Synchronous batch must contain only installed policy version {expected_weight_version}."
+                )
     if logprob_channel is not None:
         predictions = {}
         for _ in range(batch_size):

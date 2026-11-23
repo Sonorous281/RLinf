@@ -1,0 +1,25 @@
+# Four-node environment qualification; production GRPO keeps group_size=8.
+defaults:
+  - train_qwen3.5_4b_episode_sync_grpo
+  - _self_
+
+runner:
+  experiment_name: rpent-h200-unified-grpo-smoke
+  max_steps: 1
+  save_interval: 1
+
+algorithm:
+  group_size: 4
+
+data:
+  rollout_batch_size: 16
+  sampling_batch_size: 20
+
+tools:
+  rpent:
+    episodes_per_worker: 3
+    max_env_initializations_per_worker: 3
+
+actor:
+  lr_sched:
+    lr_decay_iters: 1

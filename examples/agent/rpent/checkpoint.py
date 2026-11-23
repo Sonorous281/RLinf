@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Extract a text planner or export a trained policy into its serving VLM.
-
-The original LIBERO workflow trains an extracted language model. The clean
-libero_rl workflow trains the full VLM with frozen vision components. Export
-accepts either layout and preserves the serving processor and vision weights.
-"""
+"""Export a trained RPent policy with its original VLM and processor."""
 
 import argparse
 import json
@@ -32,13 +27,6 @@ VLM_LANGUAGE = "model.language_model."
 VLM_VISION = "model.visual."
 TEXT_MODEL = "model."
 
-TOKENIZER_FILES = (
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "chat_template.jinja",
-    "generation_config.json",
-)
-
 
 def _load(directory: Path) -> dict[str, torch.Tensor]:
     tensors = {}
@@ -48,33 +36,6 @@ def _load(directory: Path) -> dict[str, torch.Tensor]:
     if not tensors:
         raise FileNotFoundError(f"no safetensors weights in {directory}")
     return tensors
-
-
-def extract(vlm: Path, output: Path) -> None:
-    """Write the language model of a Qwen3.5 VLM as a ``Qwen3_5ForCausalLM``."""
-    tensors = _load(vlm)
-    # Original checkpoints may include MTP weights, unused by the PPO model.
-    other = [
-        key for key in tensors if not key.startswith((VLM_LANGUAGE, VLM_VISION, "mtp."))
-    ]
-    if other:
-        raise ValueError(f"expected language, vision or MTP weights, got {other[:5]}")
-    config = json.loads((vlm / "config.json").read_text())
-    text_config = {**config["text_config"], "architectures": ["Qwen3_5ForCausalLM"]}
-    output.mkdir(parents=True, exist_ok=False)
-    save_file(
-        {
-            TEXT_MODEL + key.removeprefix(VLM_LANGUAGE): value.contiguous()
-            for key, value in tensors.items()
-            if key.startswith(VLM_LANGUAGE)
-        },
-        output / "model.safetensors",
-        metadata={"format": "pt"},
-    )
-    (output / "config.json").write_text(json.dumps(text_config, indent=2) + "\n")
-    for name in TOKENIZER_FILES:
-        if (vlm / name).is_file():
-            shutil.copy2(vlm / name, output / name)
 
 
 def _language_name(key: str) -> str | None:
@@ -158,18 +119,12 @@ def export(checkpoint: Path, vlm: Path, output: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    extract_parser = commands.add_parser("extract")
-    extract_parser.add_argument("--vlm", type=Path, required=True)
-    extract_parser.add_argument("--output", type=Path, required=True)
     export_parser = commands.add_parser("export")
     export_parser.add_argument("--checkpoint", type=Path, required=True)
     export_parser.add_argument("--vlm", type=Path, required=True)
     export_parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if args.command == "extract":
-        extract(args.vlm, args.output)
-    else:
-        export(args.checkpoint, args.vlm, args.output)
+    export(args.checkpoint, args.vlm, args.output)
 
 
 if __name__ == "__main__":

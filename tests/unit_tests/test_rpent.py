@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import os
+import pickle
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,7 +29,7 @@ import torch
 from _qwen35_chat import Qwen35ToyTokenizer, qwen35_agentic_tokenizer
 from omegaconf import OmegaConf, open_dict
 
-from rlinf.agents.rpent.episode import merge_prefix_turns
+from rlinf.agents.rpent.episode import RPentEpisodeError, merge_prefix_turns
 from rlinf.agents.rpent.history import (
     AppendOnlyHistory,
 )
@@ -49,6 +50,14 @@ TOOLS = [
 @pytest.fixture
 def qwen35(monkeypatch):
     return qwen35_agentic_tokenizer(monkeypatch)
+
+
+def test_episode_failure_survives_ray_exception_serialization():
+    error = RPentEpisodeError("backend.open rejected the task", kind="startup")
+    restored = pickle.loads(pickle.dumps(error))
+    assert type(restored) is RPentEpisodeError
+    assert str(restored) == str(error)
+    assert restored.kind == "startup"
 
 
 def test_merge_prefix_turns_folds_image_rows_and_keeps_the_last_image_set():
@@ -97,7 +106,7 @@ def test_merge_prefix_turns_folds_image_rows_and_keeps_the_last_image_set():
     assert second.prompt_ids == [1, 2, 7] and second.response_images["num_images"] == 1
 
 
-# Stands in for RPent's ``robots.libero_rl.rl_episode``: it plans against the
+# Stands in for RPent's ``robots.rl.rl_episode``: it plans against the
 # worker's policy endpoint and writes the outcome, as the real process does.
 FAKE_EPISODE = """
 import argparse, json, os, urllib.error, urllib.request
@@ -182,7 +191,7 @@ def make_agent(tmp_path, monkeypatch):
     )
     # Builds the patched agentic tokenizer class that skips sglang's markers.
     qwen35_agentic_tokenizer(monkeypatch)
-    package = tmp_path / "fake-rpent" / "robots" / "libero_rl"
+    package = tmp_path / "fake-rpent" / "robots" / "rl"
     package.mkdir(parents=True)
     for init_file in (package.parent / "__init__.py", package / "__init__.py"):
         init_file.touch()
@@ -218,7 +227,15 @@ def make_agent(tmp_path, monkeypatch):
                 },
                 "algorithm": {
                     "recompute_logprobs": True,
-                    "sampling_params": {"max_new_tokens": 256},
+                    "sampling_params": {
+                        "max_new_tokens": 256,
+                        "temperature": 1.0,
+                        "top_p": 1.0,
+                        "top_k": -1,
+                        "min_p": 0.0,
+                        "presence_penalty": 0.0,
+                        "repetition_penalty": 1.0,
+                    },
                 },
                 "rollout": {
                     "return_logprobs": True,
@@ -240,9 +257,13 @@ def make_agent(tmp_path, monkeypatch):
                 },
                 "tools": {
                     "rpent": {
-                        "workflow": "libero_rl",
                         "python": sys.executable,
-                        "sam3_endpoint": "http://sam3",
+                        "repo_path": str(package.parents[1]),
+                        "remote_toolkit_endpoint": "http://simulator",
+                        "image_size": 1024,
+                        "max_actions_per_call": 3,
+                        "reasoning_history": -1,
+                        "image_history": -1,
                         "libero_type": "pro",
                         "max_episode_steps": 10,
                         "env_gpus": [0, 1],
@@ -417,7 +438,7 @@ def test_token_space_checks_exact_served_prompt_ids(make_agent, key):
         worker._check_generation(generated, [1, 2])
 
 
-def compose(overrides=(), config_name="train_qwen3.5_4b_libero_rl_ppo"):
+def compose(overrides=(), config_name="train_qwen3.5_4b_episode_sync_ppo"):
     from hydra import compose, initialize_config_dir
 
     config_dir = Path(__file__).parents[2] / "examples/agent/rpent/config"
@@ -429,7 +450,7 @@ def compose(overrides=(), config_name="train_qwen3.5_4b_libero_rl_ppo"):
         "data.train_data_paths": ["/test/tasks.jsonl"],
         "data.val_data_paths": ["/test/eval.jsonl"],
         "tools.rpent.python": "/test/env/bin/python",
-        "tools.rpent.libero_config_path": "/test/libero-config",
+        "tools.rpent.remote_toolkit_endpoint": "http://127.0.0.1:28490",
         "tools.rpent.output_dir": "/test/episodes",
         "rollout.model.model_path": "/test/full-model",
     }.items():
@@ -441,13 +462,90 @@ def compose(overrides=(), config_name="train_qwen3.5_4b_libero_rl_ppo"):
 
 
 @pytest.mark.parametrize(
+    "recipe,requires_sync",
+    [
+        ("eval_qwen3.5_4b_episode_sync", False),
+        ("eval_qwen3.5_4b_episode_token_space", False),
+        ("train_qwen3.5_4b_episode_sync_grpo", True),
+    ],
+)
+@pytest.mark.parametrize("version", [None, 0])
+def test_episode_recipes_distinguish_static_weights_from_actor_sync(
+    make_agent, recipe, requires_sync, version
+):
+    cfg = compose(config_name=recipe)
+    worker = make_agent(FakeRPent(turns=1))
+    worker.cfg.runner.synchronous = cfg.runner.synchronous
+    worker.cfg.tools.rpent.update(
+        {
+            key: cfg.tools.rpent[key]
+            for key in (
+                "remote_toolkit_endpoint",
+                "image_size",
+                "max_actions_per_call",
+                "reasoning_history",
+                "image_history",
+            )
+        }
+    )
+    worker.cfg.algorithm.sampling_params.update(cfg.algorithm.sampling_params)
+    generate = worker.generate
+
+    async def versioned(*args, **kwargs):
+        result = await generate(*args, **kwargs)
+        if version is not None:
+            result.update(version_start=version, version_end=version)
+        return result
+
+    worker.generate = versioned
+    if requires_sync and version is None:
+        with pytest.raises(ValueError, match="installed weight version"):
+            run_query(worker)
+        return
+    result = run_query(worker)
+    assert result.extra_fields["turns"] == 1
+    (turn,) = result.single_turn_outputs
+    assert turn.version_start == turn.version_end == version
+    assert len(turn.response_ids) == len(turn.response_logprobs)
+    if requires_sync:
+        assert set(turn.response_weight_versions) == {version}
+
+
+@pytest.mark.parametrize(
+    "evaluation,turns,valid",
+    [
+        (True, 1, True),
+        (True, 0, False),
+        (True, True, False),
+        (False, 25, True),
+        (False, 24, False),
+    ],
+)
+def test_request_budget_preserves_evaluation_and_training_limits(
+    evaluation, turns, valid
+):
+    from rlinf.agents.rpent.config_validation import validate_rpent_cfg
+
+    cfg = compose(
+        config_name=(
+            "eval_qwen3.5_4b_episode_sync"
+            if evaluation
+            else "train_qwen3.5_4b_episode_sync_ppo"
+        )
+    )
+    cfg.agentloop.max_turns = turns
+    if valid:
+        validate_rpent_cfg(cfg)
+    else:
+        with pytest.raises(ValueError, match="max_turns must be at least"):
+            validate_rpent_cfg(cfg)
+
+
+@pytest.mark.parametrize(
     "config_name",
     [
-        "train_qwen3.5_4b_libero_rl_ppo",
-        "eval_qwen3.5_4b_libero_rl",
-        "train_qwen3.5_4b_libero_rl_sao",
-        "train_qwen3.5_4b_libero_rl_sao_local",
-        "train_qwen3.5_4b_libero_rl_sao_3node",
+        "train_qwen3.5_4b_episode_sync_ppo",
+        "eval_qwen3.5_4b_episode_sync",
     ],
 )
 def test_example_configs_preserve_planner_and_training_contracts(config_name):
@@ -460,15 +558,13 @@ def test_example_configs_preserve_planner_and_training_contracts(config_name):
         assert sampling.repetition_penalty == 1.0
         assert cfg.agentloop.thinking_token_budget is None
         assert cfg.rollout.sglang.backend_type == "server"
-    else:
-        assert (sampling.temperature, sampling.top_p, sampling.top_k) == (1.0, 0.95, 20)
-    assert sampling.max_new_tokens == 32768
-    assert cfg.agentloop.max_turns == 100
-    assert cfg.agentloop.observation_mode == "adaptive"
+        assert sampling.max_new_tokens == 32768
+    assert cfg.agentloop.max_turns == 80
     assert (
         cfg.rollout.env_vars.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE
         == "rlinf.hybrid_engines.sglang.multimodal"
     )
+    assert (sampling.temperature, sampling.top_p, sampling.top_k) == (1.0, 1.0, -1)
     if cfg.runner.task_type == "reasoning":
         for component in (cfg.actor, cfg.critic):
             assert not component.megatron.ckpt_convertor.hf_model_path.endswith("-text")
@@ -488,34 +584,6 @@ def test_example_configs_preserve_planner_and_training_contracts(config_name):
 
 
 @pytest.mark.parametrize(
-    "invalid,value",
-    [
-        (None, None),
-        ("algorithm.recompute_logprobs", False),
-        ("algorithm.importance_sampling_fix", False),
-        ("algorithm.importance_sampling_clip", float("inf")),
-        ("rollout.return_logprobs", False),
-        ("rollout.max_weight_staleness", None),
-        ("rollout.max_weight_staleness", -1),
-    ],
-)
-def test_async_tis_requires_behavior_logprobs_and_bounded_staleness(invalid, value):
-    from rlinf.config import validate_async_agent_ppo_cfg
-
-    cfg = compose(config_name="train_qwen3.5_4b_libero_rl_sao")
-    cfg.algorithm.recompute_logprobs = True
-    cfg.algorithm.importance_sampling_fix = True
-    cfg.algorithm.importance_sampling_clip = 2.0
-    cfg.rollout.max_weight_staleness = 1
-    if invalid is None:
-        validate_async_agent_ppo_cfg(cfg, "RPent")
-    else:
-        OmegaConf.update(cfg, invalid, value)
-        with pytest.raises(ValueError, match="async|staleness"):
-            validate_async_agent_ppo_cfg(cfg, "RPent")
-
-
-@pytest.mark.parametrize(
     "mode,invalid,value,error",
     [
         ("eval", None, None, None),
@@ -526,7 +594,6 @@ def test_async_tis_requires_behavior_logprobs_and_bounded_staleness(invalid, val
             None,
         ),
         ("ppo", None, None, None),
-        ("sao", None, None, None),
         ("eval", "tools.rpent.store_images_on_disk", False, "store_images_on_disk"),
         (
             "eval",
@@ -535,16 +602,16 @@ def test_async_tis_requires_behavior_logprobs_and_bounded_staleness(invalid, val
             "Remove",
         ),
         ("ppo", "actor.model.pipeline_model_parallel_size", 2, "PP=1"),
-        ("sao", "critic.megatron.mbridge", False, "Megatron-Bridge"),
+        ("ppo", "critic.megatron.mbridge", False, "Megatron-Bridge"),
     ],
 )
 def test_token_space_validation_scopes_learner_checks(mode, invalid, value, error):
     from rlinf.config import validate_rpent_cfg
 
     name = (
-        "eval_qwen3.5_4b_libero_rl"
+        "eval_qwen3.5_4b_episode_sync"
         if mode == "eval"
-        else f"train_qwen3.5_4b_libero_rl_{mode}"
+        else "train_qwen3.5_4b_episode_sync_ppo"
     )
     cfg = compose(
         [
@@ -563,38 +630,7 @@ def test_token_space_validation_scopes_learner_checks(mode, invalid, value, erro
     else:
         validate_rpent_cfg(cfg)
         if mode == "eval":
-            assert "actor" not in cfg and "critic" not in cfg
-
-
-@pytest.mark.parametrize("mode", ["ppo", "sao", "eval"])
-def test_legacy_multimodal_config_reloads_with_the_same_mode(tmp_path, mode):
-    from rlinf.config import shared_multi_modal_processor_enabled, validate_rpent_cfg
-
-    name = (
-        "eval_qwen3.5_4b_libero_rl"
-        if mode == "eval"
-        else f"train_qwen3.5_4b_libero_rl_{mode}"
-    )
-    cfg = compose(
-        [
-            "++rollout.sglang.enable_shared_multi_modal_processor=true",
-            "rollout.env_vars.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=null",
-            "++tools.rpent.store_images_on_disk=true",
-            "tools.rpent.keep_episodes=all",
-        ],
-        config_name=name,
-    )
-    validate_rpent_cfg(cfg)
-    with open_dict(cfg.rollout.sglang):
-        cfg.rollout.sglang.enable_token_space_processor = cfg.rollout.sglang.pop(
-            "enable_shared_multi_modal_processor"
-        )
-    saved_config = tmp_path / "config.yaml"
-    OmegaConf.save(cfg, saved_config)
-    restored = OmegaConf.load(saved_config)
-    validate_rpent_cfg(restored)
-    assert shared_multi_modal_processor_enabled(restored.rollout.sglang) is True
-    assert OmegaConf.to_container(restored) == OmegaConf.to_container(cfg)
+            assert cfg.runner.task_type == "reasoning_eval"
 
 
 @pytest.mark.parametrize("field", ["cache_bytes", "prefetch_batches", "prefetch_bytes"])
@@ -1065,3 +1101,239 @@ def test_release_capture_checks_sampled_history_and_request_id():
     pixels.zero_()
     with pytest.raises(ValueError, match="pixels"):
         sample([10, 11, 12, 23, 24], history)
+
+
+def test_tokenspace_grouped_grpo_keeps_native_loss_scales_without_a_critic():
+    from rlinf.agents.rpent.config_validation import validate_rpent_cfg
+
+    cfg = compose(
+        overrides=[
+            "rollout.sglang.token_space_preprocess_cache_dir=/test/cache",
+            "tools.rpent.repo_path=/test/rpent",
+            "tools.rpent.remote_toolkit_endpoint=http://127.0.0.1:28490",
+        ],
+        config_name="train_qwen3.5_4b_episode_sync_grpo",
+    )
+    validate_rpent_cfg(cfg)
+    assert cfg.algorithm.clip_ratio_high == 0.28
+    assert list(cfg.algorithm.loss_scales) == [
+        "group_level",
+        "agent_level",
+        "turn_level",
+    ]
+    assert cfg.algorithm.group_size == 8
+    assert cfg.data.rollout_batch_size == 32
+    assert cfg.data.sampling_batch_size == 40
+    assert not cfg.critic.use_critic_model
+    assert cfg.actor.megatron.mbridge
+
+
+@pytest.fixture
+def episode_launcher(tmp_path, monkeypatch):
+    from rlinf.agents.rpent.launcher import RPentEpisodeLauncher
+
+    (tmp_path / "episode_fixture.py").write_text(
+        "import argparse,json,os,time\n"
+        "from pathlib import Path\n"
+        "p=argparse.ArgumentParser()\n"
+        "p.add_argument('--request',type=Path)\n"
+        "p.add_argument('--output-dir',type=Path)\n"
+        "a,extra=p.parse_known_args()\n"
+        "r=json.loads(a.request.read_text())\n"
+        "(a.output_dir/'pid').write_text(str(os.getpid()))\n"
+        "(a.output_dir/'states.json').write_text('{}')\n"
+        "time.sleep(r['task'].get('sleep',0))\n"
+        "(a.output_dir/'outcome.json').write_text(json.dumps({\n"
+        " 'success':False,'owner':os.environ.get('RPENT_REMOTE_OWNER_ID'),\n"
+        " 'egl':os.environ.get('MUJOCO_EGL_DEVICE_ID'),'args':extra}))\n"
+    )
+    monkeypatch.setenv("MUJOCO_EGL_DEVICE_ID", "inherited-device")
+    cfg = OmegaConf.create(
+        {
+            "rollout": {"model": {"model_path": "unused"}},
+            "agentloop": {"prompt": "simple"},
+            "tools": {
+                "rpent": {
+                    "python": sys.executable,
+                    "repo_path": str(tmp_path),
+                    "remote_toolkit_endpoint": "http://unused",
+                    "image_size": 1024,
+                    "max_actions_per_call": 3,
+                    "reasoning_history": -1,
+                    "image_history": -1,
+                    "max_episode_steps": 10000,
+                    "libero_type": "pro",
+                    "max_env_initializations_per_worker": 1,
+                    "output_dir": str(tmp_path / "episodes"),
+                    "keep_episodes": "none",
+                    "process_timeout_s": 20,
+                }
+            },
+        }
+    )
+    launcher = RPentEpisodeLauncher(cfg)
+    command = launcher.command
+
+    def fixture_command(output, gpu, *, task=None):
+        args = command(output, gpu, task=task)
+        return [args[0], "-m", "episode_fixture", *args[3:]]
+
+    monkeypatch.setattr(launcher, "command", fixture_command)
+    return launcher
+
+
+def test_episode_launcher_keeps_candidates_and_cleans_process(episode_launcher):
+    from rlinf.agents.rpent.episode import Episode
+
+    launcher = episode_launcher
+    candidate = {"cohort_id": "grouped", "candidate_id": 9}
+    episode = Episode("candidate", {}, None)
+    result = asyncio.run(launcher.run(episode, {}, 3, candidate=candidate))
+    output = Path(launcher.cfg.tools.rpent.output_dir) / "candidate"
+    assert result["owner"] == "candidate" and result["egl"] is None
+    assert "--record-api-trace" not in result["args"]
+    assert result["args"][result["args"].index("--max-actions-per-call") + 1] == "3"
+    assert result["args"][result["args"].index("--cuda-device") + 1] == "3"
+    assert json.loads((output / "sampling-candidate.json").read_text()) == {
+        **candidate,
+        "episode_id": "candidate",
+    }
+    assert json.loads((output / "sampling-process-cleanup.json").read_text()) == {
+        "process_exited": True,
+        "returncode": 0,
+    }
+    asyncio.run(launcher.run(Episode("ordinary", {}, None), {}, 3))
+    assert not (output.parent / "ordinary").exists()
+
+
+def test_episode_launcher_cancellation_reaps_child_and_releases_permit(
+    episode_launcher,
+):
+    from rlinf.agents.rpent.episode import Episode
+
+    launcher = episode_launcher
+    candidate = {"cohort_id": "cancelled", "candidate_id": 0}
+    output = Path(launcher.cfg.tools.rpent.output_dir) / "cancelled"
+
+    async def run():
+        task = asyncio.create_task(
+            launcher.run(
+                Episode("cancelled", {"sleep": 60}, None), {}, 0, candidate=candidate
+            )
+        )
+
+        async def started():
+            while not (output / "pid").exists():
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(started(), timeout=10)
+        pid = int((output / "pid").read_text())
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+        await asyncio.wait_for(
+            launcher.run(Episode("after-cancel", {}, None), {}, 0), timeout=10
+        )
+
+    asyncio.run(run())
+    assert json.loads((output / "sampling-process-cleanup.json").read_text())[
+        "process_exited"
+    ]
+
+
+def test_episode_launcher_routes_without_legacy_cli_selectors(episode_launcher):
+    from rlinf.agents.rpent.episode import Episode
+
+    launcher = episode_launcher
+    launcher.cfg.tools.rpent.remote_toolkit_endpoint = None
+    with open_dict(launcher.cfg):
+        launcher.cfg.env = {"rpent": {"robotwin": {"endpoint": "http://robotwin"}}}
+    result = asyncio.run(
+        launcher.run(
+            Episode(
+                "general",
+                {"environment": "robotwin", "task_name": "adjust_bottle", "seed": 0},
+                None,
+            ),
+            {"thinking": False},
+            0,
+            candidate={"cohort_id": "groups", "candidate_id": 1},
+        )
+    )
+    command = result["args"]
+    for removed in (
+        "--workflow",
+        "--prompt",
+        "--observation-mode",
+        "--perception-mode",
+        "--world-cord",
+        "--position-unit",
+    ):
+        assert removed not in command
+    assert command[command.index("--remote-toolkit-endpoint") + 1] == "http://robotwin"
+    assert "--sam3-endpoint" not in command
+    output = Path(launcher.cfg.tools.rpent.output_dir) / "general"
+    assert json.loads((output / "request.json").read_text())["task"] == {
+        "environment": "robotwin",
+        "task_name": "adjust_bottle",
+        "seed": 0,
+    }
+    assert (
+        json.loads((output / "request.json").read_text())["planner"]["thinking"]
+        is False
+    )
+    assert json.loads((output / "sampling-process-cleanup.json").read_text())[
+        "process_exited"
+    ]
+
+
+@pytest.mark.parametrize("version", [7, None])
+def test_episode_keeps_synchronous_version_checks_and_training_turns(
+    make_agent, version
+):
+    fake = FakeRPent(turns=1)
+    worker = make_agent(fake)
+    worker.cfg.tools.rpent.update(
+        {
+            "image_size": 1024,
+            "remote_toolkit_endpoint": "http://127.0.0.1:28490",
+            "max_actions_per_call": 3,
+            "reasoning_history": -1,
+            "image_history": -1,
+        }
+    )
+    worker.cfg.runner.synchronous = True
+    worker.cfg.algorithm.sampling_params.update(
+        {
+            "temperature": 1,
+            "top_p": 1,
+            "top_k": -1,
+            "min_p": 0,
+            "presence_penalty": 0,
+            "repetition_penalty": 1,
+        }
+    )
+    generate = worker.generate
+
+    async def versioned(*args, **kwargs):
+        result = await generate(*args, **kwargs)
+        if version is not None:
+            result.update(version_start=version, version_end=version)
+        return result
+
+    worker.generate = versioned
+    if version is None:
+        with pytest.raises(ValueError, match="installed weight version"):
+            run_query(worker)
+        return
+    result = run_query(worker)
+    assert result.extra_fields["turns"] == 1
+    assert set(result.single_turn_outputs[0].response_weight_versions) == {7}
+    audits = list(
+        Path(worker.cfg.tools.rpent.output_dir).glob("*/training_audit/*.json")
+    )
+    assert len(audits) == 1
+    audit = json.loads(audits[0].read_text())
+    assert audit["weight_version_start"] == audit["weight_version_end"] == 7

@@ -149,8 +149,8 @@ class Cluster:
         """Raised when there is a namespace conflict in Ray initialization."""
 
     @classmethod
-    def find_free_port(cls, max_port_num: Optional[int] = None):
-        """Find a free port on the node.
+    def find_free_port(cls, max_port_num: Optional[int] = None) -> int:
+        """Find a listener port outside the kernel's ephemeral range on Linux.
 
         Args:
             max_port_num (Optional[int]): Largest acceptable port. Use it for servers that
@@ -161,14 +161,37 @@ class Cluster:
         import secrets
         import socket
 
-        if max_port_num is None:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("", 0))
-                return s.getsockname()[1]
-        if not 1024 <= max_port_num <= 65535:
+        if max_port_num is not None and not 1024 <= max_port_num <= 65535:
             raise ValueError("max_port_num must be between 1024 and 65535")
+        upper = max_port_num or 65535
+        ranges = [(1024, upper + 1)]
+        try:
+            ephemeral_low, ephemeral_high = map(
+                int, Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split()
+            )
+        except (OSError, ValueError):
+            if max_port_num is None:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("", 0))
+                    return s.getsockname()[1]
+        else:
+            # A released probe socket must not be reused by an outbound connection
+            # before the server binds it; the node's logical lock cannot prevent that.
+            ranges = [
+                (low, high)
+                for low, high in (
+                    (1024, min(ephemeral_low, upper + 1)),
+                    (max(1024, ephemeral_high + 1), upper + 1),
+                )
+                if low < high
+            ]
+        if not ranges:
+            raise RuntimeError(
+                f"No listener ports outside the ephemeral range at most {upper}."
+            )
         for _ in range(1000):
-            port = 1024 + secrets.randbelow(max_port_num - 1023)
+            low, high = secrets.choice(ranges)
+            port = low + secrets.randbelow(high - low)
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     s.bind(("", port))
@@ -176,7 +199,7 @@ class Cluster:
             except OSError as error:
                 if error.errno != errno.EADDRINUSE:
                     raise
-        raise RuntimeError(f"Failed to find a free port at most {max_port_num}.")
+        raise RuntimeError(f"Failed to find a free port at most {upper}.")
 
     @classmethod
     def has_initialized(cls):

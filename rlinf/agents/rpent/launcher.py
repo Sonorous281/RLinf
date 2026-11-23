@@ -20,7 +20,6 @@ import asyncio
 import json
 import os
 import shutil
-from contextlib import AsyncExitStack
 from pathlib import Path
 
 from omegaconf import DictConfig
@@ -40,43 +39,93 @@ class RPentEpisodeLauncher:
             cfg.tools.rpent.get("max_env_initializations_per_worker", 8)
         )
 
-    async def run(self, episode: Episode, planner: dict, gpu: int) -> dict:
+    def endpoint(self, task: dict) -> str | None:
+        """Return the toolkit that owns this task's scene."""
+        simulators = (self.cfg.get("env") or {}).get("rpent")
+        if simulators is not None:
+            return simulators[task["environment"]].endpoint
+        return self.cfg.tools.rpent.get("remote_toolkit_endpoint")
+
+    async def run(
+        self,
+        episode: Episode,
+        planner: dict,
+        gpu: int | None,
+        *,
+        candidate: dict | None = None,
+    ) -> dict:
         """Run the episode's RPent process and return the outcome it wrote."""
         rpent = self.cfg.tools.rpent
         output = Path(rpent.output_dir) / episode.episode_id
         output.mkdir(parents=True)
-        request = {"task": episode.task, "planner": planner}
-        (output / "request.json").write_text(json.dumps(request))
-        command = self.command(output, gpu)
+        if candidate is not None:
+            (output / "sampling-candidate.json").write_text(
+                json.dumps({**candidate, "episode_id": episode.episode_id}) + "\n"
+            )
+        task = episode.task
+        (output / "request.json").write_text(
+            json.dumps({"task": task, "planner": planner})
+        )
+        command = self.command(output, gpu, task=task)
         log = output / "episode.log"
         with log.open("wb") as log_file:
             await self._env_initializations.acquire()
-            try:
-                process = await asyncio.create_subprocess_exec(
+            start_task = asyncio.create_task(
+                asyncio.create_subprocess_exec(
                     *command,
                     stdout=log_file,
                     stderr=asyncio.subprocess.STDOUT,
-                    env=self.environment(),
+                    env={
+                        **self.environment(),
+                        **(
+                            {"RPENT_REMOTE_OWNER_ID": episode.episode_id}
+                            if candidate is not None
+                            else {}
+                        ),
+                    },
                 )
+            )
+            try:
+                process = await asyncio.shield(start_task)
+            except asyncio.CancelledError:
+                try:
+                    process = await start_task
+                    await self.stop(process)
+                finally:
+                    self._env_initializations.release()
+                raise
             except BaseException:
                 self._env_initializations.release()
                 raise
             startup = asyncio.create_task(
                 self._watch_environment_startup(process, output)
             )
-            async with AsyncExitStack() as cleanup:
-                cleanup.push_async_callback(self._cancel_startup, startup)
-                cleanup.push_async_callback(self._stop, process)
+            try:
+                returncode = await asyncio.wait_for(
+                    process.wait(), rpent.process_timeout_s
+                )
+            except asyncio.TimeoutError:
+                raise RPentEpisodeError(
+                    f"RPent episode {episode.episode_id} ran past "
+                    f"tools.rpent.process_timeout_s; see {log}",
+                    kind="process",
+                ) from None
+            finally:
                 try:
-                    returncode = await asyncio.wait_for(
-                        process.wait(), rpent.process_timeout_s
-                    )
-                except asyncio.TimeoutError:
-                    raise RPentEpisodeError(
-                        f"RPent episode {episode.episode_id} ran past "
-                        f"tools.rpent.process_timeout_s; see {log}",
-                        kind="process",
-                    ) from None
+                    await self.stop(process)
+                    if candidate is not None:
+                        (output / "sampling-process-cleanup.json").write_text(
+                            json.dumps(
+                                {
+                                    "process_exited": process.returncode is not None,
+                                    "returncode": process.returncode,
+                                }
+                            )
+                            + "\n"
+                        )
+                finally:
+                    startup.cancel()
+                    await asyncio.gather(startup, return_exceptions=True)
         if returncode == _EXIT_SETUP_FAILED:
             raise RPentEpisodeError(
                 f"RPent episode {episode.episode_id} did not start; see {log}",
@@ -89,22 +138,18 @@ class RPentEpisodeLauncher:
                 kind="process",
             )
         if returncode != 0:
-            raise RuntimeError(
+            raise RPentEpisodeError(
                 f"RPent episode {episode.episode_id} failed with exit status "
-                f"{returncode}; see {log}"
+                f"{returncode}; see {log}",
+                kind="process",
             )
         outcome = json.loads((output / "outcome.json").read_text())
         keep = rpent.keep_episodes == "all" or (
             rpent.keep_episodes == "failures" and not outcome["success"]
         )
-        if not keep:
+        if not keep and candidate is None:
             shutil.rmtree(output)
         return outcome
-
-    @staticmethod
-    async def _cancel_startup(startup: asyncio.Task) -> None:
-        startup.cancel()
-        await asyncio.gather(startup, return_exceptions=True)
 
     async def _watch_environment_startup(self, process, output: Path) -> None:
         """Release a cold-start permit after reset, process exit, or cancellation."""
@@ -115,7 +160,7 @@ class RPentEpisodeLauncher:
             self._env_initializations.release()
 
     def environment(self) -> dict[str, str]:
-        """Environment shared by this launcher's episode processes.
+        """Environment shared by the episode and cleanup processes.
 
         Agent workers hold every GPU, so the worker's own environment names
         GPU 0 as the render device. The episode process picks its device from
@@ -125,58 +170,54 @@ class RPentEpisodeLauncher:
         env = dict(os.environ)
         env.pop("MUJOCO_EGL_DEVICE_ID", None)
         env.pop("EGL_DEVICE_ID", None)
-        config_path = self.cfg.tools.rpent.get("libero_config_path")
-        if config_path is not None:
-            env["LIBERO_CONFIG_PATH"] = str(config_path)
+        repo_path = self.cfg.tools.rpent.get("repo_path")
+        if repo_path is not None:
+            env["PYTHONPATH"] = os.pathsep.join(
+                [str(repo_path), env.get("PYTHONPATH", "")]
+            ).rstrip(os.pathsep)
         return env
 
-    def command(self, output: Path, gpu: int) -> list[str]:
+    def command(
+        self, output: Path, gpu: int | None, *, task: dict | None = None
+    ) -> list[str]:
         """Command line of an episode process writing to ``output``."""
         rpent = self.cfg.tools.rpent
-        workflow = rpent.get("workflow", "libero")
+        task = task or {}
         command = [
             rpent.python,
             "-m",
-            f"robots.{workflow}.rl_episode",
+            "robots.rl.rl_episode",
             "--output-dir",
             str(output),
             "--request",
             str(output / "request.json"),
-        ]
-        if workflow == "libero_rl":
-            command += [
-                "--observation-mode",
-                "adaptive",
-                "--prompt",
-                self.cfg.agentloop.get("prompt", "simple"),
-            ]
-            if rpent.get("sam3_endpoint") is not None:
-                command += ["--sam3-endpoint", rpent.sam3_endpoint]
-            if rpent.get("libero_type") is not None:
-                command += ["--libero-type", rpent.libero_type]
-        else:
-            command += [
-                "--vla-endpoint",
-                rpent.vla_endpoint,
-                "--sam3-endpoint",
-                rpent.sam3_endpoint,
-                "--libero-type",
-                rpent.libero_type,
-            ]
-        command += [
+            "--remote-toolkit-endpoint",
+            self.endpoint(task),
             "--max-episode-steps",
             str(rpent.max_episode_steps),
-            "--cuda-device",
-            str(gpu),
             "--tokenizer-path",
             self.cfg.rollout.model.model_path,
         ]
-        if workflow == "libero" and rpent.get("frozen_memory_dir") is not None:
-            command += ["--frozen-memory-dir", rpent.frozen_memory_dir]
+        if task.get("environment", "libero") == "libero":
+            command += ["--libero-type", rpent.libero_type]
+        for option in (
+            "image_size",
+            "max_actions_per_call",
+            "reasoning_history",
+            "image_history",
+        ):
+            flag = (
+                "--image_size"
+                if option == "image_size"
+                else "--" + option.replace("_", "-")
+            )
+            command += [flag, str(rpent[option])]
+        if gpu is not None:
+            command += ["--cuda-device", str(gpu)]
         return command
 
     @staticmethod
-    async def _stop(process: asyncio.subprocess.Process) -> None:
+    async def stop(process: asyncio.subprocess.Process) -> None:
         """Stop an episode process, giving it time to release its simulator."""
         if process.returncode is not None:
             return

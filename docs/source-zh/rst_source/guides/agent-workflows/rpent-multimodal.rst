@@ -1,28 +1,7 @@
 配置 RPent 多模态训练
 ============================
 
-先完成 :doc:`单机 smoke <../../examples/agentic/rpent_libero_rl>`，再按需要调整重算、缓存和历史处理。
-
-启用 Logprob 重算与 TIS
---------------------------
-
-SAO 默认关闭训练端 Logprob 重算和截断重要性采样（TIS）。试用这两个选项时，在 SAO 配置中加入：
-
-.. code-block:: yaml
-
-   algorithm:
-     recompute_logprobs: true
-     importance_sampling_fix: true
-     importance_sampling_clip: 2.0
-   rollout:
-     return_logprobs: true
-     max_weight_staleness: 1
-
-每个 batch 保留采样时的 logprob 和逐 token 的 policy 版本。actor 更新前，训练端用当前 actor 权重重算 logprob。TIS 限制后端数值差异和 policy 滞后对更新的影响。DIS 损失按概率比筛选参与训练的 token。计算概率比时，以重算 logprob 所用的 actor 权重为基准。按上述配置，如果 episode 中任一 token 的采样权重比最新发布的权重落后超过一次更新，就丢弃整条 episode，并重新采样该任务。
-
-.. warning::
-
-   开启这些选项后，SAO 的损失计算方式会改变，并额外执行一次 actor 前向计算。扩批前，先用小规模运行检查 TIS 权重的截断比例、有效样本量和 policy 滞后。启用这些选项后的优化器更新、权重同步和 checkpoint 恢复尚未验证。logprob 重算和 TIS 不能证明 SGLang 与 Megatron 的数值一致。
+先完成 :doc:`单机 smoke <../../examples/agentic/rpent_episode_sync>`，再按需要调整重算、缓存和历史处理。
 
 回放 Qwen3.5 图像输入
 ---------------------------
@@ -92,7 +71,6 @@ CPU 测试覆盖缓存复用、图片校验、预取顺序和线程清理。GPU 
 
 训练和评测默认设置 ``rollout.sglang.disable_overlap_schedule=true``，供 presence penalty 和可选 Thinking 限制读取当前 CPU token 历史。修改前需在目标 SGLang 版本验证采样 logprob 与强制 token 对齐。
 
-``agentloop.chat_template_kwargs.enable_thinking=false`` 可关闭 thinking；``agentloop.prompt=simple_brief`` 则通过提示词引导模型将每次决策的推理控制在约 256 个 token，不设置解码器的硬性上限。切换前固定模型和任务 seed，从新 episode 对比原生成功率与成本；不能删除已有轨迹中的 thinking token 或 behavior logprob。
 
 若要限制 chat template 已开启的首段 Thinking，设置 ``agentloop.thinking_token_budget=512`` 和 ``rollout.sglang.enable_custom_logit_processor=true``，并保持 ``enable_thinking=true`` 和 ``rollout.sglang.disable_overlap_schedule=true``。启用预算时，配置校验会拒绝重叠调度，避免 CPU token 历史落后于实际解码。预算默认是 ``null``。引擎记录实际强制插入的闭合 Token，该 Token 的训练 mask 为零；自然生成的闭合 Token 仍参与训练。此选项不限制后续重新开启的 Thinking 段。组装轨迹时必须保持返回的 Token ID、behavior logprob、强制标记和权重版本的对应关系。
 
@@ -102,7 +80,7 @@ CPU 测试覆盖缓存复用、图片校验、预取顺序和线程清理。GPU 
 
 工具结果和图片保留在后续输入中。Policy loss 只作用于 policy 生成的 assistant token，user/tool/history token 不参与监督。逐 token 前缀兼容的连续 turn 合并，压缩或历史改写后分段。Actor 和 critic 使用相同的 response 位置映射；共享轨迹 packing 在任意一个计分 token 重叠时都会保留独立行，避免合并覆盖学习目标；这也适用于纯文本 SearchR1。回归测试比较 packing 前后的 loss 和梯度。response-only logits 要求 CP1。
 
-启用 ``tools.rpent.store_images_on_disk=true`` 时，所有 rollout 和 learner 进程必须能读取 **相同绝对路径下的图像** 。``tools.rpent.output_dir`` 需要在模型节点与环境节点间共享，并在轨迹或保存的 checkpoint 仍引用它时保留；不同节点上同名的本地目录不够。没有共享图像存储时保留默认 ``false``，让轨迹携带图像字节，但内存成本更高。不要清理可恢复 checkpoint 所需的 Episode 产物。
+RPent 通过 RPC 将仿真图像复制到 planner。轨迹或 checkpoint 引用这些图像期间，所有 RLinf rollout 和 learner worker 都应能读取 ``tools.rpent.output_dir`` 的同一绝对路径。仿真服务可以使用自己的存储。如果 RLinf worker 没有共享存储，将 ``tools.rpent.store_images_on_disk`` 设为 ``false``，让轨迹携带图像字节。
 
 保留多轮图像的 token 边界
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -16,7 +16,7 @@ fi
 export PYTHONPATH=${REPO_PATH}:${MEGATRON_PATH}:${REPO_PATH}/examples${PYTHONPATH:+:$PYTHONPATH}
 
 if [ -z "${1:-}" ]; then
-    CONFIG_NAME="eval_qwen3.5_4b"
+    CONFIG_NAME="eval_qwen3.5_4b_episode_token_space"
 else
     CONFIG_NAME=$1
     shift

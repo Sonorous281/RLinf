@@ -58,6 +58,7 @@ jobs:
               - 'pyproject.toml'
               - 'requirements/*.sh'
               - 'requirements/**/*.txt'
+              - 'requirements/rpent/**'
               - '.github/workflows/install.yml'
             docker_filter: &docker
               - *install
@@ -157,6 +158,7 @@ jobs:
               - 'rlinf/runners/async_agent_runner.py'
               - 'rlinf/runners/agentlightning_runner.py'
               - 'rlinf/runners/reasoning_runner.py'
+              - 'rlinf/runners/agent_ppo_runner.py'
               - 'rlinf/runners/coding_online_rl_runner.py'
               - 'rlinf/runners/agent_eval_runner.py'
               - 'rlinf/runners/reasoning_eval_runner.py'
@@ -208,9 +210,11 @@ jobs:
               - 'rlinf/workers/agent/openai_session_server.py'
               - 'rlinf/workers/actor/ma_megatron_actor_worker.py'
               - 'rlinf/runners/reasoning_runner.py'
+              - 'rlinf/runners/agent_ppo_runner.py'
               - 'rlinf/runners/async_agent_ppo_runner.py'
               - 'examples/agent/rpent/checkpoint.py'
               - 'examples/agent/rpent/eval.py'
+              - 'examples/agent/rpent/train.py'
               - 'examples/agent/rpent/config/**'
               - 'rlinf/robotics/**'
               - 'rlinf/models/embodiment/openpi/**'

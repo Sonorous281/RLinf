@@ -12,21 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Train an RPent planner with synchronous PPO or asynchronous SAO PPO."""
+"""Train an RPent planner with synchronous PPO/GRPO or asynchronous SAO PPO."""
 
-import json
+from pathlib import Path
 
 import hydra
 from omegaconf import OmegaConf
 
 from rlinf.agents.rpent.rpent_agent_loop import RPentAgentLoopWorker
+from rlinf.agents.rpent.simulators import mixed_simulators, mixed_training_dataset
 from rlinf.config import validate_cfg
 from rlinf.data.datasets.reasoning import create_reasoning_datasets
 from rlinf.models.tokenization.hf import hf_tokenizer
 from rlinf.runners.agent_ppo_runner import AgentPPORunner
 from rlinf.runners.async_agent_ppo_runner import AsyncAgentPPORunner
 from rlinf.scheduler import Cluster
-from rlinf.utils.logging import get_logger
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.utils.utils import output_redirector
 from rlinf.workers.rollout.utils import get_rollout_backend_worker
@@ -36,10 +36,18 @@ from rlinf.workers.rollout.utils import get_rollout_backend_worker
 @output_redirector
 def main(cfg) -> None:
     from rlinf.workers.actor.ma_megatron_actor_worker import MAMegatronActor
-    from rlinf.workers.critic.ma_megatron_critic_worker import MAMegatronCritic
 
     cfg = validate_cfg(cfg)
-    get_logger().info(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
+    log_dir = Path(cfg.runner.logger.log_path)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(cfg, log_dir / "config.yaml", resolve=True)
+
+    tokenizer = hf_tokenizer(cfg.actor.tokenizer.tokenizer_model)
+    simulators = mixed_simulators(cfg)
+    if simulators:
+        train_ds, val_ds = mixed_training_dataset(cfg, tokenizer, simulators)
+    else:
+        train_ds, val_ds = create_reasoning_datasets(cfg, tokenizer)
 
     cluster = Cluster(cluster_cfg=cfg.cluster)
     placement = ModelParallelComponentPlacement(cfg, cluster)
@@ -68,15 +76,25 @@ def main(cfg) -> None:
         cluster,
         name=cfg.actor.group_name,
         placement_strategy=placement.get_strategy("actor"),
+        env_vars=OmegaConf.to_container(cfg.actor.get("env_vars", {}), resolve=True)
+        if cfg.actor.get("env_vars")
+        else None,
     )
-    critic = MAMegatronCritic.create_group(cfg, placement).launch(
-        cluster,
-        name=cfg.critic.group_name,
-        placement_strategy=placement.get_strategy("critic"),
-    )
+    critic = None
+    if cfg.critic.use_critic_model:
+        from rlinf.workers.critic.ma_megatron_critic_worker import MAMegatronCritic
 
-    tokenizer = hf_tokenizer(cfg.actor.tokenizer.tokenizer_model)
-    train_ds, val_ds = create_reasoning_datasets(cfg, tokenizer)
+        critic = MAMegatronCritic.create_group(cfg, placement).launch(
+            cluster,
+            name=cfg.critic.group_name,
+            placement_strategy=placement.get_strategy("critic"),
+            env_vars=OmegaConf.to_container(
+                cfg.critic.get("env_vars", {}), resolve=True
+            )
+            if cfg.critic.get("env_vars")
+            else None,
+        )
+
     runner_cls = AgentPPORunner if cfg.runner.synchronous else AsyncAgentPPORunner
     runner = runner_cls(
         cfg=cfg,

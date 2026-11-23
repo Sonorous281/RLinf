@@ -1,0 +1,39 @@
+# Full-size GRPO acceptance on four eight-GPU H200 hosts.
+defaults:
+  - train_qwen3.5_4b_episode_sync_grpo
+  - _self_
+
+runner:
+  experiment_name: rpent-qwen3.5-27b-h200-grpo-5step
+  max_steps: 5
+  save_interval: 1
+
+tools:
+  rpent:
+    episodes_per_worker: 10
+    max_env_initializations_per_worker: 4
+
+rollout:
+  max_running_requests: 10
+  cuda_graph_max_bs: 16
+  sglang:
+    enable_weights_cpu_backup: true
+    enable_metrics: true
+    enable_cache_report: true
+
+actor:
+  env_vars:
+    CUDA_DEVICE_MAX_CONNECTIONS: "1"
+  logprob_chunk_size: 256
+  response_only_logits: true
+  model:
+    load_mtp: false
+    lm_head_chunk_size: 256
+    tensor_model_parallel_size: 4
+    sequence_parallel: true
+    context_parallel_size: 1
+    pipeline_model_parallel_size: 1
+  optim:
+    optimizer_cpu_offload: false
+    optimizer_offload_fraction: 0.0
+    use_precision_aware_optimizer: false

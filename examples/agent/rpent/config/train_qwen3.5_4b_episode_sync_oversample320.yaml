@@ -1,0 +1,44 @@
+# Four 8-GPU hosts; qualify backend capacity for all 320 candidate episodes.
+defaults:
+  - train_qwen3.5_4b_episode_sync_ppo
+  - _self_
+
+cluster:
+  num_nodes: 4
+  component_placement:
+    actor: 0-31
+    critic: 0-31
+    rollout: 0-31
+    reward: 0-31
+    agentloop: 0-31
+
+runner:
+  experiment_name: rpent-episode-qwen3.5-4b-sync-oversample320
+  max_steps: 150
+  max_epochs: 150
+  save_interval: 10
+  resume_dir: null
+
+algorithm:
+  sampling_params:
+    max_new_tokens: 16384
+
+data:
+  rollout_batch_size: 256
+  sampling_batch_size: 320
+
+agentloop:
+  max_turns: 50
+  minimum_output_tokens: 16384
+
+tools:
+  rpent:
+    episodes_per_worker: 10
+
+actor:
+  lr_sched:
+    lr_decay_iters: 150
+
+critic:
+  lr_sched:
+    lr_decay_iters: 150

@@ -18,6 +18,7 @@ import asyncio
 import json
 
 import httpx
+import pytest
 
 from rlinf.workers.agent.openai_session_server import (
     OpenAISessionServer,
@@ -120,3 +121,62 @@ def test_streaming_request_receives_the_completion_as_one_event():
     assert finish["finish_reason"] == "tool_calls"
     assert json.loads(events[1])["usage"]["total_tokens"] == 5
     assert events[2] == "[DONE]"
+
+
+def test_disconnected_stream_keeps_the_completed_session(caplog):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(state, body):
+        entered.set()
+        await release.wait()
+        state.append("answered")
+        return chat_completion("c", "policy", {"role": "assistant"}, "stop", 1, 1)
+
+    async def scenario(server, client):
+        state = []
+        url = server.open("episode", state) + "/chat/completions"
+        timeout = httpx.Timeout(connect=5, read=0.05, write=5, pool=5)
+        request = asyncio.create_task(
+            client.post(
+                url,
+                json={"model": "policy", "messages": [], "stream": True},
+                timeout=timeout,
+            )
+        )
+        await entered.wait()
+        with pytest.raises(httpx.ReadTimeout):
+            await request
+        # Deliver the peer's disconnect before completing its pending request.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        release.set()
+        error = await server.close("episode")
+        return state, error
+
+    state, error = serve(handler, scenario)
+    assert state == ["answered"] and error is None
+    assert not [
+        record
+        for record in caplog.records
+        if record.name == "aiohttp.server" and record.exc_info
+    ]
+
+
+def test_handler_connection_error_is_retained_for_the_owner():
+    error = ConnectionResetError("inference backend disconnected")
+
+    async def handler(state, body):
+        raise error
+
+    async def scenario(server, client):
+        url = server.open("episode", None) + "/chat/completions"
+        response = await client.post(
+            url, json={"model": "policy", "messages": [], "stream": True}
+        )
+        return response, await server.close("episode")
+
+    response, observed = serve(handler, scenario)
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    assert observed is error

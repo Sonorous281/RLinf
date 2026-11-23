@@ -409,10 +409,9 @@ def validate_rollout_cfg(cfg, algorithm_cfg, actor_cfg=None):
             and actor_cfg is not None
             and actor_cfg.get("training_backend") == "megatron"
         ):
-            # Qwen35Convertor syncs the fused projections unsplit.
-            assert cfg.get("tensor_parallel_size", 1) == 1, (
-                "Syncing Megatron Qwen3.5 weights needs "
-                f"rollout.tensor_parallel_size=1, got {cfg.tensor_parallel_size}."
+            load_mtp = actor_cfg.model.get("load_mtp", True)
+            assert isinstance(load_mtp, bool), (
+                f"actor.model.load_mtp must be a boolean, got {load_mtp!r}."
             )
         cfg.return_logprobs = cfg.return_logprobs or algorithm_cfg.get(
             "importance_sampling_fix", False
@@ -476,6 +475,7 @@ def validate_model_cfg_by_hf_config(cfg, hf_model_path):
         or "Qwen3VLForConditionalGeneration" in hf_config.architectures
         or "Qwen3VLMoeForConditionalGeneration" in hf_config.architectures
         or "Qwen3_5ForConditionalGeneration" in hf_config.architectures
+        or "Qwen3_5ForCausalLM" in hf_config.architectures
     ):
         qk_layernorm = True
     else:
@@ -493,8 +493,10 @@ def validate_model_cfg_by_hf_config(cfg, hf_model_path):
             # reported as rope_scaling=None and so left this untouched.
             cfg.model.seq_len_interpolation_factor = None
         model_type = getattr(cfg.model, "model_type", None)
-        if model_type in {"qwen3_vl", "qwen3_vl_moe", "qwen3_5"}:
-            # These config.json files keep the language model config in text_config.
+        if model_type in ("qwen3_vl", "qwen3_vl_moe", "qwen3_5") and hasattr(
+            hf_config, "text_config"
+        ):
+            # qwen3_vl and qwen3_vl_moe config.json set the model config in text_config
             hf_config = hf_config.text_config
 
         cfg.model.padded_vocab_size = hf_config.vocab_size
@@ -742,6 +744,8 @@ def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
 
 def validate_megatron_cfg(cfg: DictConfig) -> DictConfig:
     OmegaConf.set_struct(cfg, True)
+    if "data" in cfg and "sampling_batch_size" in cfg.data:
+        sampling_batch_size(cfg)
 
     with open_dict(cfg):
         cfg.mcore_gpt = cfg.get("mcore_gpt", True)
@@ -2198,6 +2202,34 @@ def validate_qwen_vl_chunked_cfg(cfg) -> int:
             "Qwen-VL chunked scoring requires a finite positive temperature"
         )
     return size
+
+
+def sampling_batch_size(cfg: DictConfig) -> int:
+    """Return the candidate count without changing the effective learner batch."""
+    effective = cfg.data.rollout_batch_size
+    candidates = cfg.data.get("sampling_batch_size", effective)
+    if type(candidates) is not int or candidates < effective:
+        raise ValueError(
+            "data.sampling_batch_size must be an integer >= "
+            f"data.rollout_batch_size={effective}, got {candidates!r}."
+        )
+    if candidates == effective:
+        return candidates
+    if cfg.runner.task_type != "reasoning" or not cfg.runner.get("synchronous", False):
+        raise ValueError(
+            "Oversampling requires synchronous agent PPO; asynchronous and "
+            "evaluation runs must use sampling_batch_size=rollout_batch_size."
+        )
+    if (
+        cfg.algorithm.get("max_num_gen_batches", 1) != 1
+        or not cfg.agentloop.get("is_dynamic_rollout_batch", False)
+        or cfg.rollout.rollout_backend != "sglang"
+    ):
+        raise ValueError(
+            "Synchronous oversampling requires "
+            "max_num_gen_batches=1, a multi-turn agent loop and SGLang rollout."
+        )
+    return candidates
 
 
 def validate_agent_ppo_cfg(cfg: DictConfig, task: str) -> None:

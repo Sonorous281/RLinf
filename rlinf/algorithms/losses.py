@@ -271,10 +271,8 @@ def compute_ppo_actor_loss(
     Returns:
         Tuple[torch.Tensor, Dict]: (actor_loss, metrics_dict)
     """
-    if fast_path_zero_loss_mask and (
-        loss_mask is not None and loss_mask[0].sum() == 0.0
-    ):
-        return torch.tensor(0.0, device=logprobs.device), {
+    if fast_path_zero_loss_mask and (loss_mask is not None and not loss_mask.any()):
+        return logprobs.sum() * 0.0, {
             "actor/token_num": torch.tensor(0.0, device=logprobs.device),
             "actor/policy_loss": torch.tensor(0.0, device=logprobs.device),
             "actor/policy_loss_mbs_mean": torch.tensor(0.0, device=logprobs.device),

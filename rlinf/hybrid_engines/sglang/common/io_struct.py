@@ -15,8 +15,6 @@
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from sglang.srt.managers.schedule_batch import Req
-
 
 @dataclass
 class AbortGenerationInput:
@@ -25,8 +23,8 @@ class AbortGenerationInput:
 
 @dataclass
 class AbortGenerationOutput:
-    waiting_reqs: list[Req]
-    running_reqs: list[Req]
+    waiting_reqs: list[str]
+    running_reqs: list[str]
 
 
 @dataclass

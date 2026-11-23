@@ -325,7 +325,16 @@ class AsyncChannelWork(AsyncWork):
     def _execute(self):
         method = getattr(self._channel_actor, self._method)
         future: ConcurrentFuture = method.remote(*self._args, **self._kwargs).future()
-        future.add_done_callback(lambda f: self._future.set_result(f.result()))
+
+        def complete(result: ConcurrentFuture) -> None:
+            try:
+                value = result.result()
+            except BaseException as error:
+                self._future.set_exception(error)
+            else:
+                self._future.set_result(value)
+
+        future.add_done_callback(complete)
 
     async def async_wait(self):
         """Async wait for the work to complete.
