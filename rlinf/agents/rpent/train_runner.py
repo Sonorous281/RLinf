@@ -34,11 +34,13 @@ class RPentRunner(AsyncAgentRunner):
     def _prepare_update(self, release_handle):
         if self.cfg.runner.synchronous:
             cohort = self._wait_actor(release_handle, self._training_handles)[0]
-            self.agent_loop.cancel_groups(cohort["remaining"]).wait()
-            handle = self.rollout_buffer.admit_cohort(cohort)
-            cohort["late_completions"] = self._wait_actor(
-                handle, self._training_handles
-            )[0]
+            with self.timer("rollout/cancel_groups"):
+                self.agent_loop.cancel_groups(cohort["remaining"]).wait()
+            with self.timer("rollout/admit_cohort"):
+                handle = self.rollout_buffer.admit_cohort(cohort)
+                cohort["late_completions"] = self._wait_actor(
+                    handle, self._training_handles
+                )[0]
             output = (
                 Path(self.cfg.runner.output_dir)
                 / self.cfg.runner.experiment_name

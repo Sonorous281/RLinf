@@ -80,8 +80,8 @@ from rlinf.workers.actor.megatron_actor_worker import (
 )
 from rlinf.workers.actor.nested_prefix import (
     NestedPrefixHead,
-    nested_prefix_ends,
     score_nested_microbatches,
+    tp_nested_prefix_ends,
 )
 from rlinf.workers.megatron_worker import DynamicMegatronBatchMixin
 from rlinf.workers.rollout.session_server.assembly import (
@@ -273,7 +273,11 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
     def run_forward_backward(self, batch: DynamicActorBatch, forward_only=True):
         if self.reuse_nested_prefixes:
             # The final DP assignment, shuffle and optimizer-step boundaries are known here.
-            ends = nested_prefix_ends(batch)
+            ends = tp_nested_prefix_ends(
+                batch,
+                parallel_state.get_tensor_model_parallel_group(),
+                self.torch_platform.current_device(),
+            )
             physical_rows = [i for i, end in enumerate(ends) if i == end]
             if self.is_data_io_rank:
                 rows = batch["input_ids"]
@@ -286,11 +290,18 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
             if len(physical_rows) != len(ends):
                 runs = torch.tensor([end - i + 1 for i, end in enumerate(ends)])
                 batch = {**batch, "nested_prefix_run": runs}
-                return super().run_forward_backward(
+                pending = []
+                result = super().run_forward_backward(
                     batch,
                     forward_only,
+                    forward_step_func=self.get_forward_step_func(pending),
                     should_prefetch=lambda row: row["nested_prefix_run"].item() <= 1,
                 )
+                if pending:
+                    raise RuntimeError(
+                        "Final nested prefix slot did not finish backward"
+                    )
+                return result
         return super().run_forward_backward(batch, forward_only)
 
     def _forward_ragged_scores(self, batch, model, prepare_head=None):
@@ -328,7 +339,7 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
             }
         return output
 
-    def get_forward_step_func(self):
+    def get_forward_step_func(self, pending_prefix_grads=None):
         """Acquire the forward step function for the model."""
         logical_rows = None
 
@@ -338,10 +349,11 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
                 batch = next(dataloader_iter)
                 if "nested_prefix_run" in batch:
                     forward = partial(self._forward_ragged_scores, model=model)
+                    head = partial(NestedPrefixHead, pending=pending_prefix_grads)
                     logical_rows = score_nested_microbatches(
                         chain([batch], dataloader_iter),
                         forward,
-                        partial(forward, prepare_head=NestedPrefixHead)
+                        partial(forward, prepare_head=head)
                         if self.return_loss
                         else None,
                     )
@@ -461,24 +473,20 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
                     kl_loss = self.loss_agg_func(kld * batch["loss_scales"], mask)
                     loss = loss + kl_loss * self.kl_beta
 
-                # all gather
-                _imp: torch.Tensor = metrics_data["actor/ratio"].clone()
-                torch.distributed.all_reduce(
-                    _imp,
-                    torch.distributed.ReduceOp.AVG,
-                    group=parallel_state.get_data_parallel_group(),
-                )
-
-                # Early stopping.
-                if (
-                    self.cfg.algorithm.early_stop_imp_ratio is not None
-                    and _imp > self.cfg.algorithm.early_stop_imp_ratio
-                ):
-                    self.log_warning(
-                        f"Current importance ratio {_imp.item():.4f} is larger "
-                        f"than early stop threshold {self.cfg.algorithm.early_stop_imp_ratio}. Abandon this microbatch."
+                threshold = self.cfg.algorithm.early_stop_imp_ratio
+                if threshold is not None:
+                    ratio = metrics_data["actor/ratio"].detach().clone()
+                    torch.distributed.all_reduce(
+                        ratio,
+                        torch.distributed.ReduceOp.AVG,
+                        group=parallel_state.get_data_parallel_group(),
                     )
-                    loss = loss * 0.0
+                    if ratio > threshold:
+                        self.log_warning(
+                            f"Current importance ratio {ratio.item():.4f} is larger "
+                            f"than early stop threshold {threshold}. Abandon this microbatch."
+                        )
+                        loss = loss * 0.0
 
                 if self.cfg.algorithm.use_valid_token_scale:
                     loss_scale = (
@@ -499,26 +507,43 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
                     }
                 )
 
-                for k in sorted(metrics_data.keys()):
-                    v = metrics_data[k]
-                    if v is None:
-                        continue
-                    if k in CRITIC_EXPLAINED_VARIANCE_STAT_KEYS:
-                        v = v.detach().clone()
-                        torch.distributed.all_reduce(
-                            v,
-                            op=torch.distributed.ReduceOp.SUM,
-                            group=parallel_state.get_data_parallel_group(),
-                        )
-                        metrics_data[k] = v
-                    else:
-                        metrics_data[k] = average_losses_across_data_parallel_group([v])
-
+                if self.reuse_nested_prefixes:
+                    # Only detached diagnostics survive until the schedule finishes.
+                    metrics_data = {
+                        key: value.detach() if value is not None else None
+                        for key, value in metrics_data.items()
+                    }
+                else:
+                    self._reduce_slot_metrics([metrics_data])
                 return loss, metrics_data
 
             return output, loss_func
 
         return forward_output_and_loss_func
+
+    @staticmethod
+    def _reduce_slot_metrics(slots):
+        """Reduce each scalar metric across DP, preserving its logical slot."""
+        for key in sorted(slots[0]):
+            if slots[0][key] is None:
+                continue
+            values = [slot[key] for slot in slots]
+            if key in CRITIC_EXPLAINED_VARIANCE_STAT_KEYS:
+                reduced = torch.stack(values).detach()
+                torch.distributed.all_reduce(
+                    reduced, group=parallel_state.get_data_parallel_group()
+                )
+                per_slot = reduced.unbind()
+            else:
+                per_slot = average_losses_across_data_parallel_group(values).split(1)
+            for slot, value in zip(slots, per_slot, strict=True):
+                slot[key] = value
+
+    def _process_fwd_bwd_outputs(self, forward_outputs, forward_only):
+        if not forward_only and forward_outputs and self.reuse_nested_prefixes:
+            # The gate already ran at its original slot. Diagnostics can wait.
+            self._reduce_slot_metrics(forward_outputs)
+        return super()._process_fwd_bwd_outputs(forward_outputs, forward_only)
 
     def _setup_valid_token_scale(self, batch: Optional[DynamicActorBatch] = None):
         if batch is None:

@@ -1520,6 +1520,7 @@ class DynamicMegatronBatchMixin:
         forward_only=True,
         *,
         should_prefetch: Callable[[dict], bool] | None = None,
+        forward_step_func: Callable | None = None,
     ):
         """Run the forward and backward pass on the model.
 
@@ -1527,6 +1528,7 @@ class DynamicMegatronBatchMixin:
             batch (dict): Real-length token rows and per-sequence metadata.
             forward_only (bool): If True, only run the forward pass without backpropagation.
             should_prefetch: Select microbatches that need their own model inputs.
+            forward_step_func: A forward step with state scoped to this schedule.
         """
         clear_memory()
         row_count = len(batch["input_ids"])
@@ -1596,7 +1598,7 @@ class DynamicMegatronBatchMixin:
             )
         with context as data_iterator:
             forward_outputs = fwd_bwd_function(
-                forward_step_func=self.get_forward_step_func(),
+                forward_step_func=forward_step_func or self.get_forward_step_func(),
                 data_iterator=data_iterator,
                 model=self.model,
                 num_microbatches=num_microbatches,

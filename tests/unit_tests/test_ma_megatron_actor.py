@@ -636,6 +636,7 @@ def scoring_actor(tmp_path, monkeypatch):
     actor.tokenizer = SimpleNamespace(eos_token_id=0)
     actor.clip_ratio_c, actor.clip_ratio_low, actor.clip_ratio_high = 3.0, 0.2, 0.2
     actor.response_only_logits = False
+    actor.reuse_nested_prefixes = False
     actor.scoring_forward = None
     actor.kl_beta = 0.0
     actor.loss_agg_func = masked_mean
@@ -733,6 +734,7 @@ def test_nested_actor_preserves_logprobs_and_gated_updates(scoring_actor):
     ]
 
     def replay(compact):
+        actor.reuse_nested_prefixes = compact
         model = _ChunkedDecoderStage()
         calls = []
         model.register_forward_hook(lambda *args: calls.append(1))
@@ -766,6 +768,8 @@ def test_nested_actor_preserves_logprobs_and_gated_updates(scoring_actor):
             loss, values = loss_fn(output)
             (loss / len(batch)).backward()
             metrics.append({k: v.detach() for k, v in values.items()})
+        if compact:
+            actor._reduce_slot_metrics(metrics)
         assert metrics[-1]["actor/final_loss"].item() == 0
         assert len(calls) == (2 if compact else 6)
         grads = [param.grad.clone() for param in model.parameters()]

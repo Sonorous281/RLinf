@@ -14,6 +14,8 @@
 
 """Check prefix eligibility and gradients at the original logical loss slots."""
 
+from datetime import timedelta
+
 import pytest
 import torch
 
@@ -21,6 +23,7 @@ from rlinf.utils.image_replay import REPLAY_FORMAT
 from rlinf.workers.actor.nested_prefix import (
     NestedPrefixHead,
     nested_prefix_ends,
+    tp_nested_prefix_ends,
 )
 
 
@@ -157,3 +160,45 @@ def test_logical_heads_preserve_sparse_gradients(fusion, tied, last):
         )
 
     torch.testing.assert_close(run(True), run(False), atol=2e-5, rtol=2e-5)
+
+
+def _check_tp_schedules(rank, rendezvous):
+    dist = torch.distributed
+    dist.init_process_group(
+        "gloo",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        rows = [torch.arange(size) for size in (5, 8)]
+        images = [_image_row(3, []), _image_row(7, [])]
+        batch = {"input_ids": rows, "idx_to_traj": [0, 0], "multi_modal_inputs": images}
+        tp_nested_prefix_ends(batch, dist.group.WORLD, "cpu")
+        images[1]["extends_previous_turn"] = rank == 0
+        with pytest.raises(RuntimeError, match="Tensor-parallel ranks disagree"):
+            tp_nested_prefix_ends(batch, dist.group.WORLD, "cpu")
+        images[1]["extends_previous_turn"] = True
+        if rank:
+            images[0]["prompt_token_ids"] = [-1]
+        with pytest.raises((ValueError, RuntimeError), match="nested prefix"):
+            tp_nested_prefix_ends(batch, dist.group.WORLD, "cpu")
+    finally:
+        dist.destroy_process_group()
+
+
+def test_tp_peers_reject_different_prefix_schedules(tmp_path):
+    torch.multiprocessing.spawn(
+        _check_tp_schedules, args=((tmp_path / "tp").as_uri(),), nprocs=2
+    )
+
+
+def test_nested_head_requires_backward_before_the_next_slot():
+    hidden = torch.ones(1, 5, 2, requires_grad=True)
+    labels = torch.zeros(1, 5, dtype=torch.long)
+    head = NestedPrefixHead(hidden, labels, lambda h, **kw: {"log_probs": h.sum(-1)})
+    mask = torch.tensor([False, True, True])
+    head.logical_scores(mask, last=False)
+    with pytest.raises(RuntimeError, match="did not finish backward"):
+        head.logical_scores(mask, last=True)

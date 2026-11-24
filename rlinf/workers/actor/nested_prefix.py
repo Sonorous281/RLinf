@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import hashlib
+from array import array
 from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING
 
@@ -74,6 +76,39 @@ def nested_prefix_ends(batch: DynamicActorBatch) -> list[int]:
     return ends
 
 
+def tp_nested_prefix_ends(
+    batch: DynamicActorBatch, group: torch.distributed.ProcessGroup, device
+) -> list[int]:
+    """Agree on the decoder and scoring schedule before entering TP collectives."""
+    if group.size() == 1:
+        return nested_prefix_ends(batch)
+    error = None
+    try:
+        ends = nested_prefix_ends(batch)
+        layout = array("q", ends)
+        layout.extend(map(len, batch["input_ids"]))
+        digest = hashlib.blake2b(layout.tobytes(), digest_size=16)
+        for mask in batch.get("response_mask", ()):
+            digest.update(mask.detach().cpu().contiguous().numpy())
+        signature = digest.digest()
+    except (KeyError, TypeError, ValueError, IndexError, RuntimeError) as exc:
+        # A peer with malformed metadata must still enter the same collective.
+        error = exc
+        signature = bytes(16)
+    local = torch.tensor(list(signature), dtype=torch.uint8, device=device)
+    gathered = local.new_empty(group.size() * len(signature))
+    torch.distributed.all_gather_into_tensor(gathered, local, group=group)
+    if error is not None:
+        raise ValueError(
+            "Invalid nested prefix inputs on this tensor-parallel rank"
+        ) from error
+    if not torch.equal(gathered.view(group.size(), -1), local.expand(group.size(), -1)):
+        raise RuntimeError(
+            "Tensor-parallel ranks disagree on the nested prefix schedule"
+        )
+    return ends
+
+
 class NestedPrefixScores:
     """Project the scores from a shared inference pass onto each logical row."""
 
@@ -120,14 +155,18 @@ class _SelectPrefixHidden(torch.autograd.Function):
 class NestedPrefixHead:
     """Project each logical slot using its original weights and scored positions."""
 
-    def __init__(self, hidden, labels, score):
+    def __init__(self, hidden, labels, score, *, pending=None):
         # Fixed MBS1. SP/TP synchronization wraps the physical hidden tensor once.
         self.hidden = hidden[0]
         self.labels = labels[0]
         self.score = score
-        self.pending = []
+        self.pending = [] if pending is None else pending
+        self.slot = 0
 
     def logical_scores(self, response_mask, *, last):
+        if self.hidden.requires_grad and len(self.pending) != self.slot:
+            raise RuntimeError("Previous nested prefix slot did not finish backward")
+        self.slot += 1
         indices = response_mask[1:].nonzero(as_tuple=True)[0].to(self.hidden.device)
         hidden = self.hidden
         if not last:
