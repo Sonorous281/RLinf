@@ -132,24 +132,6 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
         self.loss_scale_fns = get_loss_scales(loss_scales)
         self.pack_traj = self.cfg.actor.get("pack_traj", True)
         self.reuse_nested_prefixes = cfg.actor.get("reuse_nested_prefixes", False)
-        if self.reuse_nested_prefixes and (
-            self.scoring_forward is None
-            or self.enable_dynamic_batch_size
-            or cfg.actor.micro_batch_size != 1
-            or self.logprob_forward_micro_batch_size != 1
-            or self.transformer_config.num_moe_experts
-            or self.transformer_config.expert_model_parallel_size != 1
-            or self.transformer_config.cuda_graph_impl != "none"
-            or self.transformer_config.hidden_dropout
-            or self.transformer_config.attention_dropout
-            or cfg.actor.optim.get("overlap_param_gather", False)
-            or cfg.actor.optim.get("overlap_grad_reduce", False)
-        ):
-            raise ValueError(
-                "Nested prefix reuse requires dense chunked Qwen-VL scoring with EP1, "
-                "fixed training and logprob microbatch size 1, zero dropout, "
-                "disabled CUDA graphs and disabled DP communication overlap"
-            )
 
     def _receive_rollout_result(
         self, channel: Channel
@@ -304,6 +286,11 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
             if len(physical_rows) != len(ends):
                 runs = torch.tensor([end - i + 1 for i, end in enumerate(ends)])
                 batch = {**batch, "nested_prefix_run": runs}
+                return super().run_forward_backward(
+                    batch,
+                    forward_only,
+                    should_prefetch=lambda row: row["nested_prefix_run"].item() <= 1,
+                )
         return super().run_forward_backward(batch, forward_only)
 
     def _forward_ragged_scores(self, batch, model, prepare_head=None):

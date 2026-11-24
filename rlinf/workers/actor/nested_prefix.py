@@ -144,10 +144,7 @@ class NestedPrefixHead:
 
 def _score_run(first, batches, count, forward, forward_head):
     rows = [first]
-    for _ in range(count - 1):
-        # Only the longest row needs its prefetched pixels.
-        rows[-1].pop("_prepared_multimodal_inputs", None)
-        rows.append(next(batches))
+    rows.extend(next(batches) for _ in range(count - 1))
     longest = rows[-1]
     if forward_head is not None:
         shared = forward_head(longest)

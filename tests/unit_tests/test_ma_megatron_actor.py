@@ -778,6 +778,72 @@ def test_nested_actor_preserves_logprobs_and_gated_updates(scoring_actor):
     torch.testing.assert_close(actual, expected)
 
 
+def test_actor_prefetch_reads_only_physical_rows(scoring_actor, tmp_path, monkeypatch):
+    from megatron.core import parallel_state
+
+    from rlinf.utils.image_replay import REPLAY_FORMAT, store_pixels
+    from rlinf.workers import megatron_worker
+
+    actor, _ = scoring_actor
+    pixels = torch.arange(8, dtype=torch.bfloat16).view(4, 2)
+    media = {
+        "format": REPLAY_FORMAT,
+        "image_grid_thw": torch.tensor([[1, 2, 2]]),
+        "image_spans": [(0, 1)],
+        "mrope_position_delta": torch.tensor([0]),
+        "extends_previous_turn": True,
+        "pixel_values": pixels,
+    }
+    store_pixels(media, tmp_path)
+    rows = [torch.arange(n) for n in (3, 5, 4)]
+    images = [
+        {**media, "prompt_token_ids": row.tolist(), "mrope_positions": row.repeat(3, 1)}
+        for row in rows
+    ]
+    # The short row's copy is unavailable. Its identical pixels exist on the long row.
+    images[0]["pixel_refs"] = [
+        {**media["pixel_refs"][0], "path": str(tmp_path / "absent")}
+    ]
+    batch = {
+        "input_ids": rows,
+        "idx_to_traj": [0, 0, 1],
+        "attention_mask": [torch.ones_like(row, dtype=torch.bool) for row in rows],
+        "multi_modal_inputs": images,
+    }
+    actor.reuse_nested_prefixes = True
+    actor.enable_dynamic_batch_size = actor.is_data_io_rank = actor.use_profiler = False
+    actor.logprob_forward_micro_batch_size = 1
+    actor.model = torch.nn.Identity()
+    actor.log_debug = lambda msg: None
+    actor.role_cfg = {"multimodal": {"prefetch_batches": 2, "prefetch_bytes": 165}}
+    actor.cfg.rollout = {
+        "model": {"model_path": ""},
+        "sglang": {"enable_shared_multi_modal_processor": True},
+    }
+    monkeypatch.setattr(megatron_worker, "clear_memory", lambda: None)
+    # The other DP replica has four rows. This replica must still prefetch its pad row.
+    monkeypatch.setattr(dist, "all_reduce", lambda tensor, **kwargs: tensor.fill_(4))
+    monkeypatch.setattr(
+        parallel_state, "_PIPELINE_MODEL_PARALLEL_GROUP", dist.group.WORLD
+    )
+
+    def schedule(data_iterator, **kwargs):
+        results = []
+        for index, row in enumerate(data_iterator):
+            if index:
+                inputs = actor.multimodal_preparer.for_forward(row, "cpu")
+                if index == len(rows):
+                    assert inputs["multimodal_position_ids"].shape == (3, 1, 1)
+                else:
+                    torch.testing.assert_close(inputs["pixel_values"], pixels)
+            results.append([len(row["input_ids"][0])])
+        assert len(results) == kwargs["num_microbatches"] == 4
+        return results
+
+    monkeypatch.setattr(megatron_worker, "get_forward_backward_func", lambda: schedule)
+    assert actor.run_forward_backward(batch) == [3, 5, 4]
+
+
 def test_actor_passes_hidden_states_between_stages_unscaled(scoring_actor):
     actor, batch = scoring_actor
     actor.calculate_entropy = actor.return_loss = False

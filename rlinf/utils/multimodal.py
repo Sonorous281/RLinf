@@ -18,13 +18,12 @@ import hashlib
 import io
 import json
 from collections import OrderedDict, deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 from threading import RLock
-from typing import ContextManager
 
 import torch
 
@@ -260,14 +259,6 @@ class MultimodalBatchPreparer:
             token_space=self.token_space,
         )
 
-    def iterator_context(
-        self, iterator: Iterator[dict]
-    ) -> ContextManager[Iterator[dict]]:
-        """Own and drain the prefetch thread even when model forward fails."""
-        if not self.prefetch_batches:
-            return nullcontext(iterator)
-        return self._prefetch_context(iterator)
-
     def _result_bytes(self, batch: dict) -> int:
         size = 3 * batch["input_ids"].numel() * 8 if self.token_space else 0
         entries = batch.get("multi_modal_inputs") or []
@@ -305,11 +296,15 @@ class MultimodalBatchPreparer:
             )
         return prepared
 
-    def _iterate(self, iterator, executor):
+    def _iterate(self, iterator, executor, should_prefetch):
         pending, reserved = deque(), 0
         batch = next(iterator, None)
         while batch is not None or pending:
             while batch is not None and len(pending) < self.prefetch_batches:
+                if should_prefetch is not None and not should_prefetch(batch):
+                    pending.append((batch, None, 0))
+                    batch = next(iterator, None)
+                    continue
                 dense = self.dense_token_inputs(batch)
                 size = self._result_bytes(dense)
                 if reserved + size > self.prefetch_bytes:
@@ -333,13 +328,24 @@ class MultimodalBatchPreparer:
                 reserved += size
                 batch = next(iterator, None)
             source, future, size = pending.popleft()
-            yield {**source, "_prepared_multimodal_inputs": future.result()}
+            if future is not None:
+                source = {**source, "_prepared_multimodal_inputs": future.result()}
+            yield source
             reserved -= size
 
     @contextmanager
-    def _prefetch_context(self, iterator):
+    def iterator_context(
+        self,
+        iterator: Iterator[dict],
+        *,
+        should_prefetch: Callable[[dict], bool] | None = None,
+    ) -> Iterator[Iterator[dict]]:
+        """Prefetch inputs for model forwards and yield all microbatches in order."""
+        if not self.prefetch_batches:
+            yield iterator
+            return
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rlinf-images")
-        batches = self._iterate(iter(iterator), executor)
+        batches = self._iterate(iter(iterator), executor, should_prefetch)
         try:
             yield batches
         finally:
