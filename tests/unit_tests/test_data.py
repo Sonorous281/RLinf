@@ -6014,6 +6014,7 @@ def test_dynamic_advantage_contract_with_critic(critic, adv_type):
 
     cfg = OmegaConf.create(
         {
+            "runner": {"async_mode": False},
             "agentloop": {"is_dynamic_rollout_batch": True},
             "critic": {"use_critic_model": critic},
             "algorithm": {"adv_type": adv_type},

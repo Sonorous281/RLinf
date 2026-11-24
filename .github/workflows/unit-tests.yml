@@ -61,7 +61,7 @@ jobs:
           uv venv --python 3.11.14
           source .venv/bin/activate
           UV_TORCH_BACKEND=auto uv sync
-          UV_TORCH_BACKEND=cpu uv pip install gymnasium imageio opencv-python "torchvision==0.26.0"
+          UV_TORCH_BACKEND=cpu uv pip install gymnasium imageio opencv-python msgspec "torchvision==0.26.0"
           uv pip install "transformers<=5.9.0"
 
       - name: Run pytest
