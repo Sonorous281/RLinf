@@ -15,6 +15,7 @@
 from contextlib import nullcontext
 from dataclasses import replace
 from functools import partial
+from itertools import chain
 from typing import Optional
 
 import torch
@@ -77,6 +78,11 @@ from rlinf.utils.utils import (
 from rlinf.workers.actor.megatron_actor_worker import (
     MegatronActor,
 )
+from rlinf.workers.actor.nested_prefix import (
+    NestedPrefixHead,
+    score_nested_microbatches,
+    tp_nested_prefix_ends,
+)
 from rlinf.workers.megatron_worker import DynamicMegatronBatchMixin
 from rlinf.workers.rollout.session_server.assembly import (
     assemble_group_payload,
@@ -125,6 +131,7 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
         loss_scales = self.cfg.algorithm.get("loss_scales", [])
         self.loss_scale_fns = get_loss_scales(loss_scales)
         self.pack_traj = self.cfg.actor.get("pack_traj", True)
+        self.reuse_nested_prefixes = cfg.actor.get("reuse_nested_prefixes", False)
 
     def _receive_rollout_result(
         self, channel: Channel
@@ -192,7 +199,9 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
             self.torch_platform.current_device(),
         )
 
-    def _score_packed_tokens(self, model, module, model_inputs, label, label_mask):
+    def _score_packed_tokens(
+        self, model, module, model_inputs, label, label_mask, prepare_head=None
+    ):
         """Project packed tokens and return scores in their original positions."""
         temperature = self.cfg.algorithm.sampling_params.temperature
         if self.scoring_forward is not None:
@@ -203,6 +212,7 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
                 temperature=temperature,
                 label=label,
                 label_mask=label_mask,
+                **({"prepare_head": prepare_head} if prepare_head else {}),
             )
         positions = None
         projection = nullcontext()
@@ -260,60 +270,113 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
             for key, value in output.items()
         }
 
-    def get_forward_step_func(self):
+    def run_forward_backward(self, batch: DynamicActorBatch, forward_only=True):
+        if self.reuse_nested_prefixes:
+            # The final DP assignment, shuffle and optimizer-step boundaries are known here.
+            ends = tp_nested_prefix_ends(
+                batch,
+                parallel_state.get_tensor_model_parallel_group(),
+                self.torch_platform.current_device(),
+            )
+            physical_rows = [i for i, end in enumerate(ends) if i == end]
+            if self.is_data_io_rank:
+                rows = batch["input_ids"]
+                self.log_info(
+                    f"Nested prefix {'inference' if forward_only else 'training'}: "
+                    f"{len(rows)} logical rows / {len(physical_rows)} physical rows, "
+                    f"{sum(map(len, rows))} logical input tokens / "
+                    f"{sum(len(rows[i]) for i in physical_rows)} physical input tokens"
+                )
+            if len(physical_rows) != len(ends):
+                runs = torch.tensor([end - i + 1 for i, end in enumerate(ends)])
+                batch = {**batch, "nested_prefix_run": runs}
+                pending = []
+                result = super().run_forward_backward(
+                    batch,
+                    forward_only,
+                    forward_step_func=self.get_forward_step_func(pending),
+                    should_prefetch=lambda row: row["nested_prefix_run"].item() <= 1,
+                )
+                if pending:
+                    raise RuntimeError(
+                        "Final nested prefix slot did not finish backward"
+                    )
+                return result
+        return super().run_forward_backward(batch, forward_only)
+
+    def _forward_ragged_scores(self, batch, model, prepare_head=None):
+        rows = [
+            row.to(self.torch_platform.current_device()) for row in batch["input_ids"]
+        ]
+        lengths = [len(row) for row in rows]
+        input_ids, packed_params = preprocess_ragged_seqs(rows)
+        position_ids, _ = preprocess_ragged_seqs(
+            [torch.arange(n, device=input_ids.device) for n in lengths]
+        )
+        labels = [torch.cat((row[1:], row.new_zeros(1))) for row in rows]
+        label, _ = preprocess_ragged_seqs(labels)
+        if self.response_only_logits or self.scoring_forward is not None:
+            # Shift in each trajectory before the packing step inserts TP padding.
+            masks = [
+                torch.cat((mask[1:], mask.new_zeros(1))).to(input_ids.device)
+                for mask in batch["response_mask"]
+            ]
+        else:
+            masks = [torch.arange(n, device=input_ids.device) < n - 1 for n in lengths]
+        label_mask, _ = preprocess_ragged_seqs(masks)
+        module = unwrap_model(model)
+        with self.ragged_model_inputs(
+            batch, module, input_ids, position_ids, packed_params
+        ) as model_inputs:
+            output = self._score_packed_tokens(
+                model, module, model_inputs, label, label_mask, prepare_head
+            )
+
+        if module.post_process and prepare_head is None:
+            return {
+                key: postprocess_ragged_seqs(value, packed_params, lengths)
+                for key, value in output.items()
+            }
+        return output
+
+    def get_forward_step_func(self, pending_prefix_grads=None):
         """Acquire the forward step function for the model."""
+        logical_rows = None
 
         def forward_output_and_loss_func(dataloader_iter, model):
-            batch = next(dataloader_iter)
+            nonlocal logical_rows
+            if logical_rows is None:
+                batch = next(dataloader_iter)
+                if "nested_prefix_run" in batch:
+                    forward = partial(self._forward_ragged_scores, model=model)
+                    head = partial(NestedPrefixHead, pending=pending_prefix_grads)
+                    logical_rows = score_nested_microbatches(
+                        chain([batch], dataloader_iter),
+                        forward,
+                        partial(forward, prepare_head=head)
+                        if self.return_loss
+                        else None,
+                    )
+                else:
+                    output = self._forward_ragged_scores(batch, model)
+            if logical_rows is not None:
+                batch, output = next(logical_rows)
 
-            rows = [
-                row.to(self.torch_platform.current_device())
-                for row in batch["input_ids"]
-            ]
-            lengths = [len(row) for row in rows]
-            input_ids, packed_params = preprocess_ragged_seqs(rows)
-            position_ids, _ = preprocess_ragged_seqs(
-                [torch.arange(n, device=input_ids.device) for n in lengths]
-            )
-            labels = [torch.cat((row[1:], row.new_zeros(1))) for row in rows]
-            label, _ = preprocess_ragged_seqs(labels)
-            if self.response_only_logits or self.scoring_forward is not None:
-                # Shift in each trajectory before the packing step inserts TP padding.
-                masks = [
-                    torch.cat((mask[1:], mask.new_zeros(1))).to(input_ids.device)
-                    for mask in batch["response_mask"]
-                ]
-            else:
-                masks = [
-                    torch.arange(n, device=input_ids.device) < n - 1 for n in lengths
-                ]
-            label_mask, _ = preprocess_ragged_seqs(masks)
-            module = unwrap_model(model)
-            with self.ragged_model_inputs(
-                batch, module, input_ids, position_ids, packed_params
-            ) as model_inputs:
-                output = self._score_packed_tokens(
-                    model, module, model_inputs, label, label_mask
-                )
-
-            if module.post_process:
-                output_rows = {
-                    key: postprocess_ragged_seqs(value, packed_params, lengths)
-                    for key, value in output.items()
-                }
+            if unwrap_model(model).post_process:
+                device = output["log_probs"][0].device
                 if not self.return_loss:
                     logprob_rows = [
                         align_next_token_scores(row).detach().cpu()
-                        for row in output_rows["log_probs"]
+                        for row in output["log_probs"]
                     ]
                     # Megatron inspects the tensor device before collecting non-loss data.
                     return (
-                        output["log_probs"],
+                        output["log_probs"][0],
                         lambda output, non_loss_data=True: logprob_rows,
                     )
                 width = self.cfg.actor.model.encoder_seq_length
                 output = DynamicRolloutResult.materialize_actor_batch(
-                    output_rows, width, 0, input_ids.device
+                    output, width, 0, device
                 )
                 batch = DynamicRolloutResult.materialize_actor_batch(
                     {
@@ -330,7 +393,7 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
                     },
                     width,
                     self.tokenizer.eos_token_id,
-                    input_ids.device,
+                    device,
                 )
 
             if not self.return_loss:
@@ -410,24 +473,20 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
                     kl_loss = self.loss_agg_func(kld * batch["loss_scales"], mask)
                     loss = loss + kl_loss * self.kl_beta
 
-                # all gather
-                _imp: torch.Tensor = metrics_data["actor/ratio"].clone()
-                torch.distributed.all_reduce(
-                    _imp,
-                    torch.distributed.ReduceOp.AVG,
-                    group=parallel_state.get_data_parallel_group(),
-                )
-
-                # Early stopping.
-                if (
-                    self.cfg.algorithm.early_stop_imp_ratio is not None
-                    and _imp > self.cfg.algorithm.early_stop_imp_ratio
-                ):
-                    self.log_warning(
-                        f"Current importance ratio {_imp.item():.4f} is larger "
-                        f"than early stop threshold {self.cfg.algorithm.early_stop_imp_ratio}. Abandon this microbatch."
+                threshold = self.cfg.algorithm.early_stop_imp_ratio
+                if threshold is not None:
+                    ratio = metrics_data["actor/ratio"].detach().clone()
+                    torch.distributed.all_reduce(
+                        ratio,
+                        torch.distributed.ReduceOp.AVG,
+                        group=parallel_state.get_data_parallel_group(),
                     )
-                    loss = loss * 0.0
+                    if ratio > threshold:
+                        self.log_warning(
+                            f"Current importance ratio {ratio.item():.4f} is larger "
+                            f"than early stop threshold {threshold}. Abandon this microbatch."
+                        )
+                        loss = loss * 0.0
 
                 if self.cfg.algorithm.use_valid_token_scale:
                     loss_scale = (
@@ -448,26 +507,43 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
                     }
                 )
 
-                for k in sorted(metrics_data.keys()):
-                    v = metrics_data[k]
-                    if v is None:
-                        continue
-                    if k in CRITIC_EXPLAINED_VARIANCE_STAT_KEYS:
-                        v = v.detach().clone()
-                        torch.distributed.all_reduce(
-                            v,
-                            op=torch.distributed.ReduceOp.SUM,
-                            group=parallel_state.get_data_parallel_group(),
-                        )
-                        metrics_data[k] = v
-                    else:
-                        metrics_data[k] = average_losses_across_data_parallel_group([v])
-
+                if self.reuse_nested_prefixes:
+                    # Only detached diagnostics survive until the schedule finishes.
+                    metrics_data = {
+                        key: value.detach() if value is not None else None
+                        for key, value in metrics_data.items()
+                    }
+                else:
+                    self._reduce_slot_metrics([metrics_data])
                 return loss, metrics_data
 
             return output, loss_func
 
         return forward_output_and_loss_func
+
+    @staticmethod
+    def _reduce_slot_metrics(slots):
+        """Reduce each scalar metric across DP, preserving its logical slot."""
+        for key in sorted(slots[0]):
+            if slots[0][key] is None:
+                continue
+            values = [slot[key] for slot in slots]
+            if key in CRITIC_EXPLAINED_VARIANCE_STAT_KEYS:
+                reduced = torch.stack(values).detach()
+                torch.distributed.all_reduce(
+                    reduced, group=parallel_state.get_data_parallel_group()
+                )
+                per_slot = reduced.unbind()
+            else:
+                per_slot = average_losses_across_data_parallel_group(values).split(1)
+            for slot, value in zip(slots, per_slot, strict=True):
+                slot[key] = value
+
+    def _process_fwd_bwd_outputs(self, forward_outputs, forward_only):
+        if not forward_only and forward_outputs and self.reuse_nested_prefixes:
+            # The gate already ran at its original slot. Diagnostics can wait.
+            self._reduce_slot_metrics(forward_outputs)
+        return super()._process_fwd_bwd_outputs(forward_outputs, forward_only)
 
     def _setup_valid_token_scale(self, batch: Optional[DynamicActorBatch] = None):
         if batch is None:
@@ -556,7 +632,9 @@ class MAMegatronActor(DynamicMegatronBatchMixin, MegatronActor):
                 batch["loss_scales"] = [mask.float() for mask in batch["response_mask"]]
         self._restore_source_normalization(batch, scale_context)
         for key in list(batch.keys()):
-            if key == "idx_to_traj" or key.startswith("extra:"):
+            if (
+                key == "idx_to_traj" and not self.reuse_nested_prefixes
+            ) or key.startswith("extra:"):
                 batch.pop(key, None)
 
         # Must be called after batch is retrieved, which is when rollout has stopped

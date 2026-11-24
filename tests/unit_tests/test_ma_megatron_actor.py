@@ -573,6 +573,39 @@ class _DecoderStage(torch.nn.Module):
         return self.output_layer(hidden).transpose(0, 1).contiguous()
 
 
+class _ChunkedDecoderStage(_DecoderStage):
+    def __init__(self):
+        from types import SimpleNamespace
+
+        super().__init__()
+        self.embedding = torch.nn.Embedding.from_pretrained(torch.eye(3), freeze=False)
+        self.output_layer.gradient_accumulation_fusion = False
+        self.language_model = SimpleNamespace(
+            post_process=True,
+            mtp_process=False,
+            pg_collection=SimpleNamespace(tp=None),
+            config=SimpleNamespace(
+                mtp_num_layers=0,
+                use_mup=False,
+                defer_embedding_wgrad_compute=False,
+                fp8=False,
+            ),
+            _postprocess=self.postprocess_hidden,
+        )
+
+    def postprocess_hidden(self, hidden, *, output_processor):
+        return output_processor(
+            hidden_states=hidden,
+            output_layer=self.output_layer,
+            output_weight=None,
+            labels=None,
+            inference_context=None,
+        )
+
+    def forward(self, input_ids, attention_mask, position_ids, packed_seq_params):
+        return self.language_model._postprocess(self.embedding(input_ids.T))
+
+
 @pytest.fixture
 def scoring_actor(tmp_path, monkeypatch):
     from types import SimpleNamespace
@@ -603,6 +636,7 @@ def scoring_actor(tmp_path, monkeypatch):
     actor.tokenizer = SimpleNamespace(eos_token_id=0)
     actor.clip_ratio_c, actor.clip_ratio_low, actor.clip_ratio_high = 3.0, 0.2, 0.2
     actor.response_only_logits = False
+    actor.reuse_nested_prefixes = False
     actor.scoring_forward = None
     actor.kl_beta = 0.0
     actor.loss_agg_func = masked_mean
@@ -663,6 +697,155 @@ def test_actor_entropy_bonus_uses_response_predictors(scoring_actor, response_on
         torch.autograd.grad(loss, weight)[0],
         torch.autograd.grad(expected_loss, weight)[0],
     )
+
+
+def test_nested_actor_preserves_logprobs_and_gated_updates(scoring_actor):
+    from functools import partial
+
+    from rlinf.hybrid_engines.megatron.qwen_vl import (
+        forward_qwen_vl_with_chunked_log_probs,
+    )
+
+    actor, _ = scoring_actor
+    actor.scoring_forward = partial(
+        forward_qwen_vl_with_chunked_log_probs, chunk_size=2, calculate_entropy=True
+    )
+    actor.cfg.algorithm.entropy_bonus = 0.0
+    actor.cfg.actor.model.encoder_seq_length = 8
+    actor.response_only_logits = True
+    actor.cfg.algorithm.early_stop_imp_ratio = 5.0
+    actor.cfg.algorithm.importance_sampling_fix = True
+    actor.cfg.algorithm.importance_sampling_clip = 2.0
+    actor.cfg.algorithm.use_valid_token_scale = True
+    actor.global_valid_token = 6
+    actor.num_microbatches = 3
+    actor.calculate_entropy = True
+    actor.calculate_entropy_loss = False
+    warnings = []
+    actor.log_warning = warnings.append
+    ids = torch.tensor([0, 1, 2, 1, 1, 0, 2, 1])
+    # The first two rows score the same action under different loss weights.
+    masks = [
+        torch.tensor(row, dtype=torch.bool)
+        for row in ([0, 1, 0], [0, 1, 0, 0, 1], [0, 0, 0, 1, 0, 1, 0, 1])
+    ]
+    rows = [
+        {"input_ids": [ids[: len(mask)]], "response_mask": [mask]} for mask in masks
+    ]
+
+    def replay(compact):
+        actor.reuse_nested_prefixes = compact
+        model = _ChunkedDecoderStage()
+        calls = []
+        model.register_forward_hook(lambda *args: calls.append(1))
+        batch = [dict(row) for row in rows]
+        if compact:
+            for remaining, row in zip((3, 2, 1), batch):
+                row["nested_prefix_run"] = torch.tensor([remaining])
+        actor.return_loss = False
+        forward = actor.get_forward_step_func()
+        iterator = iter(batch)
+        old = []
+        with torch.no_grad():
+            for _ in batch:
+                output, collect = forward(iterator, model)
+                old.append(collect(output)[0])
+        assert len(calls) == (1 if compact else 3)
+
+        for slot, row in enumerate(batch):
+            previous = old[slot] - (3.0 if slot == 2 else 0)
+            row["recomputed_logprobs"] = [previous]
+            row["rollout_logprobs"] = [previous + 0.25]
+            row["advantages"] = [torch.full_like(previous, slot - 0.75)]
+            row["loss_scales"] = [torch.full_like(previous, 1 / (slot + 1))]
+
+        actor.return_loss = True
+        forward = actor.get_forward_step_func()
+        iterator = iter(batch)
+        metrics = []
+        for _ in batch:
+            output, loss_fn = forward(iterator, model)
+            loss, values = loss_fn(output)
+            (loss / len(batch)).backward()
+            metrics.append({k: v.detach() for k, v in values.items()})
+        if compact:
+            actor._reduce_slot_metrics(metrics)
+        assert metrics[-1]["actor/final_loss"].item() == 0
+        assert len(calls) == (2 if compact else 6)
+        grads = [param.grad.clone() for param in model.parameters()]
+        assert all(grad.norm() > 0 for grad in grads)
+        torch.optim.Adam(model.parameters(), lr=1e-3).step()
+        return old, metrics, grads, [param.detach() for param in model.parameters()]
+
+    expected, actual = replay(False), replay(True)
+    assert len(warnings) == 2
+    torch.testing.assert_close(actual, expected)
+
+
+def test_actor_prefetch_reads_only_physical_rows(scoring_actor, tmp_path, monkeypatch):
+    from megatron.core import parallel_state
+
+    from rlinf.utils.image_replay import REPLAY_FORMAT, store_pixels
+    from rlinf.workers import megatron_worker
+
+    actor, _ = scoring_actor
+    pixels = torch.arange(8, dtype=torch.bfloat16).view(4, 2)
+    media = {
+        "format": REPLAY_FORMAT,
+        "image_grid_thw": torch.tensor([[1, 2, 2]]),
+        "image_spans": [(0, 1)],
+        "mrope_position_delta": torch.tensor([0]),
+        "extends_previous_turn": True,
+        "pixel_values": pixels,
+    }
+    store_pixels(media, tmp_path)
+    rows = [torch.arange(n) for n in (3, 5, 4)]
+    images = [
+        {**media, "prompt_token_ids": row.tolist(), "mrope_positions": row.repeat(3, 1)}
+        for row in rows
+    ]
+    # The short row's copy is unavailable. Its identical pixels exist on the long row.
+    images[0]["pixel_refs"] = [
+        {**media["pixel_refs"][0], "path": str(tmp_path / "absent")}
+    ]
+    batch = {
+        "input_ids": rows,
+        "idx_to_traj": [0, 0, 1],
+        "attention_mask": [torch.ones_like(row, dtype=torch.bool) for row in rows],
+        "multi_modal_inputs": images,
+    }
+    actor.reuse_nested_prefixes = True
+    actor.enable_dynamic_batch_size = actor.is_data_io_rank = actor.use_profiler = False
+    actor.logprob_forward_micro_batch_size = 1
+    actor.model = torch.nn.Identity()
+    actor.log_debug = lambda msg: None
+    actor.role_cfg = {"multimodal": {"prefetch_batches": 2, "prefetch_bytes": 165}}
+    actor.cfg.rollout = {
+        "model": {"model_path": ""},
+        "sglang": {"enable_shared_multi_modal_processor": True},
+    }
+    monkeypatch.setattr(megatron_worker, "clear_memory", lambda: None)
+    # The other DP replica has four rows. This replica must still prefetch its pad row.
+    monkeypatch.setattr(dist, "all_reduce", lambda tensor, **kwargs: tensor.fill_(4))
+    monkeypatch.setattr(
+        parallel_state, "_PIPELINE_MODEL_PARALLEL_GROUP", dist.group.WORLD
+    )
+
+    def schedule(data_iterator, **kwargs):
+        results = []
+        for index, row in enumerate(data_iterator):
+            if index:
+                inputs = actor.multimodal_preparer.for_forward(row, "cpu")
+                if index == len(rows):
+                    assert inputs["multimodal_position_ids"].shape == (3, 1, 1)
+                else:
+                    torch.testing.assert_close(inputs["pixel_values"], pixels)
+            results.append([len(row["input_ids"][0])])
+        assert len(results) == kwargs["num_microbatches"] == 4
+        return results
+
+    monkeypatch.setattr(megatron_worker, "get_forward_backward_func", lambda: schedule)
+    assert actor.run_forward_backward(batch) == [3, 5, 4]
 
 
 def test_actor_passes_hidden_states_between_stages_unscaled(scoring_actor):

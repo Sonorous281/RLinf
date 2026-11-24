@@ -131,6 +131,7 @@ actor:
   calculate_flops: false
   seed: 1234
   pack_traj: false
+  reuse_nested_prefixes: false
   offload_optimizer: true
   offload_weight: true
   offload_grad: true

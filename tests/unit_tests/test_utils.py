@@ -1730,6 +1730,10 @@ def megatron_cpu(monkeypatch, tmp_path):
                 },
             }
         )
+        if role == "actor":
+            worker.response_only_logits = False
+            worker.scoring_forward = None
+            worker.reuse_nested_prefixes = False
         worker.cfg.actor = {"model": {"encoder_seq_length": 6}}
         worker.role_cfg = OmegaConf.create({"model": {"encoder_seq_length": 6}})
         worker.tokenizer = SimpleNamespace(eos_token_id=0)
@@ -2282,6 +2286,7 @@ def test_sao_actor_valid_token_scaling_matches_unsplit_gradient(
     if loss_type == "dis":
         worker.clip_ratio_low, worker.clip_ratio_high = 0.3, 5.0
     input_ids = torch.arange(64).reshape(16, 4) % 7 + 1
+    worker.cfg.actor.model.encoder_seq_length = input_ids.shape[1]
     positions = torch.arange(4).expand_as(input_ids).clone()
     mask = positions > 0
     mask[::3] = False

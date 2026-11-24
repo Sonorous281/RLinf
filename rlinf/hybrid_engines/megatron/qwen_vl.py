@@ -15,13 +15,59 @@
 """Bridge Qwen-VL output adapter for response-token scoring."""
 
 import math
+from collections.abc import Callable
 from functools import partial
+from typing import Protocol, TypeVar, overload
 
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
 
 from .lm_head import chunked_vocab_parallel_log_probs
+
+
+def _validate_nested_prefix_cfg(cfg: DictConfig) -> None:
+    """Check the actor schedule and the model settings required for prefix reuse."""
+
+    def require(key: str, expected, default=None) -> None:
+        actual = OmegaConf.select(cfg, key, default=default)
+        if actual != expected:
+            raise ValueError(
+                f"actor.reuse_nested_prefixes requires {key}={expected!r}, got {actual!r}"
+            )
+
+    require("runner.enable_dynamic_batch_size", False)
+    require("algorithm.training_batch_size_per_gpu", 1, default=1)
+    require("algorithm.logprob_forward_micro_batch_size", 1)
+    require("actor.optim.overlap_grad_reduce", False, default=False)
+    require("actor.optim.overlap_param_gather", False, default=False)
+
+    # The Qwen bridge takes attention dropout and expert count from the checkpoint.
+    require("actor.model.attention_dropout", 0.0, default=0.0)
+    require("actor.model.num_moe_experts", None)
+
+    overrides = cfg.actor.model.get("mcore_customization_config", {})
+    if overrides.get("num_moe_experts"):
+        require("actor.model.mcore_customization_config.num_moe_experts", None)
+    if "attention_dropout" in overrides:
+        require("actor.model.mcore_customization_config.attention_dropout", 0.0)
+    for field, expected in (
+        ("pipeline_model_parallel_size", 1),
+        ("context_parallel_size", 1),
+        ("expert_model_parallel_size", 1),
+        ("hidden_dropout", 0.0),
+        ("cuda_graph_impl", "none"),
+    ):
+        group = (
+            "actor.model.mcore_customization_config"
+            if field in overrides
+            else "actor.model"
+        )
+        require(f"{group}.{field}", expected, default=expected)
+    # Core resolves the legacy flags before applying any explicit implementation override.
+    if "cuda_graph_impl" not in overrides:
+        require("actor.model.enable_cuda_graph", False, default=False)
+        require("actor.model.external_cuda_graph", False, default=False)
 
 
 def validate_qwen_vl_chunked_cfg(cfg: DictConfig) -> None:
@@ -31,6 +77,17 @@ def validate_qwen_vl_chunked_cfg(cfg: DictConfig) -> None:
         raise ValueError(
             f"actor.model.lm_head_chunk_size must be a nonnegative integer, got {size!r}"
         )
+    reuse = cfg.actor.get("reuse_nested_prefixes", False)
+    if type(reuse) is not bool:
+        raise ValueError(
+            f"actor.reuse_nested_prefixes must be a boolean, got {reuse!r}"
+        )
+    if reuse:
+        if size == 0:
+            raise ValueError(
+                "actor.reuse_nested_prefixes requires actor.model.lm_head_chunk_size > 0, got 0"
+            )
+        _validate_nested_prefix_cfg(cfg)
     if size == 0:
         return
     if cfg.actor.get("training_backend") != "megatron" or not OmegaConf.select(
@@ -73,6 +130,23 @@ def validate_qwen_vl_chunked_cfg(cfg: DictConfig) -> None:
         )
 
 
+class ChunkedTokenScorer(Protocol):
+    """Apply the bound vocabulary projection to the supplied decoder states."""
+
+    def __call__(
+        self,
+        hidden: torch.Tensor,
+        *,
+        labels: torch.Tensor,
+        label_mask: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor]: ...
+
+
+_HeadT = TypeVar("_HeadT")
+_PrepareHead = Callable[[torch.Tensor, torch.Tensor, ChunkedTokenScorer], _HeadT]
+
+
+@overload
 def forward_qwen_vl_with_chunked_log_probs(
     model: torch.nn.Module,
     unwrapped_model: torch.nn.Module,
@@ -82,8 +156,38 @@ def forward_qwen_vl_with_chunked_log_probs(
     chunk_size: int,
     temperature: float,
     calculate_entropy: bool = False,
+    prepare_head: None = None,
     **model_inputs,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor]: ...
+
+
+@overload
+def forward_qwen_vl_with_chunked_log_probs(
+    model: torch.nn.Module,
+    unwrapped_model: torch.nn.Module,
+    *,
+    label: torch.Tensor,
+    label_mask: torch.Tensor,
+    chunk_size: int,
+    temperature: float,
+    calculate_entropy: bool = False,
+    prepare_head: _PrepareHead[_HeadT],
+    **model_inputs,
+) -> _HeadT: ...
+
+
+def forward_qwen_vl_with_chunked_log_probs(
+    model: torch.nn.Module,
+    unwrapped_model: torch.nn.Module,
+    *,
+    label: torch.Tensor,
+    label_mask: torch.Tensor,
+    chunk_size: int,
+    temperature: float,
+    calculate_entropy: bool = False,
+    prepare_head: _PrepareHead[_HeadT] | None = None,
+    **model_inputs,
+) -> dict[str, torch.Tensor] | _HeadT:
     """Score Qwen-VL decoder output while preserving its multimodal forward.
 
     This adapter binds Core 0.18's output processor to Bridge 0.5 Qwen3VLGPTModel.
@@ -91,6 +195,11 @@ def forward_qwen_vl_with_chunked_log_probs(
     packing transform. It supports training scoring on the last pipeline stage;
     labels, inference contexts and MTP in the wrapped forward are unsupported.
     The caller must keep output-position hooks disabled during this forward.
+
+    By default, return labels-shaped log probabilities and optional entropy.
+    With ``prepare_head``, pass the batch-first decoder states,
+    aligned labels and a bound token scorer to the callback and return its
+    result. The callback can score selected positions later.
     """
     language_model = unwrapped_model.language_model
     if not (unwrapped_model.post_process and language_model.post_process):
@@ -119,6 +228,7 @@ def forward_qwen_vl_with_chunked_log_probs(
             temperature=temperature,
             calculate_entropy=calculate_entropy,
             tp_group=language_model.pg_collection.tp,
+            prepare_head=prepare_head,
         ),
     )
     try:
@@ -143,8 +253,9 @@ def _qwen_vl_output_processor(
     temperature,
     calculate_entropy,
     tp_group,
+    prepare_head: _PrepareHead[_HeadT] | None = None,
     **kwargs,
-):
+) -> dict[str, torch.Tensor] | _HeadT:
     if labels is not None or inference_context is not None:
         raise ValueError(
             "Qwen-VL chunked scoring requires labels=None and no inference context"
@@ -163,11 +274,9 @@ def _qwen_vl_output_processor(
             hidden = tensor_parallel.copy_to_tensor_model_parallel_region(
                 hidden, group=tp_group
             )
-    return chunked_vocab_parallel_log_probs(
-        hidden.transpose(0, 1),
-        weight,
-        label,
-        label_mask,
+    score = partial(
+        chunked_vocab_parallel_log_probs,
+        weight=weight,
         chunk_size=chunk_size,
         temperature=temperature,
         bias=output_layer.bias,
@@ -175,3 +284,7 @@ def _qwen_vl_output_processor(
         calculate_entropy=calculate_entropy,
         gradient_accumulation_fusion=output_layer.gradient_accumulation_fusion,
     )
+    hidden = hidden.transpose(0, 1)
+    if prepare_head is not None:
+        return prepare_head(hidden, label, score)
+    return score(hidden, labels=label, label_mask=label_mask)

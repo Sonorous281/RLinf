@@ -34,11 +34,13 @@ class RPentRunner(AsyncAgentRunner):
     def _prepare_update(self, release_handle):
         if self.cfg.runner.synchronous:
             cohort = self._wait_actor(release_handle, self._training_handles)[0]
-            self.agent_loop.cancel_groups(cohort["remaining"]).wait()
-            handle = self.rollout_buffer.admit_cohort(cohort)
-            cohort["late_completions"] = self._wait_actor(
-                handle, self._training_handles
-            )[0]
+            with self.timer("rollout/cancel_groups"):
+                self.agent_loop.cancel_groups(cohort["remaining"]).wait()
+            with self.timer("rollout/admit_cohort"):
+                handle = self.rollout_buffer.admit_cohort(cohort)
+                cohort["late_completions"] = self._wait_actor(
+                    handle, self._training_handles
+                )[0]
             output = (
                 Path(self.cfg.runner.output_dir)
                 / self.cfg.runner.experiment_name
@@ -56,16 +58,18 @@ class RPentRunner(AsyncAgentRunner):
         if self.critic is not None or not self.recompute_logprobs:
             return super()._run_training(rollout_handle, payload_channels)
         # GRPO scores the admitted trajectories against the pre-update actor for TIS.
-        score = self.actor.run_inference(
-            input_channel=self.rollout_channel,
-            output_channel=self.actor_inference_channel,
-            compute_ref_logprobs=False,
-        )
-        self._wait_actor(score, self._training_handles)
-        train = self.actor.run_training(
-            input_channel=self.actor_inference_channel, version=self.global_steps
-        )
-        rollout, metrics = self._wait_actor(train, self._training_handles)[0]
+        with self.timer("actor/recompute_wall"):
+            score = self.actor.run_inference(
+                input_channel=self.rollout_channel,
+                output_channel=self.actor_inference_channel,
+                compute_ref_logprobs=False,
+            )
+            self._wait_actor(score, self._training_handles)
+        with self.timer("actor/update_wall"):
+            train = self.actor.run_training(
+                input_channel=self.actor_inference_channel, version=self.global_steps
+            )
+            rollout, metrics = self._wait_actor(train, self._training_handles)[0]
         return (
             rollout,
             metrics,

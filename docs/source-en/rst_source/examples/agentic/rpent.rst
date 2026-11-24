@@ -101,6 +101,21 @@ Read ``rpent-eval/eval_results.json`` under ``RPENT_RUN_DIR`` for the episode co
 
 In one standard LIBERO episode (suite ``libero_10``, task 0, seed 2), the planner called ``view_env``. The tool returned a 1024 × 1024 camera view. It then called ``segment``, which returned a mask with score 0.891. After 25 planner turns and 262 environment steps the episode reached its request limit. The recorded values were ``terminal=true``, ``success=false`` and reward 0. The segmentation score never enters the reward.
 
+Reuse planner history in GRPO
+------------------------------
+
+Long episodes can span several training rows. If one row contains the full history of the preceding row from the same episode, the actor can run the decoder once for both. The tokens, images and positions in the shared prefix must match, and both rows must be consecutive on the same data-parallel rank. Each row still trains on its own actions with its original loss weights.
+
+Prefix reuse is off by default. To enable it, launch the dense Qwen3.5-4B GRPO recipe with one override. The tested layout uses TP2 with PP1, CP1 and EP1. Keep the recipe's chunked output head and single-row microbatches for scoring and training. Leave dropout, CUDA graphs and overlapping data-parallel communication disabled.
+
+.. code-block:: bash
+
+   bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_grpo actor.reuse_nested_prefixes=true
+
+Look for ``Nested prefix training`` in the actor log. It reports the number of training rows (logical) and rows sent to the decoder (physical) on that rank. A lower physical row count means this rank reused a prefix in that batch.
+
+In a replay of one archived LIBERO-Object episode on two A100s, both runs used output chunks of 256 tokens. Recomputing old log probabilities and running the training forward and backward passes took 11.84 s with reuse off and 8.63 s with it on. The old log probabilities matched for all 23,201 action tokens. The timings exclude rollout and the optimizer step.
+
 Reference run
 -------------
 

@@ -1514,12 +1514,21 @@ class DynamicMegatronBatchMixin:
             1, (len(batch["input_ids"]) + micro_batch_size - 1) // micro_batch_size
         )
 
-    def run_forward_backward(self, batch: DynamicActorBatch, forward_only=True):
+    def run_forward_backward(
+        self,
+        batch: DynamicActorBatch,
+        forward_only=True,
+        *,
+        should_prefetch: Callable[[dict], bool] | None = None,
+        forward_step_func: Callable | None = None,
+    ):
         """Run the forward and backward pass on the model.
 
         Args:
             batch (dict): Real-length token rows and per-sequence metadata.
             forward_only (bool): If True, only run the forward pass without backpropagation.
+            should_prefetch: Select microbatches that need their own model inputs.
+            forward_step_func: A forward step with state scoped to this schedule.
         """
         clear_memory()
         row_count = len(batch["input_ids"])
@@ -1584,10 +1593,12 @@ class DynamicMegatronBatchMixin:
         iterator = self.make_data_iterator_list(batch_iter)
         context = nullcontext(iterator)
         if (self.role_cfg.get("multimodal") or {}).get("prefetch_batches", 0):
-            context = self.multimodal_preparer.iterator_context(iterator)
+            context = self.multimodal_preparer.iterator_context(
+                iterator, should_prefetch=should_prefetch
+            )
         with context as data_iterator:
             forward_outputs = fwd_bwd_function(
-                forward_step_func=self.get_forward_step_func(),
+                forward_step_func=forward_step_func or self.get_forward_step_func(),
                 data_iterator=data_iterator,
                 model=self.model,
                 num_microbatches=num_microbatches,

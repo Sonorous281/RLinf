@@ -238,6 +238,38 @@ def test_chunked_qwen_scoring_requires_explicit_mtp_disable(load_mtp):
             validate_qwen_vl_chunked_cfg(cfg)
 
 
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("actor.model.lm_head_chunk_size", 0),
+        ("algorithm.training_batch_size_per_gpu", 2),
+        ("actor.optim.overlap_grad_reduce", True),
+        ("actor.model.mcore_customization_config.cuda_graph_impl", "local"),
+        ("actor.model.mcore_customization_config.context_parallel_size", 2),
+    ],
+)
+def test_prefix_reuse_rejects_incompatible_grpo_settings(key, value):
+    from pathlib import Path
+
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+
+    from rlinf.hybrid_engines.megatron.qwen_vl import validate_qwen_vl_chunked_cfg
+
+    config_dir = Path(__file__).resolve().parents[2] / "examples/agent/rpent/config"
+    with initialize_config_dir(config_dir=str(config_dir), version_base="1.1"):
+        cfg = compose(
+            "train_qwen3.5_4b_grpo", overrides=["actor.reuse_nested_prefixes=true"]
+        )
+    validate_qwen_vl_chunked_cfg(cfg)
+    OmegaConf.update(cfg, key, value, force_add=True)
+    with pytest.raises(ValueError) as error:
+        validate_qwen_vl_chunked_cfg(cfg)
+    assert key in str(error.value) and f"got {value!r}" in str(error.value)
+    cfg.actor.reuse_nested_prefixes = False
+    validate_qwen_vl_chunked_cfg(cfg)
+
+
 def test_qwen_chunked_adapter_bypasses_dense_projection(monkeypatch):
     from types import SimpleNamespace
 

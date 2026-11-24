@@ -101,6 +101,21 @@ RPent 的模拟器进程用 tokenizer 和图像处理器计算上下文长度。
 
 例如，在一次标准 LIBERO 采样中，任务为 ``libero_10`` 的第 0 个任务，初态为 2。规划器先调用 ``view_env`` 获取 1024 × 1024 的相机画面，再调用 ``segment``，得到分数为 0.891 的分割掩码。经过 25 轮交互、262 个环境步后，这条轨迹达到请求次数上限。环境记录为 ``terminal=true``、``success=false``，因此训练奖励为 0。分割分数只用于感知。
 
+在 GRPO 中复用规划历史
+------------------------------
+
+长轨迹可能拆成多行训练样本。后一行如果完整保留了前一行的 token、图像和位置编码，actor 可以把这段历史只算一次。两行必须来自同一条轨迹，在同一个数据并行副本上前后相邻。两行的动作都按各自原有的权重计入损失。
+
+前缀复用默认关闭。在上面的 GRPO 启动命令末尾加一个开关即可启用。已验证的稠密 Qwen3.5-4B 配置使用 TP2、PP1、CP1、EP1。沿用示例的分块输出层，重算旧 logprob 和训练都使用单行微批。自定义配置时，保持 dropout、CUDA Graph 和数据并行通信重叠关闭。
+
+.. code-block:: bash
+
+   bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_grpo actor.reuse_nested_prefixes=true
+
+在 actor 日志中查找 ``Nested prefix training``。如果实际送入解码器的行数（physical rows）小于训练样本行数（logical rows），说明这个副本在这批样本中复用了前缀。
+
+在两张 A100 上回放一条历史 LIBERO-Object 轨迹，两组的词表输出都按 256 个 token 分块。重算旧 logprob 加上训练的前向和反向计算，关闭复用时耗时 11.84 秒，开启后为 8.63 秒。23,201 个动作 token 的旧 logprob 逐项相同。计时不含 rollout 和优化器更新。
+
 参考结果
 --------
 
