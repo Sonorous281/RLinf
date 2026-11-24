@@ -83,10 +83,6 @@ Generate training rows from the goal, object and spatial suites. Each JSONL row 
    "$RPENT_PYTHON" examples/agent/rpent/prepare_tasks.py --libero-type pro --seeds 0-31 --output-dir data/rpent
    bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_grpo
 
-To reuse long planner histories, set ``reuse_nested_prefixes: true`` under ``actor`` in the GRPO training YAML. This option is off by default. Two consecutive rows from the same episode can share a decoder pass if the shorter row is an exact prefix of the longer one, including its tokens, images and positions.
-
-The actor computes the old log probabilities for both rows in one pass. During an update, it applies the output projection in each row's original microbatch, preserving its action mask, loss weight and importance-ratio check. Use the recipe's dense Qwen3.5 model, chunked output projection and single-row microbatches. Keep dropout, CUDA graphs and overlapping DP communication disabled.
-
 For SAO, generate the task file with ``--libero-type standard`` and run:
 
 .. code-block:: bash
@@ -104,6 +100,21 @@ To evaluate, set ``RPENT_MODEL`` to the exported Hugging Face checkpoint and res
 Read ``rpent-eval/eval_results.json`` under ``RPENT_RUN_DIR`` for the episode count and the success rates overall and by suite. Each episode's ``request.json`` identifies the task, ``planner.json`` records its interaction and ``outcome.json`` holds the simulator verdict. In a training row, ``input_ids`` contains the rendered prompt and sampled response. The learner uses ``response_mask`` to score only policy actions. ``rollout_logprobs`` holds their behavior logprobs, ``rollout_weight_versions`` tracks the policy that produced each action token, and ``multi_modal_inputs`` references the image tensors. Tool observations become part of the next prompt.
 
 In one standard LIBERO episode (suite ``libero_10``, task 0, seed 2), the planner called ``view_env``. The tool returned a 1024 × 1024 camera view. It then called ``segment``, which returned a mask with score 0.891. After 25 planner turns and 262 environment steps the episode reached its request limit. The recorded values were ``terminal=true``, ``success=false`` and reward 0. The segmentation score never enters the reward.
+
+Reuse planner history in GRPO
+------------------------------
+
+Long episodes can span several training rows. If one row contains the full history of the preceding row from the same episode, the actor can run the decoder once for both. The tokens, images and positions in the shared prefix must match, and both rows must be consecutive on the same data-parallel rank. Each row still trains on its own actions with its original loss weights.
+
+Prefix reuse is off by default. To enable it, launch the dense Qwen3.5-4B GRPO recipe with one override. The tested layout uses TP2 with PP1, CP1 and EP1. Keep the recipe's chunked output head and single-row microbatches for scoring and training. Leave dropout, CUDA graphs and overlapping data-parallel communication disabled.
+
+.. code-block:: bash
+
+   bash examples/agent/rpent/run_train.sh train_qwen3.5_4b_grpo actor.reuse_nested_prefixes=true
+
+Look for ``Nested prefix training`` in the actor log. It reports the number of training rows (logical) and rows sent to the decoder (physical) on that rank. A lower physical row count means this rank reused a prefix in that batch.
+
+In a replay of one archived LIBERO-Object episode on two A100s, both runs used output chunks of 256 tokens. Recomputing old log probabilities and running the training forward and backward passes took 11.84 s with reuse off and 8.63 s with it on. The old log probabilities matched for all 23,201 action tokens. The timings exclude rollout and the optimizer step.
 
 Reference run
 -------------
