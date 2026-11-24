@@ -83,18 +83,29 @@ def tp_nested_prefix_ends(
     if group.size() == 1:
         return nested_prefix_ends(batch)
     error = None
+    ends = []
     try:
         ends = nested_prefix_ends(batch)
         layout = array("q", ends)
-        layout.extend(map(len, batch["input_ids"]))
+        layout.extend(map(len, batch.get("input_ids", ())))
+        for i, image in enumerate(batch.get("multi_modal_inputs") or ()):
+            if i == ends[i]:
+                grid = image.get("image_grid_thw") if image else None
+                values = (
+                    torch.as_tensor(grid).reshape(-1).tolist()
+                    if grid is not None
+                    else []
+                )
+                layout.append(len(values))
+                layout.extend(values)
         digest = hashlib.blake2b(layout.tobytes(), digest_size=16)
         for mask in batch.get("response_mask", ()):
             digest.update(mask.detach().cpu().contiguous().numpy())
-        signature = digest.digest()
-    except (KeyError, TypeError, ValueError, IndexError, RuntimeError) as exc:
+        signature = b"\x01" + digest.digest()
+    except Exception as exc:
         # A peer with malformed metadata must still enter the same collective.
         error = exc
-        signature = bytes(16)
+        signature = bytes(17)
     local = torch.tensor(list(signature), dtype=torch.uint8, device=device)
     gathered = local.new_empty(group.size() * len(signature))
     torch.distributed.all_gather_into_tensor(gathered, local, group=group)

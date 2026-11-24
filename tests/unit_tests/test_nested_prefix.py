@@ -179,9 +179,14 @@ def _check_tp_schedules(rank, rendezvous):
         images[1]["extends_previous_turn"] = rank == 0
         with pytest.raises(RuntimeError, match="Tensor-parallel ranks disagree"):
             tp_nested_prefix_ends(batch, dist.group.WORLD, "cpu")
+        images[1]["extends_previous_turn"] = False
+        if rank:
+            images[1]["image_grid_thw"] = torch.tensor([[1, 2, 2]])
+        with pytest.raises(RuntimeError, match="Tensor-parallel ranks disagree"):
+            tp_nested_prefix_ends(batch, dist.group.WORLD, "cpu")
         images[1]["extends_previous_turn"] = True
         if rank:
-            images[0]["prompt_token_ids"] = [-1]
+            batch["response_mask"] = [None]
         with pytest.raises((ValueError, RuntimeError), match="nested prefix"):
             tp_nested_prefix_ends(batch, dist.group.WORLD, "cpu")
     finally:
